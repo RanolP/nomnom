@@ -1,5 +1,6 @@
-//! Clean: choose entries, watch the dry run follow, then apply behind a
-//! confirmation that names exactly what will move and where it goes.
+//! The files to delete: choose entries and watch the dry run follow. Reclaim,
+//! in the tree's bottom bar, applies the plan this view holds, behind a
+//! confirmation that names exactly what will move.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -7,44 +8,39 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use nomnom_core::action::{
-    Action, ApplyOptions, RecordStatus, TrashPolicy, apply, plain, trash_policy,
-};
-use nomnom_core::verdict::Assessment;
+use nomnom_core::action::{Action, RecordStatus, apply, plain};
+use nomnom_core::verdict::{Assessment, Verdict};
 
 use crate::session::{Assessed, Phase, Session};
 use crate::state::{Preview, Selection, size};
-use crate::suggest::{disposition_tag, waiting_for_assessment};
+use crate::suggest::{disposition_tag, label_name, waiting_for_assessment};
 
-const ROW_HEIGHT: f32 = 46.;
+/// Three lines per row: path, reason, and the rule behind it.
+const ROW_HEIGHT: f32 = 62.;
 
 /// What one apply did, kept until the next one.
 struct Outcome {
-    journal: PathBuf,
     bytes_reclaimed: u64,
     succeeded: usize,
     failures: Vec<(PathBuf, String)>,
 }
 
+/// Emitted when an apply finishes, so the window can show its outcome.
+pub struct Applied;
+
 pub struct CleanScreen {
     session: Entity<Session>,
     selection: Selection,
-    /// The CLI's `--stage DIR`: trashed paths move here instead of the
-    /// recycle bin.
-    stage: Option<PathBuf>,
     preview: Option<Result<Rc<Preview>, String>>,
     outcome: Option<Result<Outcome, String>>,
-    picker_error: Option<String>,
 }
+
+impl EventEmitter<Applied> for CleanScreen {}
 
 impl CleanScreen {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
@@ -56,14 +52,8 @@ impl CleanScreen {
             this.refresh_preview(cx);
         })
         .detach();
-        let mut this = Self {
-            session,
-            selection: Selection::default(),
-            stage: None,
-            preview: None,
-            outcome: None,
-            picker_error: None,
-        };
+        let mut this =
+            Self { session, selection: Selection::default(), preview: None, outcome: None };
         this.refresh_preview(cx);
         this
     }
@@ -91,23 +81,24 @@ impl CleanScreen {
         self.refresh_preview(cx);
     }
 
-    fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Ok(preview)) = self.preview.clone() else { return };
-        if preview.plan.is_empty() {
-            return;
+    /// The plan Reclaim would apply: its action count and total bytes, or
+    /// `None` while there is nothing to apply.
+    pub fn plan_summary(&self) -> Option<(usize, u64)> {
+        match &self.preview {
+            Some(Ok(preview)) if !preview.plan.is_empty() => {
+                Some((preview.plan.len(), preview.plan.total_bytes()))
+            }
+            _ => None,
         }
-        let policy = trash_policy(self.stage.clone());
-        let body = format!(
-            "{} paths, {} in total, will be {}.\n\nA journal is written before anything moves; \
-             the Undo screen can reverse this apply from it.",
-            preview.plan.len(),
-            size(preview.plan.total_bytes()),
-            describe(&policy),
-        );
+    }
+
+    pub fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((len, bytes)) = self.plan_summary() else { return };
+        let body =
+            format!("{len} paths, {} in total, will be moved to the recycle bin.", size(bytes));
         let view = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
-            let policy = policy.clone();
             dialog
                 .title("Apply this cleanup?")
                 .child(div().text_sm().child(body.clone()))
@@ -118,84 +109,13 @@ impl CleanScreen {
                         .show_cancel(true),
                 )
                 .on_ok(move |_, _, cx| {
-                    view.update(cx, |this, cx| this.apply(policy.clone(), cx));
+                    view.update(cx, |this, cx| this.apply(cx));
                     true
                 })
         });
     }
 
-    fn choose_stage(&mut self, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Stage trashed paths here".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let outcome = match picked.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next().map(Ok),
-                Ok(Ok(None)) | Err(_) => None,
-                Ok(Err(error)) => Some(Err(format!("cannot open the folder picker: {error}"))),
-            };
-            let _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Some(Ok(dir)) => {
-                        this.stage = Some(dir);
-                        this.picker_error = None;
-                    }
-                    Some(Err(message)) => {
-                        eprintln!("nomnom-gui: {message}");
-                        this.picker_error = Some(message);
-                    }
-                    None => {}
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn render_stage(&self, busy: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let target = match &self.stage {
-            Some(dir) => format!("Trashed paths move into {}", plain(dir)),
-            None => "Trashed paths go to the recycle bin".to_string(),
-        };
-        h_flex()
-            .gap_2()
-            .text_sm()
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(muted)
-                    .child(target),
-            )
-            .child(
-                Button::new("choose-stage")
-                    .small()
-                    .outline()
-                    .label("Stage into folder…")
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_stage(cx))),
-            )
-            .when(self.stage.is_some(), |row| {
-                row.child(
-                    Button::new("clear-stage")
-                        .small()
-                        .ghost()
-                        .label("Use recycle bin")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.stage = None;
-                            cx.notify();
-                        })),
-                )
-            })
-    }
-
-    fn apply(&mut self, policy: TrashPolicy, cx: &mut Context<Self>) {
+    fn apply(&mut self, cx: &mut Context<Self>) {
         let Some(Ok(preview)) = self.preview.clone() else { return };
         let session = self.session.clone();
         if !session.update(cx, |session, cx| session.begin(Phase::Applying, cx)) {
@@ -207,17 +127,15 @@ impl CleanScreen {
             let applied = cx
                 .background_executor()
                 .spawn(async move {
-                    let opts = ApplyOptions { trash_policy: policy, ..ApplyOptions::default() };
-                    apply(&plan, &opts).map_err(|error| {
+                    apply(&plan).map_err(|error| {
                         format!("apply under {} failed: {error}", plain(plan.root()))
                     })
                 })
                 .await;
-            let outcome = applied.map(|journal| Outcome {
-                journal: journal.path().to_path_buf(),
-                bytes_reclaimed: journal.bytes_reclaimed(),
-                succeeded: journal.records().iter().filter(|r| r.succeeded()).count(),
-                failures: journal
+            let outcome = applied.map(|report| Outcome {
+                bytes_reclaimed: report.bytes_reclaimed(),
+                succeeded: report.records().iter().filter(|r| r.succeeded()).count(),
+                failures: report
                     .failures()
                     .map(|record| {
                         let message = match &record.status {
@@ -238,6 +156,7 @@ impl CleanScreen {
             }
             let _ = this.update(cx, |this, cx| {
                 this.outcome = Some(outcome);
+                cx.emit(Applied);
                 cx.notify();
             });
             // What was applied is gone from disk, so the assessment is stale.
@@ -265,7 +184,6 @@ impl CleanScreen {
                     done.succeeded,
                     size(done.bytes_reclaimed)
                 )))
-                .child(format!("Journal: {}", plain(&done.journal)))
                 .when(!done.failures.is_empty(), |panel| {
                     panel
                         .child(
@@ -293,16 +211,74 @@ fn verb(action: &Action) -> &'static str {
     }
 }
 
-fn describe(policy: &TrashPolicy) -> String {
-    match policy {
-        TrashPolicy::Recycle => "moved to the recycle bin".to_string(),
-        TrashPolicy::Stage { dir } => format!("moved into the staging directory {}", plain(dir)),
-    }
+/// A row's copy of an assessment entry, owned so the virtualized list can
+/// hold it across frames.
+struct Candidate {
+    path: String,
+    bytes: u64,
+    verdict: Verdict,
+}
+
+/// One candidate: the path, its reason, and the `pack/rule` behind it, never
+/// behind a click — with packs coming from the network, "who says so" is part
+/// of what a human approves on.
+fn render_candidate(
+    this: &CleanScreen,
+    ix: usize,
+    entry: &Candidate,
+    cx: &mut Context<CleanScreen>,
+) -> AnyElement {
+    let verdict = &entry.verdict;
+    let muted = cx.theme().muted_foreground;
+    let toggled = entry.path.clone();
+    h_flex()
+        .h(px(ROW_HEIGHT))
+        .w_full()
+        .gap_2()
+        .px_2()
+        .text_sm()
+        .child(
+            Checkbox::new(("pick", ix)).checked(this.selection.is_checked(&entry.path)).on_change(
+                cx.listener(move |this, checked: &bool, _, cx| {
+                    this.set_checked(&toggled, *checked, cx)
+                }),
+            ),
+        )
+        .child(disposition_tag(verdict.disposition))
+        .child(
+            v_flex()
+                .flex_1()
+                .overflow_hidden()
+                .child(div().whitespace_nowrap().child(entry.path.clone()))
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(verdict.reason.clone()),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{} — {}", label_name(&verdict.label), verdict.provenance))
+                        // A capped verdict looks exactly like one written as
+                        // `review`; without this the missing trust grant is
+                        // invisible.
+                        .when_some(verdict.capped.clone(), |row, capped| {
+                            row.child(
+                                div().text_color(cx.theme().warning).child(format!("! {capped}")),
+                            )
+                        }),
+                ),
+        )
+        .child(div().child(size(entry.bytes)))
+        .into_any_element()
 }
 
 impl Render for CleanScreen {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = window;
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(waiting) = waiting_for_assessment(&self.session, cx) {
             return v_flex()
                 .size_full()
@@ -310,14 +286,16 @@ impl Render for CleanScreen {
                 .child(waiting)
                 .into_any_element();
         }
-        let session = self.session.read(cx);
-        let busy = session.busy;
-        let assessment = session.assessment.clone().expect("checked above");
-        let candidates: Rc<Vec<(String, u64, nomnom_core::verdict::Disposition, String)>> = Rc::new(
+        let assessment = self.session.read(cx).assessment.clone().expect("checked above");
+        let candidates: Rc<Vec<Candidate>> = Rc::new(
             self.selection
                 .candidates(&assessment)
                 .into_iter()
-                .map(|e| (e.path.clone(), e.bytes, e.verdict.disposition, e.verdict.reason.clone()))
+                .map(|entry| Candidate {
+                    path: entry.path.clone(),
+                    bytes: entry.bytes,
+                    verdict: entry.verdict.clone(),
+                })
                 .collect(),
         );
 
@@ -330,26 +308,16 @@ impl Render for CleanScreen {
                 this.refresh_preview(cx);
             }));
 
-        let (summary, can_apply) = match &self.preview {
-            Some(Ok(preview)) if preview.plan.is_empty() => {
-                ("Nothing to clean.".to_string(), false)
-            }
-            Some(Ok(preview)) => (
-                format!(
-                    "Dry run: {} actions, {} to reclaim. Nothing has been touched.",
-                    preview.plan.len(),
-                    size(preview.plan.total_bytes())
-                ),
-                true,
+        let summary = match &self.preview {
+            Some(Ok(preview)) if preview.plan.is_empty() => "Nothing to clean.".to_string(),
+            Some(Ok(preview)) => format!(
+                "Dry run: {} actions, {} to reclaim. Nothing has been touched.",
+                preview.plan.len(),
+                size(preview.plan.total_bytes())
             ),
-            Some(Err(message)) => (message.clone(), false),
-            None => (String::new(), false),
+            Some(Err(message)) => message.clone(),
+            None => String::new(),
         };
-        let apply_button = Button::new("apply")
-            .danger()
-            .label("Apply…")
-            .disabled(!can_apply || busy.is_some())
-            .on_click(cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)));
 
         let checklist = {
             let candidates = candidates.clone();
@@ -358,38 +326,7 @@ impl Render for CleanScreen {
                 candidates.len(),
                 cx.processor(move |this, range: Range<usize>, _, cx| {
                     range
-                        .map(|ix| {
-                            let (path, bytes, disposition, reason) = &candidates[ix];
-                            let checked = this.selection.is_checked(path);
-                            let toggled = path.clone();
-                            h_flex()
-                                .h(px(ROW_HEIGHT))
-                                .w_full()
-                                .gap_2()
-                                .px_2()
-                                .text_sm()
-                                .child(Checkbox::new(("pick", ix)).checked(checked).on_change(
-                                    cx.listener(move |this, checked: &bool, _, cx| {
-                                        this.set_checked(&toggled, *checked, cx)
-                                    }),
-                                ))
-                                .child(disposition_tag(*disposition))
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .child(div().whitespace_nowrap().child(path.clone()))
-                                        .child(
-                                            div()
-                                                .whitespace_nowrap()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(reason.clone()),
-                                        ),
-                                )
-                                .child(div().child(size(*bytes)))
-                                .into_any_element()
-                        })
+                        .map(|ix| render_candidate(this, ix, &candidates[ix], cx))
                         .collect::<Vec<_>>()
                 }),
             )
@@ -435,19 +372,7 @@ impl Render for CleanScreen {
             .p_4()
             .children(self.render_outcome(cx))
             .child(toggle)
-            .child(self.render_stage(busy.is_some(), cx))
-            .when_some(self.picker_error.clone(), |col, message| {
-                col.child(Alert::error("stage-picker-error", message))
-            })
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(summary))
-                    .when(busy == Some(Phase::Applying), |row| {
-                        row.child(Spinner::new().small()).child(Phase::Applying.label())
-                    })
-                    .child(apply_button),
-            )
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(summary))
             .child(
                 h_flex()
                     .flex_1()

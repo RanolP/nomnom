@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 use nomnom_core::scan::backend::mft::paths::{DirRecord, PathBuilder, ROOT_RECORD, respell_under};
 use nomnom_core::scan::backend::mft::{strip_verbatim, volume};
-use nomnom_core::scan::{Backend, BackendUsed, ScanOptions, VolumeRoot, scan};
+use nomnom_core::scan::elevated::scan_elevated;
+use nomnom_core::scan::{BackendUsed, ScanOptions, VolumeRoot};
 use volume::{AlignedReader, FileSource};
 
 // ---------------------------------------------------------------------------
@@ -228,8 +229,7 @@ fn subtree_filter_keeps_the_root_and_rejects_near_misses() {
 fn real_volume_enumeration_produces_paths_that_exist() {
     let root = VolumeRoot::new(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()))
         .expect("the system drive is a volume root");
-    let opts = ScanOptions { backend: Backend::Mft, ..ScanOptions::default() };
-    let report = scan(&root, &opts).expect("run this elevated");
+    let report = scan_elevated(&root, &ScanOptions::default()).expect("the MFT read succeeds");
     let root = root.as_path();
 
     assert_eq!(report.backend_used, BackendUsed::Mft);

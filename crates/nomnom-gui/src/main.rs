@@ -7,8 +7,6 @@
 mod app;
 mod clean;
 mod drives;
-mod file_types;
-mod largest;
 mod packs;
 mod palette;
 mod scan;
@@ -16,7 +14,6 @@ mod session;
 mod state;
 mod suggest;
 mod treemap;
-mod undo;
 
 use std::process::ExitCode;
 

@@ -8,17 +8,16 @@ use nomnom_core::catalog::{Catalog, NodeId};
 use nomnom_core::scan::{BackendUsed, EntryKind, ScanError, VolumeRoot};
 use serde::Serialize;
 
-use crate::input::{self, BackendArg};
+use crate::input;
 
 pub fn run(
     drive: &VolumeRoot,
-    backend: BackendArg,
     show_errors: bool,
     depth: u32,
     top: usize,
     json: bool,
 ) -> Result<ExitCode> {
-    let catalog = input::load(drive, backend)?;
+    let catalog = input::load(drive)?;
     input::warn_backend(&catalog);
     input::report_errors(&catalog, show_errors);
 

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, thread};
 
 use windows_sys::Win32::Foundation::{
@@ -44,7 +44,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use super::ElevatedScanError;
 use super::wire::{self, Frame};
-use crate::scan::{Backend, ScanOptions, ScanProgress, ScanReport, VolumeRoot, scan};
+use crate::scan::backend::dispatch;
+use crate::scan::{Backend, ScanOptions, ScanProgress, ScanReport, VolumeRoot};
+use crate::timings;
 
 const HELPER_FLAG: &str = "--nomnom-elevated-scan";
 const DEBUG_WALK_ENV: &str = "NOMNOM_DEBUG_HELPER_WALK";
@@ -78,9 +80,10 @@ pub(super) fn scan_elevated(
     opts: &ScanOptions,
 ) -> Result<ScanReport, ElevatedScanError> {
     if is_elevated() {
-        let mft = ScanOptions { backend: Backend::Mft, ..opts.clone() };
-        return scan(root, &mft).map_err(|e| ElevatedScanError::Failed(e.to_string()));
+        return dispatch(root.as_path(), Backend::Mft, opts)
+            .map_err(|e| ElevatedScanError::Failed(e.to_string()));
     }
+    let started = Instant::now();
     let debug_walk = std::env::var_os(DEBUG_WALK_ENV).is_some_and(|v| v == "1");
     let failed =
         |what: &str, error: io::Error| ElevatedScanError::Failed(format!("{what}: {error}"));
@@ -128,6 +131,7 @@ pub(super) fn scan_elevated(
         }));
     }
 
+    let mut waited = timings::lap("helper launch + UAC + connect", started);
     let mut stream = BufReader::with_capacity(PIPE_BUFFER as usize, File::from(pipe));
     let broken = |error: io::Error| {
         let code = exit_code(&child, Duration::from_secs(5)).map_or_else(
@@ -145,8 +149,15 @@ pub(super) fn scan_elevated(
                     progress.entries_total.store(total, Ordering::Relaxed);
                     progress.bytes.store(bytes, Ordering::Relaxed);
                 }
+                waited = Instant::now();
             }
-            Frame::Report(report) => return Ok(report),
+            Frame::Report(report) => {
+                // From the last progress frame, which the helper stops sending
+                // once its scan returns: its encode overlaps this decode.
+                timings::lap("parent receive + decode (from last progress)", waited);
+                timings::lap("parent total in scan_elevated", started);
+                return Ok(report);
+            }
             Frame::Failure(message) => return Err(ElevatedScanError::Failed(message)),
         }
     }
@@ -165,6 +176,7 @@ pub(super) fn maybe_run_helper() -> Option<ExitCode> {
 }
 
 fn run_helper(args: &[OsString]) -> u8 {
+    timings::join_scan("helper");
     let [pipe, backend, root] = args else { return EXIT_BAD_LAUNCH };
     let backend = match backend.to_str() {
         Some("mft") => Backend::Mft,
@@ -217,13 +229,20 @@ fn run_helper(args: &[OsString]) -> u8 {
         })
     };
 
-    let opts = ScanOptions { backend, progress: Some(progress), ..ScanOptions::default() };
-    let result = scan(&root, &opts);
+    let opts = ScanOptions { progress: Some(progress), ..ScanOptions::default() };
+    let result = dispatch(root.as_path(), backend, &opts);
     done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
     match result {
-        Ok(report) => {
+        Ok(mut report) => {
+            // The catalog sorts entries this way anyway. Sorted here, each path
+            // shares most of the one before it, so the stream is a fifth the
+            // size and the parent's sort finds the order already in place.
+            let started = Instant::now();
+            crate::catalog::sort_subtrees(&mut report.entries);
+            let started = timings::lap("helper sort for the wire", started);
             send(&|out| wire::write_report(out, &report));
+            timings::lap("helper encode + send", started);
             0
         }
         Err(error) => {

@@ -9,18 +9,13 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
-
-mod file_types;
-mod largest;
-
-pub use file_types::{FileType, file_types};
-pub use largest::largest_files;
+use crate::scan::{BackendUsed, Entry, EntryKind, ScanError, ScanReport};
+use crate::timings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
@@ -82,7 +77,9 @@ impl Catalog {
     pub fn build(report: ScanReport) -> Self {
         let ScanReport { root: root_path, mut entries, errors, backend_used } = report;
 
-        entries.par_sort_unstable_by(|a, b| subtree_order(&a.path, &b.path));
+        let started = Instant::now();
+        sort_subtrees(&mut entries);
+        let started = timings::lap("Catalog::build sort", started);
 
         let mut nodes: Vec<Node> = Vec::with_capacity(entries.len() + 1);
         let root = NodeId(0);
@@ -92,8 +89,15 @@ impl Catalog {
         // root is never popped, so an entry outside it still lands somewhere.
         let mut open: Vec<(PathBuf, NodeId)> = vec![(root_path.clone(), root)];
 
+        // Paths compare as bytes from here on. Both backends spell every path
+        // by joining names onto the root, so a byte prefix ending at a
+        // separator is exactly a component prefix, and `Path`'s component-wise
+        // comparisons, which re-parse both paths, are pure overhead: they were
+        // two thirds of building a 4.5M-entry catalog.
+        let root_bytes = root_path.as_os_str().as_encoded_bytes().to_vec();
         for entry in entries {
-            if entry.path == root_path {
+            let path = entry.path.as_os_str().as_encoded_bytes();
+            if path == root_bytes.as_slice() {
                 let node = &mut nodes[root.index()];
                 node.kind = entry.kind;
                 node.size = entry.size;
@@ -105,13 +109,13 @@ impl Catalog {
             // A path repeated by the backend must not become a second node: its
             // bytes would be counted twice. Sorting made repeats adjacent, so
             // the repeat is always the top of the stack.
-            if open.len() > 1 && open[open.len() - 1].0 == entry.path {
+            if open.len() > 1 && bytes_of(&open[open.len() - 1].0) == path {
                 continue;
             }
             // Attach to the nearest ANCESTOR that was actually scanned, so an
             // entry whose parent fell outside the set still lands somewhere sane
             // instead of being dropped.
-            while open.len() > 1 && !entry.path.starts_with(&open[open.len() - 1].0) {
+            while open.len() > 1 && !is_under(bytes_of(&open[open.len() - 1].0), path) {
                 open.pop();
             }
             let parent = open[open.len() - 1].1;
@@ -135,8 +139,10 @@ impl Catalog {
             open.push((entry.path, id));
         }
 
+        let started = timings::lap("Catalog::build link", started);
         let mut catalog = Self { nodes, root, errors, backend_used };
         catalog.recompute();
+        timings::lap("Catalog::build roll-up", started);
         catalog
     }
 
@@ -317,6 +323,12 @@ impl Catalog {
     }
 }
 
+/// Puts entries in the order [`Catalog::build`] links them in. Input already
+/// in this order sorts in one linear pass.
+pub(crate) fn sort_subtrees(entries: &mut [Entry]) {
+    entries.par_sort_unstable_by(|a, b| subtree_order(&a.path, &b.path));
+}
+
 /// Byte order with every path separator ranked below every other byte, so a
 /// directory is followed immediately by its whole subtree: `a/b`, `a/b/c`,
 /// `a/b-x`. Plain byte order puts `a/b-x` between `a/b` and `a/b/c`, and the
@@ -324,10 +336,43 @@ impl Catalog {
 fn subtree_order(a: &Path, b: &Path) -> std::cmp::Ordering {
     // Separators are ASCII and every byte of a multi-byte character is >= 0x80,
     // so testing single bytes cannot mistake part of a character for one.
-    let key = |byte: &u8| if std::path::is_separator(char::from(*byte)) { 0 } else { *byte };
-    let a = a.as_os_str().as_encoded_bytes().iter().map(key);
-    let b = b.as_os_str().as_encoded_bytes().iter().map(key);
-    a.cmp(b)
+    let key = |byte: u8| if is_separator(byte) { 0 } else { byte };
+    let (a, b) = (bytes_of(a), bytes_of(b));
+    // Sorted neighbours share most of their path, so the shared prefix is
+    // skipped eight bytes at a time before any byte is mapped; this is the
+    // same order as comparing the mapped sequences, at a third of the cost.
+    let shared = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= shared && a[i..i + 8] == b[i..i + 8] {
+        i += 8;
+    }
+    while i < shared {
+        if a[i] != b[i] {
+            // Two different separators map to the same key; keep comparing.
+            match key(a[i]).cmp(&key(b[i])) {
+                std::cmp::Ordering::Equal => {}
+                unequal => return unequal,
+            }
+        }
+        i += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+fn bytes_of(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
+}
+
+fn is_separator(byte: u8) -> bool {
+    std::path::is_separator(char::from(byte))
+}
+
+/// Whether `path` lies strictly below `dir`, both spelled the way a backend
+/// spells them (see [`Catalog::build`]).
+fn is_under(dir: &[u8], path: &[u8]) -> bool {
+    path.len() > dir.len()
+        && path.starts_with(dir)
+        && (dir.last().copied().is_some_and(is_separator) || is_separator(path[dir.len()]))
 }
 
 fn blank_node(id: NodeId, name: OsString, kind: EntryKind) -> Node {
@@ -346,5 +391,47 @@ fn blank_node(id: NodeId, name: OsString, kind: EntryKind) -> Node {
         dir_count: 0,
         max_modified: None,
         depth: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the byte-compared link treating `C:\a\b-x` as inside
+    /// `C:\a\b` because its bytes start with it, or `C:\a\b\c` as outside it,
+    /// or counting a repeated path twice.
+    #[test]
+    fn byte_link_respects_component_boundaries() {
+        let entry = |path: &str, kind, size| Entry {
+            path: PathBuf::from(path),
+            kind,
+            size,
+            allocated: None,
+            modified: None,
+            accessed: None,
+        };
+        let entries = vec![
+            entry(r"C:\a\b-x", EntryKind::File, 1),
+            entry(r"C:\a\b\c", EntryKind::File, 2),
+            entry(r"C:\a", EntryKind::Dir, 0),
+            entry(r"C:\a\b", EntryKind::Dir, 0),
+            entry(r"C:\a\b\c", EntryKind::File, 2),
+            entry(r"C:\ab", EntryKind::File, 4),
+        ];
+        let catalog = Catalog::build(ScanReport {
+            root: PathBuf::from(r"C:\"),
+            entries,
+            errors: Vec::new(),
+            backend_used: BackendUsed::Mft,
+        });
+        let parent = |path: &str| {
+            let id = catalog.find(Path::new(path)).unwrap_or_else(|| panic!("{path} missing"));
+            catalog.path(catalog.node(id).parent.unwrap())
+        };
+        assert_eq!(parent(r"C:\a\b-x"), Path::new(r"C:\a"));
+        assert_eq!(parent(r"C:\a\b\c"), Path::new(r"C:\a\b"));
+        assert_eq!(parent(r"C:\ab"), Path::new(r"C:\"));
+        assert_eq!(catalog.node(catalog.root()).subtree_size, 7);
     }
 }

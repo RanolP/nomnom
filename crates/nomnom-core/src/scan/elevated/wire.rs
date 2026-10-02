@@ -197,6 +197,7 @@ fn read_report(r: &mut impl Read) -> io::Result<ScanReport> {
     let count = read_count(r, MAX_ENTRIES, "entry count")?;
     let mut entries = Vec::with_capacity(count.min(PREALLOC_CAP) as usize);
     let mut path_units: Vec<u16> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
     for index in 0..count {
         let flags = read_u8(r)?;
         if flags & !(KIND_MASK | HAS_ALLOCATED | HAS_MODIFIED | HAS_ACCESSED) != 0 {
@@ -216,8 +217,13 @@ fn read_report(r: &mut impl Read) -> io::Result<ScanReport> {
             )));
         }
         path_units.truncate(shared as usize);
-        let suffix = read_units(r, MAX_PATH_UNITS - shared, "path suffix")?;
-        path_units.extend_from_slice(&suffix);
+        // Into reused buffers: two allocations per entry were a fifth of the
+        // decode.
+        let len = read_count(r, MAX_PATH_UNITS - shared, "path suffix")? as usize;
+        scratch.resize(len * 2, 0);
+        r.read_exact(&mut scratch)?;
+        path_units
+            .extend(scratch.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])));
 
         let size = read_varint(r)?;
         let allocated = if flags & HAS_ALLOCATED != 0 { Some(read_varint(r)?) } else { None };
@@ -495,26 +501,15 @@ mod tests {
     #[test]
     #[ignore = "a timing measurement, not a check"]
     fn encode_and_decode_time_at_volume_scale() {
-        const N: usize = 4_500_000;
-        let root = PathBuf::from("C:\\");
-        let now = SystemTime::now();
-        let entries: Vec<Entry> = (0..N)
-            .map(|i| Entry {
-                path: root.join(format!(
-                    "Users\\someone\\dir{}\\sub{}\\file-{i}.dat",
-                    i / 5000,
-                    i / 50
-                )),
-                kind: EntryKind::File,
-                size: i as u64 * 31,
-                allocated: Some(i as u64 * 32),
-                modified: Some(now),
-                accessed: None,
-            })
-            .collect();
-        let report =
-            ScanReport { root, entries, errors: Vec::new(), backend_used: BackendUsed::Mft };
+        // NOMNOM_TIMINGS=1 prints the catalog's phases as well.
+        crate::timings::join_scan("bench");
+        let mut report = volume_scale_report(4_500_000);
+        let n = report.entries.len();
 
+        // As the helper does before it sends.
+        let started = Instant::now();
+        crate::catalog::sort_subtrees(&mut report.entries);
+        let sorted = started.elapsed();
         let started = Instant::now();
         let mut bytes = Vec::new();
         write_report(&mut bytes, &report).unwrap();
@@ -523,10 +518,59 @@ mod tests {
         let mut slice = bytes.as_slice();
         let Frame::Report(back) = read_frame(&mut slice).unwrap() else { panic!() };
         let decoded = started.elapsed();
-        assert_eq!(back.entries.len(), N);
+        assert_eq!(back.entries.len(), n);
+        let started = Instant::now();
+        let catalog = crate::catalog::Catalog::build(back);
+        let built = started.elapsed();
+        assert!(catalog.len() > n / 2);
         println!(
-            "{N} entries: {} MiB on the wire, encode {encoded:?}, decode {decoded:?}",
+            "{n} entries: helper sort {sorted:?}, {} MiB on the wire, encode {encoded:?}, \
+             decode {decoded:?}, Catalog::build {built:?}",
             bytes.len() >> 20
         );
+    }
+
+    /// A C:-shaped report: about one directory per ten files, depth up to a
+    /// dozen, in creation order the way MFT record order is: each entry lands
+    /// in one of the 2000 most recent directories, so neighbours share some
+    /// of their path but the whole is far from sorted.
+    fn volume_scale_report(n: usize) -> ScanReport {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let root = PathBuf::from("C:\\");
+        let now = SystemTime::now();
+        let mut dirs: Vec<(PathBuf, u32)> = vec![(root.clone(), 0)];
+        let mut entries = Vec::with_capacity(n);
+        let exts = ["dll", "exe", "txt", "json", "png", "js", "pyc", "dat", "Manifest", "mui"];
+        for i in 0..n {
+            let r = next();
+            // Parents favour recent directories, which is what gives depth.
+            let span = dirs.len().min(2000) as u64;
+            let (parent, depth) = dirs[dirs.len() - 1 - (r % span) as usize].clone();
+            let entry = if i % 10 == 0 && depth < 12 {
+                let path = parent.join(format!("Folder_{:x}", r >> 40));
+                dirs.push((path.clone(), depth + 1));
+                entry(path, EntryKind::Dir, 0)
+            } else {
+                let ext = exts[(r >> 8) as usize % exts.len()];
+                entry(
+                    parent.join(format!("file-{i}-{:x}.{ext}", r >> 50)),
+                    EntryKind::File,
+                    r >> 44,
+                )
+            };
+            entries.push(Entry {
+                allocated: Some(entry.size.next_multiple_of(4096)),
+                modified: Some(now),
+                accessed: Some(now),
+                ..entry
+            });
+        }
+        ScanReport { root, entries, errors: Vec::new(), backend_used: BackendUsed::Mft }
     }
 }

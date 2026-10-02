@@ -2,7 +2,7 @@
 //! a UAC prompt and receive its scan over a named pipe.
 //!
 //! The parent creates a pipe only it and Administrators can open, starts
-//! `current_exe() --nomnom-elevated-scan <pipe> <backend> <root>` with the
+//! `current_exe() --nomnom-elevated-scan <pipe> <mft|walk> <root>` with the
 //! `runas` verb, and reads the stream [`wire`] defines: progress frames it
 //! mirrors into [`ScanOptions::progress`], then the report. The helper writes a
 //! progress frame every 100 ms, so it notices a dead parent within that and

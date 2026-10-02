@@ -1,7 +1,7 @@
 //! Facts about what is on disk. No judgement, no aggregation.
 //!
-//! A scan always covers a whole volume: [`scan`] takes a [`VolumeRoot`], which
-//! only a drive root such as `C:\` parses into.
+//! A scan always covers a whole volume: [`scan_drive`] takes a [`VolumeRoot`],
+//! which only a drive root such as `C:\` parses into.
 //!
 //! Two backends produce the same [`Entry`] stream:
 //!
@@ -13,9 +13,10 @@
 //! - [`backend::walk`] walks the tree with the `ignore` crate. Portable, needs
 //!   no privileges, and is the fallback whenever the MFT path is unavailable.
 //!
-//! [`Backend::Auto`] tries MFT and falls back to walk, recording why in
-//! [`ScanReport::backend_used`] so the CLI can tell the user they are on the
-//! slow path and how to get off it.
+//! Which one runs is not the caller's choice: [`scan_drive`] takes the MFT
+//! whenever it can get it and falls back to walk, recording why in
+//! [`ScanReport::backend_used`] so a front-end can tell the user they are on
+//! the slow path and how to get off it.
 
 pub mod backend;
 mod drives;
@@ -27,8 +28,8 @@ pub use elevated::{is_elevated, maybe_run_helper};
 pub use root::VolumeRoot;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -65,14 +66,13 @@ pub struct ScanError {
     pub message: String,
 }
 
-/// Which backend to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Backend {
+/// Which backend [`backend::dispatch`] runs. Internal: [`scan_drive`] owns the
+/// choice so no front-end can offer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
     /// MFT where possible, walk otherwise.
-    #[default]
     Auto,
-    /// Fail rather than silently fall back — for benchmarking and for proving
-    /// the MFT path actually engaged.
+    /// Fail rather than silently fall back: the elevated helper's mode.
     Mft,
     Walk,
 }
@@ -88,9 +88,8 @@ pub enum BackendUsed {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
-    pub backend: Backend,
     /// Honour `.gitignore` and friends. Walk backend only; the MFT sees the
     /// volume, not the repo.
     pub respect_gitignore: bool,
@@ -98,17 +97,6 @@ pub struct ScanOptions {
     /// Live counters a UI on another thread reads to show how far the scan
     /// has got. See [`ScanProgress`] for what each backend fills in.
     pub progress: Option<Arc<ScanProgress>>,
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            backend: Backend::Auto,
-            respect_gitignore: false,
-            follow_symlinks: false,
-            progress: None,
-        }
-    }
 }
 
 impl ScanOptions {
@@ -152,6 +140,9 @@ pub struct ScanProgress {
     /// 0 means unknown.
     pub entries_total: AtomicU64,
     pub bytes: AtomicU64,
+    /// Why the MFT read was given up, set the moment [`scan_drive`] falls back
+    /// to the walk, so a front-end can say so while the slower scan runs.
+    pub fallback: OnceLock<String>,
 }
 
 impl ScanProgress {
@@ -184,13 +175,57 @@ pub struct ScanReport {
     pub backend_used: BackendUsed,
 }
 
-/// Scan the volume at `root`, honouring `opts`.
+/// Set to any value, [`scan_drive`] treats the elevated scan as failed without
+/// launching it, so the walk fallback can be exercised with no UAC prompt to
+/// decline.
+pub const DEBUG_FAIL_ELEVATED_ENV: &str = "NOMNOM_GUI_FAIL_ELEVATED";
+
+/// Scan the drive at `root`: the one scan every front-end runs.
 ///
-/// Returns `Err` only when the scan could not start at all (root missing, or
-/// [`Backend::Mft`] demanded and unavailable). Per-entry failures land in
-/// [`ScanReport::errors`].
-pub fn scan(root: &VolumeRoot, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
-    backend::dispatch(root.as_path(), opts)
+/// The MFT read is always tried first on NTFS: in-process when already
+/// elevated, otherwise through [`elevated::scan_elevated`], which raises one
+/// UAC prompt. A declined or failed prompt walks the drive instead, sets
+/// [`ScanProgress::fallback`] as it starts, and records the reason in
+/// [`BackendUsed::Walk`].
+///
+/// Returns `Err` only when the scan could not start at all. Per-entry failures
+/// land in [`ScanReport::errors`].
+pub fn scan_drive(
+    root: &VolumeRoot,
+    progress: Option<Arc<ScanProgress>>,
+) -> Result<ScanReport, ScanFailure> {
+    let opts = ScanOptions { progress, ..ScanOptions::default() };
+    let ntfs = volumes()
+        .into_iter()
+        .find(|volume| volume.root == root.as_path())
+        .is_none_or(|volume| volume.fs.eq_ignore_ascii_case("NTFS"));
+    if !ntfs || is_elevated() {
+        return backend::dispatch(root.as_path(), Backend::Auto, &opts);
+    }
+    let elevated = if std::env::var_os(DEBUG_FAIL_ELEVATED_ENV).is_some() {
+        Err(elevated::ElevatedScanError::Failed(format!("{DEBUG_FAIL_ELEVATED_ENV} is set")))
+    } else {
+        elevated::scan_elevated(root, &opts)
+    };
+    let reason = match elevated {
+        Ok(report) => return Ok(report),
+        Err(elevated::ElevatedScanError::Declined) => {
+            "Administrator access was declined".to_string()
+        }
+        Err(elevated::ElevatedScanError::Failed(message)) => {
+            format!("the elevated scan failed: {message}")
+        }
+    };
+    if let Some(progress) = &opts.progress {
+        // The helper may have counted part of the MFT before it stopped.
+        for counter in [&progress.entries, &progress.entries_total, &progress.bytes] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        let _ = progress.fallback.set(reason.clone());
+    }
+    let mut report = backend::dispatch(root.as_path(), Backend::Walk, &opts)?;
+    report.backend_used = BackendUsed::Walk { mft_unavailable: Some(reason) };
+    Ok(report)
 }
 
 #[derive(Debug, thiserror::Error)]

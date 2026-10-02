@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use common::report_of;
-use nomnom_core::catalog::{Catalog, file_types, largest_files};
+use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::{
     BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanProgress, ScanReport, VolumeRoot,
 };
@@ -216,58 +216,6 @@ fn progress_fraction_prefers_the_record_total_and_caps_the_byte_estimate() {
     progress.entries_total.store(200, Ordering::Relaxed);
     progress.entries.store(50, Ordering::Relaxed);
     assert_eq!(progress.fraction(1000), Some(0.25));
-}
-
-/// Catches directories being counted as files (twice over, once as a node and
-/// once through their children): the per-extension totals must add up to the
-/// root's file bytes and file count exactly.
-#[test]
-fn file_types_add_up_to_the_root_totals() {
-    let root = PathBuf::from("/r");
-    let catalog = Catalog::build(report(
-        &root,
-        vec![
-            dir_entry("/r"),
-            dir_entry("/r/src.d"),
-            file_entry("/r/src.d/main.RS", 30),
-            file_entry("/r/src.d/lib.rs", 20),
-            file_entry("/r/Makefile", 7),
-            file_entry("/r/.gitignore", 3),
-            file_entry("/r/photo.jpg", 100),
-        ],
-    ));
-
-    let types = file_types(&catalog);
-    let root_node = catalog.node(catalog.root());
-    assert_eq!(types.iter().map(|t| t.bytes).sum::<u64>(), root_node.subtree_size);
-    assert_eq!(types.iter().map(|t| t.count).sum::<u64>(), root_node.file_count);
-    let summary: Vec<(&str, u64, u64)> =
-        types.iter().map(|t| (t.ext.as_str(), t.bytes, t.count)).collect();
-    assert_eq!(summary, vec![("jpg", 100, 1), ("rs", 50, 2), ("(none)", 10, 2)]);
-}
-
-/// Catches the bounded heap evicting the wrong end (keeping the smallest
-/// files) or returning them unsorted.
-#[test]
-fn largest_files_keeps_the_biggest_in_descending_order() {
-    let root = PathBuf::from("/r");
-    let catalog = Catalog::build(report(
-        &root,
-        vec![
-            dir_entry("/r"),
-            file_entry("/r/a", 5),
-            file_entry("/r/b", 50),
-            file_entry("/r/c", 1),
-            file_entry("/r/d", 20),
-            dir_entry("/r/e"),
-            file_entry("/r/e/f", 40),
-        ],
-    ));
-
-    let names: Vec<PathBuf> =
-        largest_files(&catalog, 3).into_iter().map(|id| catalog.path(id)).collect();
-    assert_eq!(names, ["/r/b", "/r/e/f", "/r/d"].map(PathBuf::from));
-    assert_eq!(largest_files(&catalog, 99).len(), 5, "n beyond the file count returns all files");
 }
 
 /// Catches the drive picker coming up empty or garbled: the system drive is

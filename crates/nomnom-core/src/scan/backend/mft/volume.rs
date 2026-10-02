@@ -4,9 +4,9 @@
 //! multiple of the volume's sector size, while the `ntfs` crate reads at
 //! arbitrary offsets and in arbitrary lengths (a 1024-byte file record, a
 //! 4-byte reparse tag). This module bridges the two: it serves every read out
-//! of one large aligned block, refilling the block only when the requested
-//! offset falls outside it. MFT enumeration walks the table front to back, so
-//! that block is a near-total hit rate.
+//! of one aligned block, refilling the block only when the requested offset
+//! falls outside it. One block is a cache for scattered reads, not for the
+//! table itself: the sequential pass over the MFT is `super::stream`'s job.
 //!
 //! The alignment arithmetic is split behind [`BlockSource`] so it can be tested
 //! against an ordinary file — an off-by-one-sector bug here would silently
@@ -41,6 +41,12 @@ impl<S: BlockSource> AlignedReader<S> {
         let sector = sector.max(1);
         let block = block.max(sector as usize).next_multiple_of(sector as usize);
         Self { source, sector, pos: 0, buf: vec![0; block], buf_start: 0, buf_len: 0 }
+    }
+
+    /// The source underneath, for a caller that reads large aligned spans
+    /// itself and must not disturb this reader's cached block.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
     }
 
     fn buffered(&self, pos: u64) -> Option<usize> {
@@ -113,6 +119,49 @@ impl<S: BlockSource> Seek for AlignedReader<S> {
 
 fn overflowed() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range")
+}
+
+/// What a [`CountingSource`] has seen go through it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoStats {
+    pub reads: u64,
+    pub bytes: u64,
+    /// Reads that started at an offset some earlier read already started at.
+    /// A sequential pass keeps this near zero; a cache that thrashes between
+    /// two places on the device drives it toward `reads`.
+    pub rereads: u64,
+    pub reread_bytes: u64,
+}
+
+/// A [`BlockSource`] that counts every device read, so the IO a scan costs is a
+/// measured number rather than a guess.
+pub struct CountingSource<S> {
+    inner: S,
+    stats: IoStats,
+    seen: std::collections::HashSet<u64>,
+}
+
+impl<S> CountingSource<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner, stats: IoStats::default(), seen: Default::default() }
+    }
+
+    pub fn stats(&self) -> IoStats {
+        self.stats
+    }
+}
+
+impl<S: BlockSource> BlockSource for CountingSource<S> {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read_at(offset, out)?;
+        self.stats.reads += 1;
+        self.stats.bytes += n as u64;
+        if !self.seen.insert(offset) {
+            self.stats.rereads += 1;
+            self.stats.reread_bytes += n as u64;
+        }
+        Ok(n)
+    }
 }
 
 /// A [`BlockSource`] over an ordinary file, so the alignment arithmetic can be

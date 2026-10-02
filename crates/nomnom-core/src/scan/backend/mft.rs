@@ -17,28 +17,43 @@
 //! silent fallback and that string is all the user ever sees about it.
 
 pub mod paths;
+pub mod stream;
 pub mod volume;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ntfs::attribute_value::NtfsAttributeValue;
 use ntfs::structured_values::{NtfsFileName, NtfsFileNamespace, NtfsStandardInformation};
 use ntfs::{Ntfs, NtfsAttributeType, NtfsFileFlags, NtfsTime};
 
 use crate::scan::{BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport};
+use crate::timings;
 use paths::{DirRecord, PathBuilder, ROOT_RECORD, respell_under};
-use volume::{AlignedReader, VolumeSource};
+use stream::{Chunk, ChunkReader, MftLayout, SharedVolume};
+use volume::{AlignedReader, BlockSource, CountingSource, IoStats, VolumeSource};
 
 /// Records 0–15 are the NTFS metafiles (`$MFT`, `$LogFile`, `$Bitmap`, …).
 /// They are filesystem plumbing, not user data, and never appear in a scan.
 const FIRST_USER_RECORD: u64 = 16;
 
-/// Read-ahead block. MFT enumeration is front-to-back, so a large block turns
-/// ~1000 record reads into one device read.
-const READ_BLOCK: usize = 1 << 20;
+/// Read size of the sequential pass over the table: 8192 records of 1 KiB
+/// per device read.
+const STREAM_CHUNK: usize = 8 << 20;
+
+/// Block of the reader behind everything that is not the table stream: the
+/// boot sector, `$Volume`, and per-record reads that land elsewhere (a
+/// non-resident reparse value, an extension record). Those are scattered, so
+/// a large block would only inflate each one.
+const SCATTERED_BLOCK: usize = 4 << 10;
+
+/// Set to anything to print the scan's device reads to stderr, which is how a
+/// real elevated run proves the IO stays near one pass over the table.
+pub const IO_STATS_ENV: &str = "NOMNOM_MFT_IO_STATS";
 
 /// Upper bound on collected per-record errors. A pathologically damaged volume
 /// must not turn a scan into an out-of-memory error report.
@@ -49,6 +64,7 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
     // sees the volume, not a repository, and never traverses a link. Only
     // `progress` applies here.
 
+    let started = Instant::now();
     let canonical =
         std::fs::canonicalize(root).map_err(|_| ScanFailure::RootUnreadable(root.to_path_buf()))?;
     let root_canon = strip_verbatim(&canonical)?;
@@ -75,7 +91,7 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
         }
     })?;
 
-    let mut fs = AlignedReader::new(source, target.sector, READ_BLOCK);
+    let mut fs = AlignedReader::new(CountingSource::new(source), target.sector, SCATTERED_BLOCK);
     let ntfs = Ntfs::new(&mut fs).map_err(|err| {
         ScanFailure::MftUnavailable(format!(
             "parsing the NTFS boot sector of {} failed: {err}",
@@ -91,7 +107,33 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
         ))
     })?;
 
-    enumerate(&ntfs, &mut fs, &target, root, &root_canon, opts)
+    let layout = MftLayout::read(&ntfs, &mut fs).map_err(ScanFailure::MftUnavailable)?;
+    let started = timings::lap("MFT volume open", started);
+    let mut volume = SharedVolume::new(fs, target.sector, STREAM_CHUNK);
+    let pass = read_records(&ntfs, &mut volume, &layout, opts);
+    if std::env::var_os(IO_STATS_ENV).is_some() {
+        eprintln!("{}", io_summary(volume.source_mut().stats(), &layout));
+    }
+    let started = timings::lap("MFT IO + parse", started);
+
+    let report = build_report(pass, &target, root, &root_canon);
+    timings::lap("MFT path build", started);
+    Ok(report)
+}
+
+fn io_summary(stats: IoStats, layout: &MftLayout) -> String {
+    const MIB: f64 = (1u64 << 20) as f64;
+    let ratio = stats.bytes as f64 / layout.bytes().max(1) as f64;
+    format!(
+        "MFT IO: {} reads, {:.1} MiB read ({} re-reads, {:.1} MiB) for a {:.1} MiB table \
+         of {} records: {ratio:.2}x the table",
+        stats.reads,
+        stats.bytes as f64 / MIB,
+        stats.rereads,
+        stats.reread_bytes as f64 / MIB,
+        layout.bytes() as f64 / MIB,
+        layout.record_count(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -101,8 +143,10 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
 /// Everything one record contributes, held until every directory is known and
 /// paths can be resolved. A file's parent may sit later in the table than the
 /// file itself, so paths cannot be built during the pass that reads records.
+#[derive(Debug, PartialEq)]
 struct RawRecord {
     number: u64,
+    is_dir: bool,
     kind: EntryKind,
     size: u64,
     allocated: u64,
@@ -112,112 +156,198 @@ struct RawRecord {
     names: Vec<(u64, String)>,
 }
 
-fn enumerate(
+/// What the pass over the table collects, before any path is built.
+#[derive(Debug, Default)]
+struct RecordPass {
+    records: Vec<RawRecord>,
+    dirs: HashMap<u64, DirRecord>,
+    errors: Vec<ScanError>,
+}
+
+impl RecordPass {
+    fn add(&mut self, number: u64, record: Result<Option<RawRecord>, ntfs::NtfsError>) {
+        match record {
+            Ok(Some(record)) => {
+                if record.is_dir {
+                    let (parent, name) = &record.names[0];
+                    self.dirs.insert(number, DirRecord { name: name.clone(), parent: *parent });
+                }
+                self.records.push(record);
+            }
+            Ok(None) => {}
+            Err(err) => push_error(&mut self.errors, format!("MFT record {number}: {err}")),
+        }
+    }
+}
+
+/// Reads every user record in table order.
+///
+/// One thread reads the table forward a chunk at a time; each chunk's records
+/// are parsed across the rayon pool while the next chunk is read, and folded
+/// into the pass in table order, so the result is the sequential one.
+fn read_records<S: BlockSource + Send>(
     ntfs: &Ntfs,
-    fs: &mut AlignedReader<VolumeSource>,
+    volume: &mut SharedVolume<S>,
+    layout: &MftLayout,
+    opts: &ScanOptions,
+) -> RecordPass {
+    use rayon::prelude::*;
+
+    /// Chunks read ahead of the parse: enough to keep the device busy while
+    /// one chunk is parsed, few enough to bound memory at a few chunks.
+    const READ_AHEAD: usize = 2;
+
+    let total = layout.record_count();
+    opts.set_entries_total(total.saturating_sub(FIRST_USER_RECORD));
+
+    // `Ntfs::file` re-reads record 0 on every call to find the record it was
+    // asked for. Pinned, no scattered read can evict it and turn the next
+    // record into an extra device read.
+    let record_size = u64::from(ntfs.file_record_size());
+    if let Some(at) = ntfs.mft_position().value() {
+        volume.pin(at.get(), record_size as usize);
+    }
+    let volume = &*volume;
+
+    let mut pass = RecordPass::default();
+    std::thread::scope(|scope| {
+        let (send, batches) = std::sync::mpsc::sync_channel(READ_AHEAD);
+        scope.spawn(move || {
+            // A batch is every record from `first` up to the next one whose
+            // bytes the current chunk does not hold. A record with no span on
+            // the volume stays in the batch and reads through the scattered
+            // reader.
+            let mut chunk = Chunk::default();
+            let mut first = FIRST_USER_RECORD;
+            for number in FIRST_USER_RECORD..total {
+                let Some(span) = layout.span(number) else { continue };
+                if chunk.holds(span.phys, record_size) {
+                    continue;
+                }
+                let next = volume.load_chunk(span);
+                if number > first && send.send((first..number, chunk)).is_err() {
+                    return;
+                }
+                (first, chunk) = (number, next);
+            }
+            if first < total {
+                let _ = send.send((first..total, chunk));
+            }
+        });
+
+        for (numbers, chunk) in batches {
+            let parsed: Vec<_> = numbers
+                .clone()
+                .into_par_iter()
+                .map(|number| read_record(ntfs, &mut ChunkReader::new(volume, &chunk), number))
+                .collect();
+            // Every record counts toward progress, free and unreadable ones
+            // too, because `entries_total` is the size of the table, not of
+            // its live set.
+            if let Some(progress) = &opts.progress {
+                progress.entries.fetch_add(parsed.len() as u64, Ordering::Relaxed);
+            }
+            for (number, record) in numbers.zip(parsed) {
+                pass.add(number, record);
+            }
+        }
+    });
+    pass
+}
+
+/// One record's contribution, `None` for a free slot or a nameless record.
+fn read_record<T: Read + Seek>(
+    ntfs: &Ntfs,
+    fs: &mut T,
+    number: u64,
+) -> Result<Option<RawRecord>, ntfs::NtfsError> {
+    let file = ntfs.file(fs, number)?;
+    // A record not in use is a deleted file whose slot has not been reused.
+    if !file.flags().contains(NtfsFileFlags::IN_USE) {
+        return Ok(None);
+    }
+
+    let is_dir = file.is_directory();
+    let mut names: Vec<(u64, String)> = Vec::new();
+    let mut short_names: Vec<(u64, String)> = Vec::new();
+    let mut size = 0u64;
+    let mut allocated = 0u64;
+    let mut info: Option<NtfsStandardInformation> = None;
+    let mut reparse_tag: Option<u32> = None;
+
+    // One pass over the attributes collects all four facts. Calling
+    // `NtfsFile::name`, `::info` and `::data` instead would re-walk the
+    // attribute list three times per record.
+    let mut attributes = file.attributes();
+    while let Some(item) = attributes.next(fs) {
+        let Ok(item) = item else { continue };
+        let Ok(attribute) = item.to_attribute() else { continue };
+        let Ok(ty) = attribute.ty() else { continue };
+
+        match ty {
+            NtfsAttributeType::StandardInformation => {
+                if let Ok(value) = attribute.structured_value::<_, NtfsStandardInformation>(fs) {
+                    info = Some(value);
+                }
+            }
+            NtfsAttributeType::FileName => {
+                if let Ok(value) = attribute.structured_value::<_, NtfsFileName>(fs) {
+                    let parent = value.parent_directory_reference().file_record_number();
+                    let name = value.name().to_string_lossy();
+                    // The 8.3 alias duplicates a long name that is also
+                    // present; it is a fallback, never a preference.
+                    if value.namespace() == NtfsFileNamespace::Dos {
+                        short_names.push((parent, name));
+                    } else {
+                        names.push((parent, name));
+                    }
+                }
+            }
+            NtfsAttributeType::Data if attribute.name().is_ok_and(|n| n.is_empty()) => {
+                size = attribute.value_length();
+                allocated = allocated_bytes(&attribute, fs);
+            }
+            NtfsAttributeType::ReparsePoint => {
+                reparse_tag = read_reparse_tag(&attribute, fs);
+            }
+            _ => {}
+        }
+    }
+
+    if names.is_empty() {
+        names = short_names;
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+
+    if is_dir {
+        // Directories occupy index clusters, but that space is filesystem
+        // bookkeeping rather than any file's content, and charging it here
+        // would double-count in a size roll-up.
+        size = 0;
+        allocated = 0;
+    }
+
+    Ok(Some(RawRecord {
+        number,
+        is_dir,
+        kind: classify(is_dir, reparse_tag),
+        size,
+        allocated,
+        modified: info.as_ref().and_then(|i| to_system_time(i.modification_time())),
+        accessed: info.as_ref().and_then(|i| to_system_time(i.access_time())),
+        names,
+    }))
+}
+
+fn build_report(
+    pass: RecordPass,
     target: &VolumeTarget,
     root: &Path,
     root_canon: &Path,
-    opts: &ScanOptions,
-) -> Result<ScanReport, ScanFailure> {
-    let total = mft_record_count(ntfs, fs)?;
-    opts.set_entries_total(total.saturating_sub(FIRST_USER_RECORD));
-
-    let mut errors: Vec<ScanError> = Vec::new();
-    let mut dirs: HashMap<u64, DirRecord> = HashMap::new();
-    let mut records: Vec<RawRecord> = Vec::new();
-
-    for number in FIRST_USER_RECORD..total {
-        // Every record counts toward progress, free and unreadable ones too,
-        // because `entries_total` is the size of the table, not of its live set.
-        opts.tick();
-        let file = match ntfs.file(fs, number) {
-            Ok(file) => file,
-            Err(err) => {
-                push_error(&mut errors, format!("MFT record {number}: {err}"));
-                continue;
-            }
-        };
-        // A record not in use is a deleted file whose slot has not been reused.
-        if !file.flags().contains(NtfsFileFlags::IN_USE) {
-            continue;
-        }
-
-        let is_dir = file.is_directory();
-        let mut names: Vec<(u64, String)> = Vec::new();
-        let mut short_names: Vec<(u64, String)> = Vec::new();
-        let mut size = 0u64;
-        let mut allocated = 0u64;
-        let mut info: Option<NtfsStandardInformation> = None;
-        let mut reparse_tag: Option<u32> = None;
-
-        // One pass over the attributes collects all four facts. Calling
-        // `NtfsFile::name`, `::info` and `::data` instead would re-walk the
-        // attribute list three times per record.
-        let mut attributes = file.attributes();
-        while let Some(item) = attributes.next(fs) {
-            let Ok(item) = item else { continue };
-            let Ok(attribute) = item.to_attribute() else { continue };
-            let Ok(ty) = attribute.ty() else { continue };
-
-            match ty {
-                NtfsAttributeType::StandardInformation => {
-                    if let Ok(value) = attribute.structured_value::<_, NtfsStandardInformation>(fs)
-                    {
-                        info = Some(value);
-                    }
-                }
-                NtfsAttributeType::FileName => {
-                    if let Ok(value) = attribute.structured_value::<_, NtfsFileName>(fs) {
-                        let parent = value.parent_directory_reference().file_record_number();
-                        let name = value.name().to_string_lossy();
-                        // The 8.3 alias duplicates a long name that is also
-                        // present; it is a fallback, never a preference.
-                        if value.namespace() == NtfsFileNamespace::Dos {
-                            short_names.push((parent, name));
-                        } else {
-                            names.push((parent, name));
-                        }
-                    }
-                }
-                NtfsAttributeType::Data if attribute.name().is_ok_and(|n| n.is_empty()) => {
-                    size = attribute.value_length();
-                    allocated = allocated_bytes(&attribute, fs);
-                }
-                NtfsAttributeType::ReparsePoint => {
-                    reparse_tag = read_reparse_tag(&attribute, fs);
-                }
-                _ => {}
-            }
-        }
-
-        if names.is_empty() {
-            names = short_names;
-        }
-        if names.is_empty() {
-            continue;
-        }
-
-        if is_dir {
-            // Directories occupy index clusters, but that space is filesystem
-            // bookkeeping rather than any file's content, and charging it here
-            // would double-count in a size roll-up.
-            size = 0;
-            allocated = 0;
-            dirs.insert(number, DirRecord { name: names[0].1.clone(), parent: names[0].0 });
-        }
-
-        records.push(RawRecord {
-            number,
-            kind: classify(is_dir, reparse_tag),
-            size,
-            allocated,
-            modified: info.as_ref().and_then(|i| to_system_time(i.modification_time())),
-            accessed: info.as_ref().and_then(|i| to_system_time(i.access_time())),
-            names,
-        });
-    }
-
+) -> ScanReport {
+    let RecordPass { records, dirs, mut errors } = pass;
     let mut builder = PathBuilder::new(&dirs, target.mount.clone(), ROOT_RECORD);
     let mut entries: Vec<Entry> = Vec::new();
 
@@ -265,7 +395,7 @@ fn enumerate(
         }
     }
 
-    Ok(ScanReport { root: root.to_path_buf(), entries, errors, backend_used: BackendUsed::Mft })
+    ScanReport { root: root.to_path_buf(), entries, errors, backend_used: BackendUsed::Mft }
 }
 
 fn to_entry(record: &RawRecord, path: PathBuf) -> Entry {
@@ -306,35 +436,13 @@ fn push_error(errors: &mut Vec<ScanError>, message: String) {
     }
 }
 
-/// How many file records the table holds, read off `$MFT`'s own `$DATA` length.
-fn mft_record_count(ntfs: &Ntfs, fs: &mut AlignedReader<VolumeSource>) -> Result<u64, ScanFailure> {
-    let mft = ntfs
-        .file(fs, 0)
-        .map_err(|err| ScanFailure::MftUnavailable(format!("reading $MFT failed: {err}")))?;
-    let data = mft
-        .data(fs, "")
-        .ok_or_else(|| ScanFailure::MftUnavailable("$MFT has no $DATA attribute".into()))?
-        .map_err(|err| ScanFailure::MftUnavailable(format!("reading $MFT $DATA failed: {err}")))?;
-    let attribute = data
-        .to_attribute()
-        .map_err(|err| ScanFailure::MftUnavailable(format!("parsing $MFT $DATA failed: {err}")))?;
-    let record_size = u64::from(ntfs.file_record_size());
-    if record_size == 0 {
-        return Err(ScanFailure::MftUnavailable("boot sector reports a zero record size".into()));
-    }
-    Ok(attribute.value_length() / record_size)
-}
-
 /// On-disk bytes of a `$DATA` attribute.
 ///
 /// Sparse runs are skipped, which is exactly what makes this worth reading: a
 /// sparse or compressed file's allocation is the runs that actually have
 /// clusters behind them, not its logical length. A resident value lives inside
 /// the MFT record and occupies no clusters of its own.
-fn allocated_bytes(
-    attribute: &ntfs::NtfsAttribute<'_, '_>,
-    fs: &mut AlignedReader<VolumeSource>,
-) -> u64 {
+fn allocated_bytes<T: Read + Seek>(attribute: &ntfs::NtfsAttribute<'_, '_>, fs: &mut T) -> u64 {
     match attribute.value(fs) {
         Ok(NtfsAttributeValue::NonResident(value)) => {
             let mut total = 0u64;
@@ -351,9 +459,9 @@ fn allocated_bytes(
 }
 
 /// First 4 bytes of a `$REPARSE_POINT` value: the reparse tag.
-fn read_reparse_tag(
+fn read_reparse_tag<T: Read + Seek>(
     attribute: &ntfs::NtfsAttribute<'_, '_>,
-    fs: &mut AlignedReader<VolumeSource>,
+    fs: &mut T,
 ) -> Option<u32> {
     use ntfs::NtfsReadSeek;
 
@@ -567,4 +675,119 @@ pub(crate) fn from_wide(buffer: &[u16]) -> PathBuf {
     use std::os::windows::ffi::OsStringExt;
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     PathBuf::from(OsString::from_wide(&buffer[..len]))
+}
+
+#[cfg(test)]
+mod test_image;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_image::{Image, MemSource, SECTOR, build};
+
+    /// The pass as it ran before streaming: one `Ntfs::file` per record over a
+    /// single-block reader. Slow, but every byte is fetched where `ntfs` asks.
+    fn reference_pass(image: &Image, block: usize) -> (RecordPass, IoStats) {
+        let source = CountingSource::new(MemSource::new(image, SECTOR));
+        let mut fs = AlignedReader::new(source, SECTOR, block);
+        let ntfs = Ntfs::new(&mut fs).unwrap();
+        let layout = MftLayout::read(&ntfs, &mut fs).unwrap();
+        let mut pass = RecordPass::default();
+        for number in FIRST_USER_RECORD..layout.record_count() {
+            pass.add(number, read_record(&ntfs, &mut fs, number));
+        }
+        (pass, fs.source_mut().stats())
+    }
+
+    fn streamed_pass(image: &Image, sector: u64) -> (RecordPass, IoStats) {
+        let source = CountingSource::new(MemSource::new(image, sector));
+        let mut fs = AlignedReader::new(source, sector, SCATTERED_BLOCK);
+        let ntfs = Ntfs::new(&mut fs).unwrap();
+        let layout = MftLayout::read(&ntfs, &mut fs).unwrap();
+        let mut volume = SharedVolume::new(fs, sector, STREAM_CHUNK);
+        let pass = read_records(&ntfs, &mut volume, &layout, &ScanOptions::default());
+        (pass, volume.source_mut().stats())
+    }
+
+    /// Times the pass on a large image on one thread and on the full pool.
+    /// `cargo test -p nomnom-core --release --lib mft_pass_time -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, not a check"]
+    fn mft_pass_time_one_thread_vs_pool() {
+        let image = build(400_000);
+        let timed = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let started = std::time::Instant::now();
+            let (pass, _) = pool.install(|| streamed_pass(&image, SECTOR));
+            (started.elapsed(), pass.records.len())
+        };
+        let (one, records) = timed(1);
+        let (all, same) = timed(0);
+        assert_eq!(records, same);
+        eprintln!(
+            "{records} records of {} MiB: 1 thread {one:.2?}, {} threads {all:.2?}",
+            image.mft_bytes >> 20,
+            rayon::current_num_threads(),
+        );
+    }
+
+    fn messages(pass: &RecordPass) -> Vec<&str> {
+        pass.errors.iter().map(|e| e.message.as_str()).collect()
+    }
+
+    /// Regression: the streamed pass serving `ntfs` the wrong bytes — a wrong
+    /// fragment mapping, a chunk boundary, a straddled record, a misaligned
+    /// device read — which would silently change entries, sizes or errors.
+    /// The per-record reader is the oracle.
+    #[test]
+    fn streamed_pass_matches_per_record_reads_on_a_fragmented_table() {
+        let image = build(3000);
+        let (want, _) = reference_pass(&image, 4096);
+
+        // The image really holds every case this is meant to cover.
+        let records = &want.records;
+        let kinds = |kind| records.iter().filter(|r| r.kind == kind).count();
+        assert!(kinds(EntryKind::Dir) > 50 && kinds(EntryKind::File) > 1000);
+        assert!(records.iter().any(|r| r.kind == EntryKind::Symlink && r.is_dir), "junction");
+        assert!(records.iter().any(|r| r.kind == EntryKind::Symlink && !r.is_dir), "symlink");
+        assert!(records.iter().any(|r| r.names.len() == 2), "hard link");
+        assert!(records.iter().any(|r| r.names[0].1.contains('~')), "8.3-only name");
+        assert!(records.iter().any(|r| r.allocated == 3 * test_image::CLUSTER), "sparse run");
+        assert!(records.iter().any(|r| r.number == 31 && r.size == 3 * test_image::CLUSTER - 10));
+        assert!(records.iter().all(|r| r.modified.is_some() && r.accessed.is_some()));
+        assert!(!want.errors.is_empty(), "corrupt records");
+
+        // 4096 forces stream chunks to start up to three records early.
+        for sector in [SECTOR, 4096] {
+            let (got, _) = streamed_pass(&image, sector);
+            assert_eq!(got.records, want.records, "sector {sector}");
+            assert_eq!(got.dirs, want.dirs, "sector {sector}");
+            assert_eq!(messages(&got), messages(&want), "sector {sector}");
+        }
+    }
+
+    /// Regression: the C: scan that read a 1 MiB block twice per record — 17x
+    /// the table and counting — because `Ntfs::file` reads record 0 before
+    /// every record and the two evicted each other from a one-block cache.
+    #[test]
+    fn mft_pass_reads_the_table_about_once_not_once_per_record() {
+        let image = build(20_000);
+        let (pass, stats) = streamed_pass(&image, SECTOR);
+        assert!(pass.records.len() > 15_000);
+
+        let budget = image.mft_bytes + image.mft_bytes / 10 + (256 << 10);
+        assert!(
+            stats.bytes <= budget,
+            "read {} bytes ({} reads, {} re-reads) for a {}-byte table; budget {budget}",
+            stats.bytes,
+            stats.reads,
+            stats.rereads,
+            image.mft_bytes,
+        );
+        // Bytes alone pass with a small block read once per few records, which
+        // caps the scan at the device's ops/s instead. The stream needs a
+        // handful of reads; the rest are the image's ~175 non-resident reparse
+        // values at one scattered read each.
+        assert!(stats.reads <= 400, "{} device reads for 20,000 records", stats.reads);
+    }
 }

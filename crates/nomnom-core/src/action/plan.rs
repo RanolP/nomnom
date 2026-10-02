@@ -13,8 +13,8 @@ use super::ActionError;
 
 /// One reversible operation on one path.
 ///
-/// There is no hard delete. [`Action::Trash`] goes to the OS recycle bin (or to
-/// a staging directory, see [`super::TrashPolicy`]); the other two are renames.
+/// There is no hard delete. [`Action::Trash`] goes to the OS recycle bin; the
+/// other two are renames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
@@ -126,7 +126,7 @@ impl Plan {
     }
 
     /// Add an action, running every guard first. The stored action carries
-    /// canonical paths, so the journal later records unambiguous ones.
+    /// canonical paths, so the apply report later records unambiguous ones.
     pub fn push(
         &mut self,
         action: Action,

@@ -8,77 +8,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use nomnom_core::catalog::Catalog;
-use nomnom_core::scan::elevated::{ElevatedScanError, scan_elevated};
-use nomnom_core::scan::{
-    Backend, BackendUsed, ScanOptions, ScanProgress, ScanReport, VolumeRoot, is_elevated, scan,
-    volumes,
-};
+use nomnom_core::scan::{BackendUsed, ScanProgress, VolumeRoot, scan_drive, volumes};
+use nomnom_core::timings;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum BackendArg {
-    #[default]
-    Auto,
-    Mft,
-    Walk,
-}
-
-impl From<BackendArg> for Backend {
-    fn from(arg: BackendArg) -> Self {
-        match arg {
-            BackendArg::Auto => Backend::Auto,
-            BackendArg::Mft => Backend::Mft,
-            BackendArg::Walk => Backend::Walk,
-        }
-    }
-}
-
-pub fn load(drive: &VolumeRoot, backend: BackendArg) -> Result<Catalog> {
+/// Scans through core's [`scan_drive`], the GUI's scan too: MFT behind one UAC
+/// prompt when needed, the walk when that is declined, which [`warn_backend`]
+/// then prints.
+pub fn load(drive: &VolumeRoot) -> Result<Catalog> {
     let volume = volumes().into_iter().find(|volume| volume.root == drive.as_path());
     let progress = Arc::new(ScanProgress::default());
-    let opts = ScanOptions {
-        backend: backend.into(),
-        progress: Some(Arc::clone(&progress)),
-        ..ScanOptions::default()
-    };
     let used = volume.as_ref().map_or(0, |volume| volume.total.saturating_sub(volume.free));
-    let ntfs = volume.as_ref().is_none_or(|volume| volume.fs.eq_ignore_ascii_case("NTFS"));
 
-    let meter = Meter::start(progress, used);
-    let report = scan_drive(drive, opts, ntfs);
+    timings::start_scan("cli");
+    let started = Instant::now();
+    let meter = Meter::start(Arc::clone(&progress), used);
+    let report = scan_drive(drive, Some(progress));
     meter.stop();
-    Ok(Catalog::build(report?))
-}
-
-/// The MFT read is always offered, as the GUI offers it: in-process when
-/// already elevated, otherwise through one UAC prompt. A declined or failed
-/// prompt walks instead and records why, which [`warn_backend`] prints.
-/// `--backend mft` fails rather than falling back; `--backend walk` never
-/// prompts.
-fn scan_drive(drive: &VolumeRoot, opts: ScanOptions, ntfs: bool) -> Result<ScanReport> {
-    let cannot = || format!("cannot scan {drive}");
-    if opts.backend == Backend::Walk || !ntfs || is_elevated() {
-        return scan(drive, &opts).with_context(cannot);
-    }
-    let reason = match scan_elevated(drive, &opts) {
-        Ok(report) => return Ok(report),
-        Err(ElevatedScanError::Declined) => "Administrator access was declined".to_string(),
-        Err(ElevatedScanError::Failed(message)) => format!("the elevated scan failed: {message}"),
-    };
-    if opts.backend == Backend::Mft {
-        return Err(anyhow!("MFT backend unavailable: {reason}")).with_context(cannot);
-    }
-    // The helper may have counted part of the MFT before it stopped.
-    if let Some(progress) = &opts.progress {
-        for counter in [&progress.entries, &progress.entries_total, &progress.bytes] {
-            counter.store(0, Ordering::Relaxed);
-        }
-    }
-    let walk = ScanOptions { backend: Backend::Walk, ..opts };
-    let mut report = scan(drive, &walk).with_context(cannot)?;
-    report.backend_used = BackendUsed::Walk { mft_unavailable: Some(reason) };
-    Ok(report)
+    let report = report.with_context(|| format!("cannot scan {drive}"))?;
+    let catalog_started = timings::lap("cli start -> report in hand", started);
+    let catalog = Catalog::build(report);
+    timings::lap("Catalog::build total", catalog_started);
+    Ok(catalog)
 }
 
 /// A scan of a whole drive takes long enough that silence reads as a hang,

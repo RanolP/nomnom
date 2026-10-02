@@ -127,7 +127,7 @@ impl std::hash::Hash for Label {
     }
 }
 
-/// A plain string, so the JSON output and the journal stay readable.
+/// A plain string, so the JSON output stays readable.
 impl Serialize for Label {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -154,7 +154,7 @@ pub enum Disposition {
 /// `docs/lang.md`: "With packs coming from the network, 'why does nomnom want
 /// to delete this' must be answerable down to the rule, so provenance is part
 /// of the verdict rather than a debugging aid." It therefore travels inside the
-/// verdict, into the plan and into the journal, and is not reconstructible
+/// verdict, into the plan and into the apply report, and is not reconstructible
 /// after the fact from anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
@@ -197,7 +197,7 @@ pub struct Verdict {
     /// `docs/lang.md`: a rule from an untrusted pack "is downgraded, and the
     /// CLI says why". The sentence lives beside [`Provenance`] rather than in a
     /// channel of its own because everything downstream — `--json`, the plan,
-    /// the journal — already carries the verdict and nothing else; a parallel
+    /// the apply report — already carries the verdict and nothing else; a parallel
     /// map would have to be re-joined by `NodeId` at every one of them, and the
     /// first consumer that forgot would silently drop the explanation while
     /// still showing the downgraded disposition.

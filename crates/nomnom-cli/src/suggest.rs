@@ -17,17 +17,16 @@ use nomnom_core::verdict::{
 };
 use serde::Serialize;
 
-use crate::input::{self, BackendArg};
+use crate::input;
 
 pub fn run(
     drive: &VolumeRoot,
-    backend: BackendArg,
     show_errors: bool,
     explicit: &[PathBuf],
     json: bool,
 ) -> Result<ExitCode> {
     let packs = resolve_packs(drive.as_path(), explicit)?;
-    let catalog = input::load(drive, backend)?;
+    let catalog = input::load(drive)?;
     input::warn_backend(&catalog);
     input::report_errors(&catalog, show_errors);
 

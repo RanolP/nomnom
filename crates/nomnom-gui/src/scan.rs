@@ -187,7 +187,8 @@ impl ScanScreen {
         let map = canvas(
             move |bounds, _, _| prepare_map.borrow_mut().prepare(&prepare_data, root, bounds),
             move |_, (), window, _| {
-                paint_map.borrow().paint(&paint_data.catalog, selected, hovered, window)
+                paint_map.borrow().paint(&paint_data.catalog, selected, hovered, window);
+                paint_data.note_painted();
             },
         )
         .size_full();

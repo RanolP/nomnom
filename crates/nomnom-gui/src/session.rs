@@ -1,18 +1,17 @@
 //! The one shared piece of state: which drive is open, what the scan found,
-//! and what the judge made of it. Scan runs once per drive; Suggest and Clean
-//! read the same assessment instead of each scanning again.
+//! and what the judge made of it. Scan runs once per drive, and the judging
+//! starts by itself once it lands; the plan list and Reclaim read that one
+//! assessment.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter};
-use nomnom_core::catalog::{Catalog, FileType, NodeId, file_types, largest_files};
-use nomnom_core::scan::elevated::{ElevatedScanError, scan_elevated};
-use nomnom_core::scan::{
-    self, Backend, ScanFailure, ScanOptions, ScanReport, Volume, VolumeRoot, is_elevated,
-};
+use nomnom_core::catalog::{Catalog, NodeId};
+use nomnom_core::scan::{self, ScanFailure, Volume, VolumeRoot};
+use nomnom_core::timings;
 use nomnom_core::verdict::{Assessment, assess, resolve_packs};
 
 use crate::palette::Palette;
@@ -20,12 +19,13 @@ use crate::palette::Palette;
 /// The long-running phase in flight. Only one runs at a time: every phase
 /// either reads the catalog another would replace or moves files another
 /// would read, so the UI disables conflicting actions while this is `Some`.
+///
+/// Judging is not a phase: it only reads the catalog, so it runs beside the
+/// tree and is superseded, never waited on, when a new scan starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Scanning,
-    Assessing,
     Applying,
-    Undoing,
     Packs,
 }
 
@@ -33,9 +33,7 @@ impl Phase {
     pub fn label(self) -> &'static str {
         match self {
             Phase::Scanning => "Scanning…",
-            Phase::Assessing => "Judging what each path is…",
             Phase::Applying => "Applying the plan…",
-            Phase::Undoing => "Undoing…",
             Phase::Packs => "Working on packs…",
         }
     }
@@ -47,9 +45,6 @@ pub struct ScanProgress {
     /// Bytes in use on the volume, the walk's yardstick: it knows no entry
     /// total up front, but it does sum file sizes as it goes.
     used_bytes: u64,
-    /// Set by the scanning thread the moment it falls back to the walk, so
-    /// the banner shows while the slower scan is still running.
-    notice: Arc<OnceLock<String>>,
     pub started: Instant,
 }
 
@@ -64,83 +59,49 @@ impl ScanProgress {
         self.counters.fraction(self.used_bytes)
     }
 
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.get().map(String::as_str)
+    /// Set the moment core's scan falls back to the walk, so the banner shows
+    /// while the slower scan is still running.
+    pub fn notice(&self) -> Option<String> {
+        self.counters.fallback.get().map(|reason| fallback_notice(reason))
     }
 }
 
-/// The MFT read is always offered: in-process when already elevated,
-/// otherwise through core's elevated helper, which raises one UAC prompt per
-/// scan. A declined or failed prompt falls back to the walk and puts why in
-/// `notice`. `Backend::Mft` keeps the CLI's meaning, failing rather than
-/// falling back.
-fn scan_drive(
-    root: &VolumeRoot,
-    opts: ScanOptions,
-    ntfs: bool,
-    notice_slot: &OnceLock<String>,
-) -> Result<ScanReport, ScanFailure> {
-    if opts.backend == Backend::Walk || !ntfs || is_elevated() {
-        return scan::scan(root, &opts);
-    }
-    // Lets the fallback be exercised without a UAC prompt to decline.
-    let elevated = if std::env::var_os("NOMNOM_GUI_FAIL_ELEVATED").is_some() {
-        Err(ElevatedScanError::Failed("NOMNOM_GUI_FAIL_ELEVATED is set".into()))
-    } else {
-        scan_elevated(root, &opts)
-    };
-    let notice = match elevated {
-        Ok(report) => return Ok(report),
-        Err(ElevatedScanError::Declined) => {
-            "Administrator access declined — using the slower walk scan".to_string()
-        }
-        Err(ElevatedScanError::Failed(message)) => {
-            format!("The elevated MFT scan failed ({message}) — using the slower walk scan")
-        }
-    };
-    if opts.backend == Backend::Mft {
-        return Err(ScanFailure::MftUnavailable(notice));
-    }
-    eprintln!("nomnom-gui: {notice}");
-    let _ = notice_slot.set(notice);
-    // The helper may have counted part of the MFT before it stopped.
-    if let Some(progress) = &opts.progress {
-        for counter in [&progress.entries, &progress.entries_total, &progress.bytes] {
-            counter.store(0, Ordering::Relaxed);
-        }
-    }
-    let walk = ScanOptions { backend: Backend::Walk, ..opts };
-    scan::scan(root, &walk)
+fn fallback_notice(reason: &str) -> String {
+    format!("Using the slower walk scan: {reason}")
 }
 
 /// A finished scan and the drive-wide views derived from it once, off the UI
 /// thread, rather than per frame.
 pub struct ScanData {
     pub catalog: Arc<Catalog>,
-    pub file_types: Vec<FileType>,
-    pub largest: Vec<NodeId>,
     pub palette: Palette,
     /// On-disk bytes per subtree, indexed by node id; `None` when the backend
     /// reported no allocation sizes (the walk backend never does).
     pub allocated: Option<Vec<u64>>,
     pub elapsed: Duration,
+    /// When the user started the scan, for the first-paint timing.
+    pub started: Instant,
+    painted: AtomicBool,
 }
 
 impl ScanData {
-    const LARGEST: usize = 1000;
-
     fn new(catalog: Catalog, started: Instant) -> Self {
-        let file_types = file_types(&catalog);
-        let largest = largest_files(&catalog, Self::LARGEST);
-        let palette = Palette::new(&file_types);
+        let palette = Palette::new(&catalog);
         let allocated = subtree_allocated(&catalog);
         Self {
             catalog: Arc::new(catalog),
-            file_types,
-            largest,
             palette,
             allocated,
             elapsed: started.elapsed(),
+            started,
+            painted: AtomicBool::new(false),
+        }
+    }
+
+    /// Records the click-to-treemap time the first time the map paints.
+    pub fn note_painted(&self) {
+        if !self.painted.swap(true, Ordering::Relaxed) {
+            timings::record("gui click -> first treemap paint", self.started.elapsed());
         }
     }
 
@@ -172,7 +133,6 @@ pub struct Session {
     /// The drive open, as `Volume.root`; the GUI scans whole drives only.
     pub root: Option<PathBuf>,
     volume: Option<Volume>,
-    pub backend: Backend,
     /// The CLI's `--pack DIR` list, in the order added: loaded last, so a
     /// later one overrides an earlier one and both override the other tiers.
     pub explicit_packs: Vec<PathBuf>,
@@ -180,6 +140,11 @@ pub struct Session {
     /// Set while a scan runs.
     pub progress: Option<ScanProgress>,
     pub assessment: Option<Arc<Assessment>>,
+    /// Set while the judging of the current catalog runs in the background.
+    pub assessing: bool,
+    /// Bumped by every scan and every judging run, so a result that lands
+    /// after a newer one started is dropped rather than shown.
+    assess_generation: u64,
     pub busy: Option<Phase>,
     pub scan_error: Option<String>,
     /// Why the scan fell back to the walk instead of the elevated MFT read.
@@ -195,11 +160,12 @@ impl Session {
         Self {
             root: None,
             volume: None,
-            backend: Backend::Auto,
             explicit_packs: Vec::new(),
             scan: None,
             progress: None,
             assessment: None,
+            assessing: false,
+            assess_generation: 0,
             busy: None,
             scan_error: None,
             scan_notice: None,
@@ -239,22 +205,20 @@ impl Session {
         if !self.begin(Phase::Scanning, cx) {
             return;
         }
-        // Judging a whole drive hashes every duplicate candidate and takes
-        // minutes, so it runs again only for a rescan the user had analyzed.
-        let reassess = self.assessment.is_some();
         self.scan = None;
         self.assessment = None;
+        self.assessing = false;
+        // Any judging still running is for the catalog this scan replaces.
+        self.assess_generation += 1;
         self.scan_error = None;
         self.scan_notice = None;
         self.assess_error = None;
-        let backend = self.backend;
+        timings::start_scan("gui");
         let counters = Arc::new(scan::ScanProgress::default());
-        let notice = Arc::new(OnceLock::new());
         let started = Instant::now();
         self.progress = Some(ScanProgress {
             counters: counters.clone(),
             used_bytes: volume.total.saturating_sub(volume.free),
-            notice: notice.clone(),
             started,
         });
 
@@ -274,19 +238,21 @@ impl Session {
 
         cx.spawn(async move |this, cx| {
             let scan_root = root.clone();
-            let slot = notice.clone();
+            let progress = counters.clone();
             let scanned = cx
                 .background_executor()
                 .spawn(async move {
-                    let opts =
-                        ScanOptions { backend, progress: Some(counters), ..ScanOptions::default() };
-                    let ntfs = volume.fs.eq_ignore_ascii_case("NTFS");
                     let report = VolumeRoot::new(&scan_root)
-                        .and_then(|root| scan_drive(&root, opts, ntfs, &slot))?;
-                    Ok::<_, ScanFailure>(Arc::new(ScanData::new(Catalog::build(report), started)))
+                        .and_then(|root| scan::scan_drive(&root, Some(progress)))?;
+                    let catalog_started = timings::lap("gui click -> report in hand", started);
+                    let catalog = Catalog::build(report);
+                    let aggregates_started = timings::lap("Catalog::build total", catalog_started);
+                    let data = ScanData::new(catalog, started);
+                    timings::lap("gui aggregates (ScanData::new)", aggregates_started);
+                    Ok::<_, ScanFailure>(Arc::new(data))
                 })
                 .await;
-            let notice = notice.get().cloned();
+            let notice = counters.fallback.get().map(|reason| fallback_notice(reason));
             let data = match scanned {
                 Ok(data) => data,
                 Err(error) => {
@@ -306,9 +272,7 @@ impl Session {
                 this.scan_notice = notice;
                 this.progress = None;
                 this.end(cx);
-                if reassess {
-                    this.assess(cx);
-                }
+                this.assess(cx);
             });
             if landed.is_err() {
                 eprintln!(
@@ -320,31 +284,30 @@ impl Session {
         .detach();
     }
 
-    /// Re-judge after a pack change, but only a catalog the user already had
-    /// analyzed: an unasked-for full-drive judgement would hold the busy slot
-    /// for minutes.
+    /// Re-judge after a pack change alters which rules load or how far they
+    /// are trusted.
     pub fn reassess(&mut self, cx: &mut Context<Self>) {
-        if self.assessment.is_some() {
-            self.assess(cx);
-        }
+        self.assess(cx);
     }
 
-    /// Judge the current catalog again — after a scan, and after a pack
-    /// change alters which rules load or how far they are trusted.
-    pub fn assess(&mut self, cx: &mut Context<Self>) {
+    /// Judge the current catalog in the background. Starts by itself after
+    /// every scan; a newer run supersedes an older one still in flight.
+    fn assess(&mut self, cx: &mut Context<Self>) {
         let (Some(root), Some(catalog)) =
             (self.root.clone(), self.scan.as_ref().map(|scan| scan.catalog.clone()))
         else {
             return;
         };
-        if !self.begin(Phase::Assessing, cx) {
-            return;
-        }
+        self.assess_generation += 1;
+        let generation = self.assess_generation;
+        self.assessing = true;
         self.assess_error = None;
+        cx.notify();
         let explicit = self.explicit_packs.clone();
 
         cx.spawn(async move |this, cx| {
             let pack_root = root.clone();
+            let started = Instant::now();
             let judged = cx
                 .background_executor()
                 .spawn(async move {
@@ -352,7 +315,14 @@ impl Session {
                     Ok::<_, nomnom_pack::Error>(Arc::new(assess(&catalog, packs)))
                 })
                 .await;
+            let elapsed = started.elapsed();
+            timings::record("gui assess", elapsed);
+            eprintln!("nomnom-gui: assessed {} in {:.1?}", root.display(), elapsed);
             let _ = this.update(cx, |this, cx| {
+                if this.assess_generation != generation {
+                    return;
+                }
+                this.assessing = false;
                 match judged {
                     Ok(assessment) => {
                         this.assessment = Some(assessment);
@@ -365,7 +335,7 @@ impl Session {
                         this.assess_error = Some(message);
                     }
                 }
-                this.end(cx);
+                cx.notify();
             });
         })
         .detach();

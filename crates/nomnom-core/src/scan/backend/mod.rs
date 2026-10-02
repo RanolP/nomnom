@@ -1,5 +1,5 @@
-//! Backend selection. The policy lives here so [`crate::scan::scan`] stays a
-//! one-liner and the fallback rules are testable on their own.
+//! Backend dispatch, kept apart from [`crate::scan::scan_drive`]'s elevation
+//! policy so the fallback rules are testable on their own.
 
 pub mod walk;
 
@@ -10,8 +10,12 @@ use std::path::Path;
 
 use crate::scan::{Backend, BackendUsed, ScanFailure, ScanOptions, ScanReport};
 
-pub(crate) fn dispatch(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
-    match opts.backend {
+pub(crate) fn dispatch(
+    root: &Path,
+    backend: Backend,
+    opts: &ScanOptions,
+) -> Result<ScanReport, ScanFailure> {
+    match backend {
         Backend::Walk => walk_with(root, opts, None),
         Backend::Mft => mft_scan(root, opts),
         Backend::Auto => match mft_scan(root, opts) {
@@ -29,7 +33,9 @@ fn walk_with(
     opts: &ScanOptions,
     mft_unavailable: Option<String>,
 ) -> Result<ScanReport, ScanFailure> {
+    let started = std::time::Instant::now();
     let mut report = walk::scan(root, opts)?;
+    crate::timings::lap("walk scan", started);
     report.backend_used = BackendUsed::Walk { mft_unavailable };
     Ok(report)
 }
@@ -44,9 +50,9 @@ fn mft_scan(_root: &Path, _opts: &ScanOptions) -> Result<ScanReport, ScanFailure
     Err(ScanFailure::MftUnavailable("not a Windows target".into()))
 }
 
-/// Dispatch on real trees. The public [`crate::scan::scan`] only takes a whole
-/// volume, so these run the root-agnostic dispatcher on small temp trees from
-/// inside the crate.
+/// Dispatch on real trees. The public [`crate::scan::scan_drive`] only takes a
+/// whole volume, so these run the root-agnostic dispatcher on small temp trees
+/// from inside the crate.
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -56,8 +62,8 @@ mod tests {
     use super::*;
     use crate::scan::ScanProgress;
 
-    fn opts(backend: Backend) -> ScanOptions {
-        ScanOptions { backend, ..ScanOptions::default() }
+    fn run(root: &Path, backend: Backend) -> Result<ScanReport, ScanFailure> {
+        dispatch(root, backend, &ScanOptions::default())
     }
 
     /// Catches Auto turning into a hard failure when MFT is unavailable — the
@@ -68,7 +74,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.bin"), b"x").unwrap();
 
-        match dispatch(tmp.path(), &opts(Backend::Mft)) {
+        match run(tmp.path(), Backend::Mft) {
             // Elevated: the backend really ran, and says so.
             Ok(report) => assert_eq!(report.backend_used, BackendUsed::Mft),
             Err(ScanFailure::MftUnavailable(reason)) => assert!(
@@ -78,8 +84,8 @@ mod tests {
             Err(other) => panic!("Backend::Mft must not fall back, got {other:?}"),
         }
 
-        let auto = dispatch(tmp.path(), &opts(Backend::Auto))
-            .expect("Auto must fall back to walk rather than fail");
+        let auto =
+            run(tmp.path(), Backend::Auto).expect("Auto must fall back to walk rather than fail");
         match &auto.backend_used {
             BackendUsed::Mft => {}
             BackendUsed::Walk { mft_unavailable: Some(reason) } => assert!(!reason.is_empty()),
@@ -87,8 +93,8 @@ mod tests {
         }
         assert!(auto.entries.iter().any(|e| e.path == tmp.path().join("f.bin")));
 
-        let requested = dispatch(tmp.path(), &opts(Backend::Walk))
-            .expect("an explicitly requested walk must succeed");
+        let requested =
+            run(tmp.path(), Backend::Walk).expect("an explicitly requested walk must succeed");
         assert_eq!(requested.backend_used, BackendUsed::Walk { mft_unavailable: None });
     }
 
@@ -99,7 +105,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-directory");
         for backend in [Backend::Mft, Backend::Auto] {
-            match dispatch(&missing, &opts(backend)) {
+            match run(&missing, backend) {
                 Err(ScanFailure::RootUnreadable(path)) => assert_eq!(path, missing),
                 other => panic!("{backend:?}: expected RootUnreadable, got {other:?}"),
             }
@@ -117,8 +123,8 @@ mod tests {
         std::fs::write(tmp.path().join("sub/b.bin"), b"bb").unwrap();
 
         let progress = Arc::new(ScanProgress::default());
-        let opts = ScanOptions { progress: Some(progress.clone()), ..opts(Backend::Walk) };
-        let report = dispatch(tmp.path(), &opts).unwrap();
+        let opts = ScanOptions { progress: Some(progress.clone()), ..ScanOptions::default() };
+        let report = dispatch(tmp.path(), Backend::Walk, &opts).unwrap();
 
         assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
         assert_eq!(progress.entries.load(Ordering::Relaxed), report.entries.len() as u64);
@@ -143,12 +149,8 @@ mod tests {
         std::fs::write(root.join("Alpha").join("one.txt"), b".").unwrap();
         std::fs::write(root.join("Alpha").join("Beta").join("deep.txt"), b"...").unwrap();
 
-        let walked: HashSet<PathBuf> = dispatch(&root, &opts(Backend::Walk))
-            .unwrap()
-            .entries
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
+        let walked: HashSet<PathBuf> =
+            run(&root, Backend::Walk).unwrap().entries.into_iter().map(|e| e.path).collect();
 
         // The same tree as the MFT would hand it over: names and parent
         // references, with the temp directory standing in for the volume root.
