@@ -171,26 +171,21 @@ impl NomnomApp {
         }
         let busy = session.busy.is_some();
         let assessing = session.assessing;
-        let plan = self.clean.read(cx).plan_summary();
+        let clean = self.clean.read(cx);
+        let (checked, bytes) = clean.plan_summary();
+        let can_apply = clean.can_apply();
 
-        let list_label = match plan {
-            Some((len, _)) => format!("Files to delete ({len})"),
-            None => "Files to delete".to_string(),
-        };
         let list = Button::new("files-to-delete")
             .outline()
-            .label(list_label)
+            .label(format!("Files to delete ({checked})"))
             .on_click(cx.listener(|this, _, _, cx| this.open(Feature::Suggest, cx)));
 
-        let reclaim_label = match plan {
-            _ if assessing => "Analyzing…".to_string(),
-            Some((_, bytes)) => format!("Reclaim {}", size(bytes)),
-            None => format!("Reclaim {}", size(0)),
-        };
+        let reclaim_label =
+            if assessing { "Analyzing…".to_string() } else { format!("Reclaim {}", size(bytes)) };
         let reclaim = Button::new("reclaim")
             .danger()
             .label(reclaim_label)
-            .disabled(assessing || busy || plan.is_none())
+            .disabled(assessing || busy || !can_apply)
             .on_click(cx.listener(|this, _, window, cx| {
                 this.clean.update(cx, |clean, cx| clean.confirm_apply(window, cx))
             }));

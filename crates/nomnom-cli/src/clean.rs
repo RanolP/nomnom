@@ -1,58 +1,91 @@
-//! `nomnom clean` — the plan, and only on request the act.
+//! `nomnom clean` — the candidates, the plan of the paths the user names, and
+//! only on request the act.
 //!
+//! Opt-in, like the GUI's checkboxes: with no paths it lists the candidates
+//! and plans nothing; a plan holds only the paths named on the command line.
 //! Dry-run is the default. `--apply` is the only thing that moves a byte, and
 //! it sends trashed paths to the recycle bin, where they can be restored from.
 
+use std::collections::HashSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use humansize::{BINARY, format_size};
-use nomnom_core::action::{Action, ApplyReport, Plan, RecordStatus, plain, plan_from};
+use nomnom_core::action::{Action, ApplyReport, Plan, RecordStatus, candidates, plain, plan_from};
 use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::VolumeRoot;
-use nomnom_core::verdict::{TrustedPack, assess};
+use nomnom_core::verdict::{Disposition, Entry, TrustedPack, assess};
 use serde::Serialize;
 
 use crate::input;
+use crate::suggest::disposition_name;
 
 pub struct Request<'a> {
     pub drive: &'a VolumeRoot,
     pub show_errors: bool,
     /// The `--pack <DIR>` arguments, in the order they were given.
     pub packs: &'a [PathBuf],
+    /// The candidates the user picked; empty lists them and plans nothing.
+    pub paths: &'a [PathBuf],
     pub apply: bool,
     pub include_review: bool,
     pub json: bool,
 }
 
 pub fn run(request: Request<'_>) -> Result<ExitCode> {
+    let mode = Mode {
+        paths: request.paths,
+        apply: request.apply,
+        include_review: request.include_review,
+        json: request.json,
+    };
+    // Before the scan, so a refused command never costs a UAC prompt.
+    mode.check()?;
     let packs = nomnom_core::verdict::resolve_packs(request.drive.as_path(), request.packs)?;
     let catalog = input::load(request.drive)?;
     input::warn_backend(&catalog);
     input::report_errors(&catalog, request.show_errors);
 
-    let mode =
-        Mode { apply: request.apply, include_review: request.include_review, json: request.json };
     execute(&catalog, packs, mode, &mut std::io::stdout().lock())
 }
 
 /// What to do with a catalog once it is judged.
-struct Mode {
+struct Mode<'a> {
+    paths: &'a [PathBuf],
     apply: bool,
     include_review: bool,
     json: bool,
 }
 
+impl Mode<'_> {
+    /// `--apply` acts only on paths the user named; there is no "apply all".
+    fn check(&self) -> Result<()> {
+        if self.apply && self.paths.is_empty() {
+            bail!(
+                "--apply needs the paths to delete: nomnom clean <DRIVE> <PATH>... --apply \
+                 (run `nomnom clean <DRIVE>` to list the candidates)"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn execute(
     catalog: &Catalog,
     packs: Vec<TrustedPack>,
-    mode: Mode,
+    mode: Mode<'_>,
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
+    mode.check()?;
     let assessment = assess(catalog, packs);
-    let (plan, refused) = plan_from(&assessment, None, mode.include_review)
+    let offered = candidates(&assessment, mode.include_review);
+    if mode.paths.is_empty() {
+        return report_candidates(&assessment.root, &offered, mode.include_review, mode.json, out);
+    }
+    let selection = select(&offered, &candidates(&assessment, true), mode.paths)?;
+    let (plan, refused) = plan_from(&assessment, &selection, mode.include_review)
         .with_context(|| format!("cannot anchor a plan at {}", assessment.root.display()))?;
     // A guard refusal is information, not a stop: the other actions are still
     // sound, and the user can act on the named path.
@@ -65,15 +98,104 @@ fn execute(
         return report_apply(&report, mode.json, out);
     }
 
-    report_plan(&plan, mode.include_review, mode.json, out)
+    report_plan(&plan, mode.json, out)
 }
 
-fn report_plan(
-    plan: &Plan,
+/// The entries of `offered` the user named, by the path the assessment holds.
+///
+/// Every named path must be a candidate under the current dispositions; one
+/// that is not fails the whole command, naming it, rather than being skipped —
+/// a silent skip would apply a plan the user did not write.
+fn select(offered: &[&Entry], widened: &[&Entry], named: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    let mut selection = HashSet::new();
+    let mut rejected = Vec::new();
+    for path in named {
+        if let Some(entry) = find(offered, path) {
+            selection.insert(PathBuf::from(&entry.path));
+        } else if find(widened, path)
+            .is_some_and(|entry| entry.verdict.disposition == Disposition::Review)
+        {
+            rejected.push(format!(
+                "{}: a `review` verdict; add --include-review to pick it",
+                path.display()
+            ));
+        } else {
+            rejected.push(format!("{}: not a cleanup candidate on this drive", path.display()));
+        }
+    }
+    if !rejected.is_empty() {
+        bail!(
+            "refusing to plan paths that are not candidates (run `nomnom clean <DRIVE>` to list \
+             them):\n  {}",
+            rejected.join("\n  ")
+        );
+    }
+    Ok(selection)
+}
+
+/// The candidate `path` names: by its exact text first, then by where both
+/// resolve on disk, so `d:\proj\node_modules\` finds `D:\proj\node_modules`.
+fn find<'a>(entries: &[&'a Entry], path: &Path) -> Option<&'a Entry> {
+    if let Some(entry) = entries.iter().find(|entry| Path::new(&entry.path) == path) {
+        return Some(entry);
+    }
+    let resolved = path.canonicalize().ok()?;
+    entries
+        .iter()
+        .find(|entry| Path::new(&entry.path).canonicalize().is_ok_and(|it| it == resolved))
+        .copied()
+}
+
+fn report_candidates(
+    root: &Path,
+    offered: &[&Entry],
     include_review: bool,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
+    if json {
+        let report = CandidatesOutput {
+            root: plain(root),
+            applied: false,
+            total_bytes: 0,
+            entries: &[],
+            candidates: offered,
+        };
+        writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    writeln!(out, "Dry run — nothing is selected and nothing has been touched.")?;
+    writeln!(out, "Root: {}", plain(root))?;
+    if offered.is_empty() {
+        writeln!(out, "No candidates.")?;
+    } else {
+        writeln!(out)?;
+        writeln!(out, "Candidates ({}):", offered.len())?;
+        for entry in offered {
+            writeln!(
+                out,
+                "  [{}] {}  {}",
+                disposition_name(entry.verdict.disposition),
+                entry.path,
+                format_size(entry.bytes, BINARY)
+            )?;
+            writeln!(out, "      {}", entry.verdict.reason)?;
+            writeln!(out, "      — {}", entry.verdict.provenance)?;
+            if let Some(capped) = &entry.verdict.capped {
+                writeln!(out, "      ! {capped}")?;
+            }
+        }
+        writeln!(out)?;
+        writeln!(out, "Name the ones to delete: nomnom clean <DRIVE> <PATH>... [--apply]")?;
+    }
+    if !include_review {
+        writeln!(out, "(--include-review would also offer paths the evidence does not carry.)")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn report_plan(plan: &Plan, json: bool, out: &mut dyn Write) -> Result<ExitCode> {
     if json {
         let report = PlanOutput {
             root: plan.root().display().to_string(),
@@ -88,13 +210,7 @@ fn report_plan(
     writeln!(out, "Dry run — nothing has been touched. Add --apply to carry this out.")?;
     writeln!(out, "Root: {}", plain(plan.root()))?;
     if plan.is_empty() {
-        writeln!(out, "Nothing to clean.")?;
-        if !include_review {
-            writeln!(
-                out,
-                "(--include-review would also consider paths the evidence does not carry.)"
-            )?;
-        }
+        writeln!(out, "Nothing to clean: every named path was refused above.")?;
         return Ok(ExitCode::SUCCESS);
     }
     writeln!(out)?;
@@ -113,9 +229,6 @@ fn report_plan(
     }
     writeln!(out)?;
     writeln!(out, "{} actions, {} reclaimed", plan.len(), format_size(plan.total_bytes(), BINARY))?;
-    if !include_review {
-        writeln!(out, "(--include-review would also consider paths the evidence does not carry.)")?;
-    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -175,6 +288,16 @@ struct PlanOutput<'a> {
     entries: &'a [nomnom_core::action::PlanEntry],
 }
 
+/// A plan's shape with nothing selected, plus what the user may pick.
+#[derive(Serialize)]
+struct CandidatesOutput<'a> {
+    root: String,
+    applied: bool,
+    total_bytes: u64,
+    entries: &'a [nomnom_core::action::PlanEntry],
+    candidates: &'a [&'a Entry],
+}
+
 #[derive(Serialize)]
 struct ApplyOutput<'a> {
     applied: bool,
@@ -216,13 +339,54 @@ mod tests {
         out
     }
 
-    fn dry_run(root: &Path) -> (ExitCode, String) {
+    fn clean(root: &Path, paths: &[PathBuf], apply: bool) -> Result<(ExitCode, String)> {
         isolated_store();
         let packs = resolve_packs(root, &[]).expect("packs resolve");
-        let mode = Mode { apply: false, include_review: false, json: false };
+        let mode = Mode { paths, apply, include_review: false, json: false };
         let mut out = Vec::new();
-        let code = execute(&catalog_of(root), packs, mode, &mut out).expect("clean runs");
-        (code, String::from_utf8(out).expect("utf-8 output"))
+        let code = execute(&catalog_of(root), packs, mode, &mut out)?;
+        Ok((code, String::from_utf8(out).expect("utf-8 output")))
+    }
+
+    fn dry_run(root: &Path) -> (ExitCode, String) {
+        clean(root, &[], false).expect("clean runs")
+    }
+
+    /// The opt-in contract: `clean` must never act on a path the user did not
+    /// name. Catches `--apply` with no paths deleting every candidate, and a
+    /// named non-candidate (here the project's own `package.json`, or a typo)
+    /// reaching the plan instead of failing the command with its name — both
+    /// checked with `--apply` on, and the tree compared afterwards.
+    #[test]
+    fn apply_without_paths_and_non_candidate_paths_are_rejected() {
+        let dir = node_fixture();
+        let before = snapshot(dir.path());
+
+        let error = clean(dir.path(), &[], true).expect_err("--apply with no paths ran");
+        assert!(format!("{error:#}").contains("--apply needs the paths"), "{error:#}");
+
+        let manifest = dir.path().join("package.json");
+        let typo = dir.path().join("node_modulez");
+        let error = clean(dir.path(), &[manifest.clone(), typo.clone()], true)
+            .expect_err("a non-candidate path was planned");
+        let message = format!("{error:#}");
+        assert!(message.contains(&manifest.display().to_string()), "{message}");
+        assert!(message.contains(&typo.display().to_string()), "{message}");
+
+        assert_eq!(before, snapshot(dir.path()), "a rejected clean modified the tree");
+    }
+
+    /// Catches a named candidate failing to reach the plan, which would make
+    /// the opt-in CLI unable to clean anything.
+    #[test]
+    fn a_named_candidate_is_planned_alone() {
+        let dir = node_fixture();
+        let before = snapshot(dir.path());
+        let (code, text) =
+            clean(dir.path(), &[dir.path().join("node_modules")], false).expect("clean runs");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(text.contains("1 actions"), "{text}");
+        assert_eq!(before, snapshot(dir.path()), "dry run modified the tree");
     }
 
     /// A dry run that is not dry is the single worst bug this tool could
@@ -235,7 +399,8 @@ mod tests {
 
         let (code, text) = dry_run(dir.path());
         assert_eq!(code, ExitCode::SUCCESS);
-        assert!(text.contains("node_modules"), "plan did not name node_modules:\n{text}");
+        assert!(text.contains("node_modules"), "candidates did not name node_modules:\n{text}");
+        assert!(text.contains("nothing is selected"), "{text}");
 
         assert_eq!(before, snapshot(dir.path()), "dry run modified the tree");
     }

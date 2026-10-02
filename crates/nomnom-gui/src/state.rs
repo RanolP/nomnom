@@ -3,13 +3,13 @@
 //! that decides what gets trashed can be tested on its own.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use humansize::{BINARY, format_size};
-use nomnom_core::action::{ActionError, Plan, plan_from};
+use nomnom_core::action::{ActionError, Plan, candidates, plan_from};
 use nomnom_core::catalog::{Catalog, NodeId};
-use nomnom_core::verdict::{Assessment, Disposition, Entry};
+use nomnom_core::verdict::{Assessment, Entry};
 
 pub fn size(bytes: u64) -> String {
     format_size(bytes, BINARY)
@@ -111,15 +111,15 @@ impl TreeModel {
 }
 
 /// What the Clean screen will hand to `plan_from`: the include-review toggle
-/// and the entries the user unchecked.
+/// and the entries the user checked.
 ///
-/// Unchecked entries are remembered rather than checked ones, so every
-/// candidate starts checked — matching `nomnom clean`, which plans them all —
-/// and toggling include-review on brings the review entries in already checked.
+/// Opt-in: nothing is in the plan until the user checks it, matching
+/// `nomnom clean`, which plans only the paths named on its command line.
+/// Include-review only widens what can be checked; it never checks anything.
 #[derive(Debug, Default, Clone)]
 pub struct Selection {
     pub include_review: bool,
-    unchecked: HashSet<String>,
+    checked: HashSet<PathBuf>,
 }
 
 /// The dry run the Clean screen previews and Apply carries out.
@@ -131,53 +131,44 @@ pub struct Preview {
 
 impl Selection {
     pub fn is_checked(&self, path: &str) -> bool {
-        !self.unchecked.contains(path)
+        self.checked.contains(Path::new(path))
     }
 
     pub fn set_checked(&mut self, path: &str, checked: bool) {
         if checked {
-            self.unchecked.remove(path);
+            self.checked.insert(PathBuf::from(path));
         } else {
-            self.unchecked.insert(path.to_string());
+            self.checked.remove(Path::new(path));
         }
     }
 
-    /// Start over for a new assessment, keeping the include-review toggle.
-    pub fn recheck_all(&mut self) {
-        self.unchecked.clear();
+    /// Uncheck everything, keeping the include-review toggle. Called when a new
+    /// assessment lands and after an apply: a choice made against other
+    /// entries is not a choice about these.
+    pub fn clear(&mut self) {
+        self.checked.clear();
     }
 
-    /// Every entry the dispositions allow onto a plan, biggest group first.
+    /// How many of the current candidates the user checked.
+    pub fn checked_count(&self, assessment: &Assessment) -> usize {
+        self.candidates(assessment).iter().filter(|entry| self.is_checked(&entry.path)).count()
+    }
+
+    /// Every entry the dispositions allow the user to check, biggest group
+    /// first.
     pub fn candidates<'a>(&self, assessment: &'a Assessment) -> Vec<&'a Entry> {
-        assessment
-            .groups
-            .iter()
-            .flat_map(|group| &group.entries)
-            .filter(|entry| match entry.verdict.disposition {
-                Disposition::Reclaimable => true,
-                Disposition::Review => self.include_review,
-                Disposition::Keep => false,
-            })
-            .collect()
+        candidates(assessment, self.include_review)
     }
 
     pub fn preview(&self, assessment: &Assessment) -> Result<Preview, ActionError> {
-        let chosen: HashSet<PathBuf> = self
-            .candidates(assessment)
-            .into_iter()
-            .filter(|entry| self.is_checked(&entry.path))
-            .map(|entry| PathBuf::from(&entry.path))
-            .collect();
-        let (plan, refused) = plan_from(assessment, Some(&chosen), self.include_review)?;
+        let (plan, refused) = plan_from(assessment, &self.checked, self.include_review)?;
         Ok(Preview { plan, refused })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use nomnom_core::verdict::{Group, Label, Provenance, Verdict};
+    use nomnom_core::verdict::{Disposition, Group, Label, Provenance, Verdict};
 
     use super::*;
 
@@ -219,46 +210,86 @@ mod tests {
         names
     }
 
-    // Catches an unchecked box still trashing its path on Apply.
+    // Catches "Files to delete" filling itself with every reclaimable verdict
+    // before the user checks anything, or again once a new assessment lands —
+    // the opt-out selection that put unpicked paths behind Reclaim.
     #[test]
-    fn unchecking_an_entry_removes_its_action_from_the_plan() {
+    fn fresh_and_reassessed_selections_plan_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = entry(&root.join("a"), Disposition::Reclaimable);
+        let a_path = a.path.clone();
+        let assessment =
+            assessment(&root, vec![a, entry(&root.join("b"), Disposition::Reclaimable)]);
+
+        let mut selection = Selection::default();
+        let plan = selection.preview(&assessment).unwrap().plan;
+        assert!(plan.is_empty());
+        assert_eq!(plan.total_bytes(), 0);
+        assert_eq!(selection.checked_count(&assessment), 0);
+
+        selection.set_checked(&a_path, true);
+        selection.include_review = true;
+        // What the Clean screen does when `Assessed` fires.
+        selection.clear();
+        let plan = selection.preview(&assessment).unwrap().plan;
+        assert!(plan.is_empty());
+        assert_eq!(plan.total_bytes(), 0);
+        assert!(selection.include_review, "clearing must keep the toggle");
+    }
+
+    // Catches a checked box not reaching the plan, or an unchecked one still
+    // trashing its path on Apply.
+    #[test]
+    fn only_checked_entries_reach_the_plan() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let a = entry(&root.join("a"), Disposition::Reclaimable);
         let b = entry(&root.join("b"), Disposition::Reclaimable);
-        let a_path = a.path.clone();
+        let (a_path, b_path) = (a.path.clone(), b.path.clone());
         let assessment = assessment(&root, vec![a, b]);
 
         let mut selection = Selection::default();
+        selection.set_checked(&a_path, true);
+        assert_eq!(planned(&selection, &assessment), ["a"]);
+        assert_eq!(selection.checked_count(&assessment), 1);
+
+        selection.set_checked(&b_path, true);
         assert_eq!(planned(&selection, &assessment), ["a", "b"]);
 
         selection.set_checked(&a_path, false);
         assert_eq!(planned(&selection, &assessment), ["b"]);
-
-        selection.set_checked(&a_path, true);
-        assert_eq!(planned(&selection, &assessment), ["a", "b"]);
     }
 
-    // Catches a `review` verdict reaching the plan without the user turning on
-    // "include review" — the GUI equivalent of `--include-review`.
+    // Catches "include review" checking review entries on its own, and a
+    // checked `review` entry reaching the plan with the toggle off.
     #[test]
-    fn review_entries_stay_out_unless_include_review_is_on() {
+    fn include_review_widens_candidates_but_checks_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
+        let maybe = entry(&root.join("maybe"), Disposition::Review);
+        let maybe_path = maybe.path.clone();
         let assessment = assessment(
             &root,
             vec![
                 entry(&root.join("gone"), Disposition::Reclaimable),
-                entry(&root.join("maybe"), Disposition::Review),
+                maybe,
                 entry(&root.join("kept"), Disposition::Keep),
             ],
         );
 
         let mut selection = Selection::default();
         assert_eq!(selection.candidates(&assessment).len(), 1);
-        assert_eq!(planned(&selection, &assessment), ["gone"]);
 
         selection.include_review = true;
-        assert_eq!(planned(&selection, &assessment), ["gone", "maybe"]);
+        assert_eq!(selection.candidates(&assessment).len(), 2);
+        assert!(planned(&selection, &assessment).is_empty());
+
+        selection.set_checked(&maybe_path, true);
+        assert_eq!(planned(&selection, &assessment), ["maybe"]);
+
+        selection.include_review = false;
+        assert!(planned(&selection, &assessment).is_empty());
+        assert_eq!(selection.checked_count(&assessment), 0);
     }
 }

@@ -7,36 +7,46 @@ use super::ActionError;
 use super::plan::{Action, Justification, Plan};
 use crate::verdict::{Assessment, Disposition, Entry};
 
-/// A trash plan anchored at the assessment's root, holding every
-/// `reclaimable` entry — and every `review` one when `include_review` — biggest
-/// first.
+/// The entries a user may pick for a plan: every `reclaimable` one, and every
+/// `review` one when `include_review`, in the assessment's group order.
 ///
-/// `selection`, when given, restricts the plan to entries whose path is in the
-/// set; `None` takes every entry the dispositions allow.
+/// A candidate is only offered. Nothing reaches a plan until the user names it
+/// in the selection [`plan_from`] takes.
+pub fn candidates(assessment: &Assessment, include_review: bool) -> Vec<&Entry> {
+    assessment
+        .groups
+        .iter()
+        .flat_map(|group| &group.entries)
+        .filter(|entry| included(entry.verdict.disposition, include_review))
+        .collect()
+}
+
+/// A trash plan anchored at the assessment's root, holding exactly the
+/// [`candidates`] whose path the user put in `selection`, biggest first.
+///
+/// The selection is required and opt-in: an empty one is an empty plan. A
+/// selected path that is not a candidate under `include_review` is left out.
 ///
 /// `Err` only when the root cannot anchor a plan. A path the guards refuse is
 /// information, not a stop: the other actions are still sound, so it comes back
 /// beside the plan for the caller to show.
 pub fn plan_from(
     assessment: &Assessment,
-    selection: Option<&HashSet<PathBuf>>,
+    selection: &HashSet<PathBuf>,
     include_review: bool,
 ) -> Result<(Plan, Vec<(PathBuf, ActionError)>), ActionError> {
     let mut plan = Plan::new(&assessment.root)?;
 
-    let mut candidates: Vec<&Entry> = assessment
-        .groups
-        .iter()
-        .flat_map(|group| &group.entries)
-        .filter(|entry| included(entry.verdict.disposition, include_review))
-        .filter(|entry| selection.is_none_or(|chosen| chosen.contains(Path::new(&entry.path))))
+    let mut chosen: Vec<&Entry> = candidates(assessment, include_review)
+        .into_iter()
+        .filter(|entry| selection.contains(Path::new(&entry.path)))
         .collect();
     // By the path's text rather than `Path`'s component order: the order a
     // printed plan has always listed ties in.
-    candidates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    chosen.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
 
     let mut refused = Vec::new();
-    for entry in candidates {
+    for entry in chosen {
         let verdict = &entry.verdict;
         let justification = Justification::new(
             verdict.reason.clone(),
@@ -93,10 +103,11 @@ mod tests {
         names
     }
 
-    // Catches a `review` verdict reaching a plan the user never widened with
-    // --include-review, and a GUI selection being ignored.
+    // Catches a plan filling itself with every candidate the user never picked,
+    // a `review` verdict reaching a plan the user never widened with
+    // --include-review, and a `keep` verdict being plannable at all.
     #[test]
-    fn review_needs_opt_in_keep_never_plans_and_selection_restricts() {
+    fn only_selected_candidates_plan_and_review_needs_opt_in() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let entries = vec![
@@ -110,15 +121,20 @@ mod tests {
             reclaimable_bytes: 1,
         };
 
-        let (plan, refused) = plan_from(&assessment, None, false).unwrap();
+        let (plan, refused) = plan_from(&assessment, &HashSet::new(), true).unwrap();
         assert!(refused.is_empty());
+        assert!(plan.is_empty());
+        assert_eq!(plan.total_bytes(), 0);
+
+        let all = HashSet::from([root.join("gone"), root.join("maybe"), root.join("kept")]);
+        let (plan, _) = plan_from(&assessment, &all, false).unwrap();
         assert_eq!(planned(&plan), ["gone"]);
 
-        let (plan, _) = plan_from(&assessment, None, true).unwrap();
+        let (plan, _) = plan_from(&assessment, &all, true).unwrap();
         assert_eq!(planned(&plan), ["gone", "maybe"]);
 
         let chosen = HashSet::from([root.join("maybe")]);
-        let (plan, _) = plan_from(&assessment, Some(&chosen), true).unwrap();
+        let (plan, _) = plan_from(&assessment, &chosen, true).unwrap();
         assert_eq!(planned(&plan), ["maybe"]);
     }
 }

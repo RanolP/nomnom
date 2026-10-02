@@ -22,7 +22,7 @@ mod plan;
 use std::path::PathBuf;
 
 pub use apply::{ActionKind, ApplyRecord, ApplyReport, RecordStatus, apply};
-pub use candidates::plan_from;
+pub use candidates::{candidates, plan_from};
 pub use display::plain;
 pub use plan::{Action, Justification, Plan, PlanEntry};
 

@@ -36,6 +36,8 @@ pub struct Applied;
 pub struct CleanScreen {
     session: Entity<Session>,
     selection: Selection,
+    /// How many current candidates the user checked; kept beside `preview`.
+    checked: usize,
     preview: Option<Result<Rc<Preview>, String>>,
     outcome: Option<Result<Outcome, String>>,
 }
@@ -46,14 +48,20 @@ impl CleanScreen {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&session, |this, _, _: &Assessed, cx| {
-            // A new assessment has different entries; a selection carried over
-            // from the old one would silently re-include or drop paths.
-            this.selection.recheck_all();
+            // A new assessment (rescan, pack change, post-apply rescan) has
+            // different entries; a choice made against the old ones is not a
+            // choice about these, so the user starts from nothing checked.
+            this.selection.clear();
             this.refresh_preview(cx);
         })
         .detach();
-        let mut this =
-            Self { session, selection: Selection::default(), preview: None, outcome: None };
+        let mut this = Self {
+            session,
+            selection: Selection::default(),
+            checked: 0,
+            preview: None,
+            outcome: None,
+        };
         this.refresh_preview(cx);
         this
     }
@@ -65,7 +73,9 @@ impl CleanScreen {
     /// Recomputed on every selection change rather than per frame: building a
     /// plan canonicalizes every chosen path.
     fn refresh_preview(&mut self, cx: &mut Context<Self>) {
-        self.preview = self.assessment(cx).map(|assessment| {
+        let assessment = self.assessment(cx);
+        self.checked = assessment.as_ref().map_or(0, |a| self.selection.checked_count(a));
+        self.preview = assessment.map(|assessment| {
             self.selection.preview(&assessment).map(Rc::new).map_err(|error| {
                 let message =
                     format!("cannot anchor a plan at {}: {error}", assessment.root.display());
@@ -81,19 +91,28 @@ impl CleanScreen {
         self.refresh_preview(cx);
     }
 
-    /// The plan Reclaim would apply: its action count and total bytes, or
-    /// `None` while there is nothing to apply.
-    pub fn plan_summary(&self) -> Option<(usize, u64)> {
-        match &self.preview {
-            Some(Ok(preview)) if !preview.plan.is_empty() => {
-                Some((preview.plan.len(), preview.plan.total_bytes()))
-            }
-            _ => None,
-        }
+    /// What the bottom bar shows: how many entries the user checked, and the
+    /// bytes of the plan those checks make — `(0, 0)` until something is
+    /// checked.
+    pub fn plan_summary(&self) -> (usize, u64) {
+        let bytes = match &self.preview {
+            Some(Ok(preview)) => preview.plan.total_bytes(),
+            _ => 0,
+        };
+        (self.checked, bytes)
+    }
+
+    /// Whether Reclaim has anything the user checked to apply.
+    pub fn can_apply(&self) -> bool {
+        matches!(&self.preview, Some(Ok(preview)) if !preview.plan.is_empty())
     }
 
     pub fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((len, bytes)) = self.plan_summary() else { return };
+        let Some(Ok(preview)) = &self.preview else { return };
+        if preview.plan.is_empty() {
+            return;
+        }
+        let (len, bytes) = (preview.plan.len(), preview.plan.total_bytes());
         let body =
             format!("{len} paths, {} in total, will be moved to the recycle bin.", size(bytes));
         let view = cx.entity();
@@ -156,6 +175,9 @@ impl CleanScreen {
             }
             let _ = this.update(cx, |this, cx| {
                 this.outcome = Some(outcome);
+                // What was checked is applied; the next plan starts empty.
+                this.selection.clear();
+                this.refresh_preview(cx);
                 cx.emit(Applied);
                 cx.notify();
             });
@@ -309,7 +331,9 @@ impl Render for CleanScreen {
             }));
 
         let summary = match &self.preview {
-            Some(Ok(preview)) if preview.plan.is_empty() => "Nothing to clean.".to_string(),
+            Some(Ok(preview)) if preview.plan.is_empty() => {
+                "Nothing checked. Check the entries to delete.".to_string()
+            }
             Some(Ok(preview)) => format!(
                 "Dry run: {} actions, {} to reclaim. Nothing has been touched.",
                 preview.plan.len(),

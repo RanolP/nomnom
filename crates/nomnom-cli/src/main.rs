@@ -88,14 +88,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Plan a cleanup of the drive. Dry-run unless `--apply` is given, which
-    /// sends the planned paths to the recycle bin.
+    /// List the drive's cleanup candidates, or plan the ones named. Nothing is
+    /// selected unless named; dry-run unless `--apply` is given, which sends
+    /// the named paths to the recycle bin.
     Clean {
         #[command(flatten)]
         scan: ScanArgs,
         #[command(flatten)]
         packs: PackArgs,
-        /// Actually carry the plan out. Without this nothing is touched.
+        /// Candidates to plan, as `nomnom clean <DRIVE>` lists them. With none,
+        /// the candidates are listed and nothing is planned.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Actually carry the plan out. Requires at least one PATH.
         #[arg(long)]
         apply: bool,
         /// Also act on `review` verdicts, which the evidence does not carry on
@@ -168,14 +173,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Suggest { scan, packs, json } => {
             suggest::run(&scan.drive, scan.show_errors, &packs.packs, json)
         }
-        Command::Clean { scan, packs, apply, include_review, json } => clean::run(clean::Request {
-            drive: &scan.drive,
-            show_errors: scan.show_errors,
-            packs: &packs.packs,
-            apply,
-            include_review,
-            json,
-        }),
+        Command::Clean { scan, packs, paths, apply, include_review, json } => {
+            clean::run(clean::Request {
+                drive: &scan.drive,
+                show_errors: scan.show_errors,
+                packs: &packs.packs,
+                paths: &paths,
+                apply,
+                include_review,
+                json,
+            })
+        }
         Command::Pack { drive, command } => pack::run(drive, command),
     }
 }
