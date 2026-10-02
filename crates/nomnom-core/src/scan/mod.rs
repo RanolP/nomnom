@@ -88,12 +88,9 @@ pub struct ScanOptions {
     /// volume, not the repo.
     pub respect_gitignore: bool,
     pub follow_symlinks: bool,
-    /// Bumped once per entry as the scan runs, so a UI on another thread can
-    /// show the scan is alive. The walk backend counts every visited entry,
-    /// unreadable ones included. The MFT backend counts in-use records of the
-    /// whole volume while reading the table, which outnumbers the entries of a
-    /// scan rooted below the volume root.
-    pub progress: Option<Arc<AtomicU64>>,
+    /// Live counters a UI on another thread reads to show how far the scan
+    /// has got. See [`ScanProgress`] for what each backend fills in.
+    pub progress: Option<Arc<ScanProgress>>,
 }
 
 impl Default for ScanOptions {
@@ -110,8 +107,64 @@ impl Default for ScanOptions {
 impl ScanOptions {
     pub(crate) fn tick(&self) {
         if let Some(progress) = &self.progress {
-            progress.fetch_add(1, Ordering::Relaxed);
+            progress.entries.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn add_bytes(&self, bytes: u64) {
+        if let Some(progress) = &self.progress {
+            progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn set_entries_total(&self, total: u64) {
+        if let Some(progress) = &self.progress {
+            progress.entries_total.store(total, Ordering::Relaxed);
+        }
+    }
+}
+
+/// How far a running scan has got, written by the scanning thread and read by
+/// anyone holding the `Arc`.
+///
+/// The two backends know different things up front, so they fill different
+/// fields:
+/// - MFT knows the table's record count before reading it, so it sets
+///   `entries_total` first and then counts every record it processes in
+///   `entries`: `entries / entries_total` is an honest fraction.
+/// - Walk cannot know how many entries a tree holds until it has walked it, so
+///   `entries_total` stays 0 (unknown). It counts visited entries in `entries`
+///   and adds each file's logical size to `bytes`, which against the volume's
+///   used bytes gives an estimate.
+///
+/// [`ScanProgress::fraction`] applies that rule, so every front-end shows the
+/// same number.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    pub entries: AtomicU64,
+    /// 0 means unknown.
+    pub entries_total: AtomicU64,
+    pub bytes: AtomicU64,
+}
+
+impl ScanProgress {
+    /// Completed fraction in `0.0..=1.0`, or `None` when nothing supports an
+    /// estimate yet. `used_bytes` is the scanned volume's total minus free.
+    ///
+    /// The byte estimate is capped below 1: logical sizes overshoot used bytes
+    /// for sparse and compressed files, and "100%" while still scanning is a
+    /// lie the record count never tells.
+    pub fn fraction(&self, used_bytes: u64) -> Option<f64> {
+        let total = self.entries_total.load(Ordering::Relaxed);
+        if total > 0 {
+            let done = self.entries.load(Ordering::Relaxed);
+            return Some((done as f64 / total as f64).min(1.0));
+        }
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        if bytes == 0 || used_bytes == 0 {
+            return None;
+        }
+        Some((bytes as f64 / used_bytes as f64).min(0.99))
     }
 }
 

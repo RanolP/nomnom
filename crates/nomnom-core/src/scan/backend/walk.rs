@@ -38,7 +38,10 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
             opts.tick();
             match result {
                 Ok(dent) => match to_entry(&dent) {
-                    Ok(entry) => entries.lock().unwrap().push(entry),
+                    Ok(entry) => {
+                        opts.add_bytes(entry.size);
+                        entries.lock().unwrap().push(entry);
+                    }
                     Err(err) => errors.lock().unwrap().push(err),
                 },
                 Err(err) => errors.lock().unwrap().push(walk_error(&err)),

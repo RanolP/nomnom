@@ -121,12 +121,16 @@ fn enumerate(
     opts: &ScanOptions,
 ) -> Result<ScanReport, ScanFailure> {
     let total = mft_record_count(ntfs, fs)?;
+    opts.set_entries_total(total.saturating_sub(FIRST_USER_RECORD));
 
     let mut errors: Vec<ScanError> = Vec::new();
     let mut dirs: HashMap<u64, DirRecord> = HashMap::new();
     let mut records: Vec<RawRecord> = Vec::new();
 
     for number in FIRST_USER_RECORD..total {
+        // Every record counts toward progress, free and unreadable ones too,
+        // because `entries_total` is the size of the table, not of its live set.
+        opts.tick();
         let file = match ntfs.file(fs, number) {
             Ok(file) => file,
             Err(err) => {
@@ -138,7 +142,6 @@ fn enumerate(
         if !file.flags().contains(NtfsFileFlags::IN_USE) {
             continue;
         }
-        opts.tick();
 
         let is_dir = file.is_directory();
         let mut names: Vec<(u64, String)> = Vec::new();

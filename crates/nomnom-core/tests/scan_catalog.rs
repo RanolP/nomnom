@@ -3,11 +3,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use nomnom_core::catalog::{Catalog, file_types, largest_files};
 use nomnom_core::scan::{
-    Backend, BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport, scan,
+    Backend, BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanProgress,
+    ScanReport, scan,
 };
 
 fn file_entry(path: impl Into<PathBuf>, size: u64) -> Entry {
@@ -220,21 +221,40 @@ fn auto_falls_back_to_walk_while_mft_fails_loudly() {
     assert_eq!(requested.backend_used, BackendUsed::Walk { mft_unavailable: None });
 }
 
-/// Catches an unwired progress counter, which would freeze the GUI's scan
-/// indicator at 0 for the whole scan.
+/// Catches unwired progress counters, which would freeze the front-ends' scan
+/// indicator at 0: walk must count every entry and add every file's bytes, and
+/// leave the total at 0 (unknown) rather than invent one.
 #[test]
-fn progress_counter_counts_every_scanned_entry() {
+fn walk_progress_counts_every_entry_and_its_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("sub")).unwrap();
-    std::fs::write(tmp.path().join("a.bin"), b"a").unwrap();
-    std::fs::write(tmp.path().join("sub/b.bin"), b"b").unwrap();
+    std::fs::write(tmp.path().join("a.bin"), b"aaa").unwrap();
+    std::fs::write(tmp.path().join("sub/b.bin"), b"bb").unwrap();
 
-    let progress = Arc::new(AtomicU64::new(0));
+    let progress = Arc::new(ScanProgress::default());
     let opts = ScanOptions { progress: Some(progress.clone()), ..walk_opts() };
     let report = scan(tmp.path(), &opts).unwrap();
 
     assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
-    assert_eq!(progress.load(Ordering::Relaxed), report.entries.len() as u64);
+    assert_eq!(progress.entries.load(Ordering::Relaxed), report.entries.len() as u64);
+    assert_eq!(progress.bytes.load(Ordering::Relaxed), 5);
+    assert_eq!(progress.entries_total.load(Ordering::Relaxed), 0);
+}
+
+/// Catches the two front-ends drifting apart on the shown percentage: a known
+/// total wins over bytes, and the byte estimate never claims completion.
+#[test]
+fn progress_fraction_prefers_the_record_total_and_caps_the_byte_estimate() {
+    let progress = ScanProgress::default();
+    assert_eq!(progress.fraction(1000), None, "nothing scanned yet");
+
+    progress.bytes.store(2000, Ordering::Relaxed);
+    assert_eq!(progress.fraction(1000), Some(0.99), "sparse overshoot must not read as done");
+    assert_eq!(progress.fraction(0), None, "unknown used bytes");
+
+    progress.entries_total.store(200, Ordering::Relaxed);
+    progress.entries.store(50, Ordering::Relaxed);
+    assert_eq!(progress.fraction(1000), Some(0.25));
 }
 
 /// Catches directories being counted as files (twice over, once as a node and
