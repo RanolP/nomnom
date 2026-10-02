@@ -113,15 +113,13 @@ pub struct Plan {
 impl Plan {
     /// Anchor a plan at `root`. The root must exist: it is the fence every
     /// action is checked against, and a fence that cannot be resolved is no
-    /// fence at all.
+    /// fence at all. A drive root is a valid fence, since nomnom scans whole
+    /// drives; [`guard_source`] still refuses the root itself as a target.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ActionError> {
         let root = root.as_ref();
         reject_parent_dir(root)?;
         let root =
             root.canonicalize().map_err(|_| ActionError::RootUnreadable(root.to_path_buf()))?;
-        if root.parent().is_none() {
-            return Err(ActionError::FilesystemRoot(root));
-        }
         Ok(Self { root, entries: Vec::new() })
     }
 

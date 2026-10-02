@@ -24,6 +24,18 @@ fn fixture() -> (TempDir, PathBuf) {
 }
 
 #[test]
+fn a_drive_root_anchors_a_plan_but_is_never_a_target() {
+    // Catches Clean planning nothing on every drive: scans are drive-only, so
+    // the plan's fence is always a drive root.
+    let drive_root = if cfg!(windows) { PathBuf::from("C:\\") } else { PathBuf::from("/") };
+    let mut plan = Plan::new(&drive_root).unwrap();
+    assert!(matches!(
+        plan.push(Action::Trash { path: drive_root }, 0, "the whole drive"),
+        Err(ActionError::FilesystemRoot(_))
+    ));
+}
+
+#[test]
 fn guards_reject_paths_outside_the_root_drive_roots_and_parent_traversal() {
     // Catches the guards being dropped — the one thing standing between a rule
     // bug and someone's C:\.
