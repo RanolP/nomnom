@@ -236,3 +236,18 @@ fn progress_counter_counts_every_scanned_entry() {
     assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
     assert_eq!(progress.load(Ordering::Relaxed), report.entries.len() as u64);
 }
+
+/// Catches the drive picker coming up empty or garbled: the system drive is
+/// always a fixed drive, so it must be listed with a real capacity.
+#[cfg(windows)]
+#[test]
+fn volumes_lists_the_system_drive() {
+    let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let volumes = nomnom_core::scan::volumes();
+    let volume = volumes
+        .iter()
+        .find(|v| v.root == Path::new(&format!("{system}\\")))
+        .unwrap_or_else(|| panic!("{system}\\ missing from {volumes:?}"));
+    assert!(volume.total > 0 && volume.free <= volume.total, "{volume:?}");
+    assert!(!volume.fs.is_empty(), "{volume:?}");
+}

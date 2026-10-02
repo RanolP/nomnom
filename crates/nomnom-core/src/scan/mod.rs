@@ -15,6 +15,9 @@
 //! slow path and how to get off it.
 
 pub mod backend;
+mod drives;
+
+pub use drives::{Volume, volumes};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

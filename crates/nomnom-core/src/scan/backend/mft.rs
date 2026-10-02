@@ -555,12 +555,12 @@ pub fn strip_verbatim(path: &Path) -> Result<PathBuf, ScanFailure> {
     }
 }
 
-fn wide(text: &OsStr) -> Vec<u16> {
+pub(crate) fn wide(text: &OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     text.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn from_wide(buffer: &[u16]) -> PathBuf {
+pub(crate) fn from_wide(buffer: &[u16]) -> PathBuf {
     use std::os::windows::ffi::OsStringExt;
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     PathBuf::from(OsString::from_wide(&buffer[..len]))
