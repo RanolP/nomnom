@@ -1,12 +1,10 @@
-//! Turning a path plus flags into a [`Catalog`], and telling the user the two
+//! Turning a drive plus flags into a [`Catalog`], and telling the user the two
 //! things a scan can quietly get wrong: which backend actually ran, and how
 //! many entries it could not read.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use nomnom_core::catalog::Catalog;
-use nomnom_core::scan::{Backend, BackendUsed, ScanOptions, scan};
+use nomnom_core::scan::{Backend, BackendUsed, ScanOptions, VolumeRoot, scan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum BackendArg {
@@ -26,9 +24,9 @@ impl From<BackendArg> for Backend {
     }
 }
 
-pub fn load(path: &Path, backend: BackendArg) -> Result<Catalog> {
+pub fn load(drive: &VolumeRoot, backend: BackendArg) -> Result<Catalog> {
     let opts = ScanOptions { backend: backend.into(), ..ScanOptions::default() };
-    let report = scan(path, &opts).with_context(|| format!("cannot scan {}", path.display()))?;
+    let report = scan(drive, &opts).with_context(|| format!("cannot scan {drive}"))?;
     Ok(Catalog::build(report))
 }
 

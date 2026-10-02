@@ -1,14 +1,16 @@
 //! Scan → catalog seam: aggregate roll-up, order independence, depth safety,
-//! duplicate detection, error collection, and backend dispatch policy.
+//! duplicate detection, error collection, and the drive-only scan policy.
+//! Backend dispatch on real trees is tested inside the crate, beside it.
+
+mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use common::report_of;
 use nomnom_core::catalog::{Catalog, file_types, largest_files};
 use nomnom_core::scan::{
-    Backend, BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanProgress,
-    ScanReport, scan,
+    BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanProgress, ScanReport, VolumeRoot,
 };
 
 fn file_entry(path: impl Into<PathBuf>, size: u64) -> Entry {
@@ -42,10 +44,6 @@ fn report(root: impl Into<PathBuf>, entries: Vec<Entry>) -> ScanReport {
     }
 }
 
-fn walk_opts() -> ScanOptions {
-    ScanOptions { backend: Backend::Walk, ..ScanOptions::default() }
-}
-
 /// Catches aggregate roll-up drifting: subtree_size, file_count and dir_count
 /// must be the exact byte and node counts of a fixture tree with known sizes.
 #[test]
@@ -61,7 +59,7 @@ fn rollup_matches_known_fixture_sizes() {
     std::fs::write(root.join("a/inner/three.bin"), vec![0u8; 3]).unwrap();
     std::fs::write(root.join("b/four.bin"), vec![0u8; 7]).unwrap();
 
-    let catalog = Catalog::build(scan(root, &walk_opts()).unwrap());
+    let catalog = Catalog::build(report_of(root));
 
     let root_node = catalog.node(catalog.root());
     assert_eq!(root_node.subtree_size, 140);
@@ -157,7 +155,7 @@ fn duplicate_groups_require_matching_contents_not_just_size() {
     std::fs::write(root.join("three.bin"), b"DIFFERENT contentz").unwrap();
     assert_eq!(b"identical contents".len(), b"DIFFERENT contentz".len());
 
-    let catalog = Catalog::build(scan(root, &walk_opts()).unwrap());
+    let catalog = Catalog::build(report_of(root));
     let groups = catalog.duplicate_groups(1);
 
     assert_eq!(groups.len(), 1, "expected exactly one duplicate group, got {groups:?}");
@@ -193,52 +191,15 @@ fn per_entry_errors_are_collected_not_propagated() {
     assert!(catalog.find(Path::new("/r/readable.bin")).is_some());
 }
 
-/// Catches Auto turning into a hard failure when MFT is unavailable — the most
-/// damaging regression in this seam. Mft must fail loudly; Auto must fall back
-/// to walk and say why.
+/// Catches the drive-only policy being bypassed: the one public scan entry
+/// point takes a `VolumeRoot`, and a folder must never parse into one.
 #[test]
-fn auto_falls_back_to_walk_while_mft_fails_loudly() {
+fn a_folder_is_not_a_volume_root() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("f.bin"), b"x").unwrap();
-
-    let explicit =
-        scan(tmp.path(), &ScanOptions { backend: Backend::Mft, ..ScanOptions::default() });
-    assert!(
-        matches!(explicit, Err(ScanFailure::MftUnavailable(_))),
-        "Backend::Mft must not fall back, got {explicit:?}"
-    );
-
-    let auto = scan(tmp.path(), &ScanOptions { backend: Backend::Auto, ..ScanOptions::default() })
-        .expect("Auto must fall back to walk rather than fail");
-    match auto.backend_used {
-        BackendUsed::Walk { mft_unavailable: Some(_) } => {}
-        other => panic!("Auto must report why MFT was skipped, got {other:?}"),
+    match VolumeRoot::new(tmp.path()) {
+        Err(ScanFailure::NotAVolumeRoot(path)) => assert_eq!(path, tmp.path()),
+        other => panic!("a temp folder parsed as a scan root: {other:?}"),
     }
-    assert!(auto.entries.iter().any(|e| e.path == tmp.path().join("f.bin")));
-
-    let requested =
-        scan(tmp.path(), &walk_opts()).expect("an explicitly requested walk must succeed");
-    assert_eq!(requested.backend_used, BackendUsed::Walk { mft_unavailable: None });
-}
-
-/// Catches unwired progress counters, which would freeze the front-ends' scan
-/// indicator at 0: walk must count every entry and add every file's bytes, and
-/// leave the total at 0 (unknown) rather than invent one.
-#[test]
-fn walk_progress_counts_every_entry_and_its_bytes() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(tmp.path().join("sub")).unwrap();
-    std::fs::write(tmp.path().join("a.bin"), b"aaa").unwrap();
-    std::fs::write(tmp.path().join("sub/b.bin"), b"bb").unwrap();
-
-    let progress = Arc::new(ScanProgress::default());
-    let opts = ScanOptions { progress: Some(progress.clone()), ..walk_opts() };
-    let report = scan(tmp.path(), &opts).unwrap();
-
-    assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
-    assert_eq!(progress.entries.load(Ordering::Relaxed), report.entries.len() as u64);
-    assert_eq!(progress.bytes.load(Ordering::Relaxed), 5);
-    assert_eq!(progress.entries_total.load(Ordering::Relaxed), 0);
 }
 
 /// Catches the two front-ends drifting apart on the shown percentage: a known

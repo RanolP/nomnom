@@ -8,10 +8,23 @@ mod scan;
 mod suggest;
 mod undo;
 
+// The commands' own tests render from fixture catalogs instead of scanning a
+// drive, so they borrow the workspace's fixture helpers by path rather than
+// copying them.
+#[cfg(test)]
+#[path = "../../nomnom-pack/tests/common/mod.rs"]
+mod pack_fixtures;
+#[cfg(test)]
+#[path = "../../nomnom-core/tests/common/mod.rs"]
+mod scan_fixtures;
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use nomnom_core::scan::VolumeRoot;
 
 use input::BackendArg;
 
@@ -22,11 +35,11 @@ struct Cli {
     command: Command,
 }
 
-/// Flags every command that scans a tree shares.
+/// Flags every command that scans a drive shares.
 #[derive(Debug, Args)]
 struct ScanArgs {
-    /// Directory to examine.
-    path: PathBuf,
+    /// Drive to examine, e.g. `C:\` or `D:`. nomnom scans whole drives only.
+    drive: VolumeRoot,
     /// Scanning backend. `mft` fails rather than falling back.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto, global = true)]
     backend: BackendArg,
@@ -42,7 +55,7 @@ struct ScanArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show the tree with rolled-up sizes, biggest first.
+    /// Show the drive's tree with rolled-up sizes, biggest first.
     Scan {
         #[command(flatten)]
         scan: ScanArgs,
@@ -55,14 +68,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Say what each path is and whether it can go.
+    /// Say what each path on the drive is and whether it can go.
     Suggest {
         #[command(flatten)]
         scan: ScanArgs,
         #[arg(long)]
         json: bool,
     },
-    /// Plan a cleanup. Dry-run unless `--apply` is given.
+    /// Plan a cleanup of the drive. Dry-run unless `--apply` is given.
     Clean {
         #[command(flatten)]
         scan: ScanArgs,
@@ -79,8 +92,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Add, list and trust the rule packs a run loads.
+    /// Add, list and trust the rule packs a drive's runs load.
     Pack {
+        /// The drive whose `.nomnom\packs.lock` to use. Defaults to the drive
+        /// holding the working directory.
+        #[arg(long, value_name = "DRIVE", global = true)]
+        drive: Option<VolumeRoot>,
         #[command(subcommand)]
         command: pack::PackCommand,
     },
@@ -107,13 +124,13 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Scan { scan, depth, top, json } => {
-            scan::run(&scan.path, scan.backend, scan.show_errors, depth, top, json)
+            scan::run(&scan.drive, scan.backend, scan.show_errors, depth, top, json)
         }
         Command::Suggest { scan, json } => {
-            suggest::run(&scan.path, scan.backend, scan.show_errors, &scan.packs, json)
+            suggest::run(&scan.drive, scan.backend, scan.show_errors, &scan.packs, json)
         }
         Command::Clean { scan, apply, include_review, stage, json } => clean::run(clean::Request {
-            path: &scan.path,
+            drive: &scan.drive,
             backend: scan.backend,
             show_errors: scan.show_errors,
             packs: &scan.packs,
@@ -122,7 +139,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             stage,
             json,
         }),
-        Command::Pack { command } => pack::run(command),
+        Command::Pack { drive, command } => pack::run(drive, command),
         Command::Undo { journal, json } => undo::run(&journal, json),
     }
 }

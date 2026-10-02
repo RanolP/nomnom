@@ -4,85 +4,24 @@
 //! a raw volume handle — the enumeration itself — cannot be proven without
 //! Administrator, so what is pinned instead is everything that decides whether
 //! the enumeration would be correct: the alignment arithmetic under the reader,
-//! the parent-chasing loop that rebuilds paths, the exact spelling of the paths
-//! that come out, and the failure that is reported when the volume is closed to
-//! us. Nothing below skips itself.
+//! and the parent-chasing loop that rebuilds paths. The spelling of the paths
+//! that come out and the failure reported when the volume is closed to us run
+//! a folder through the dispatcher, so they live in the crate's own tests
+//! (`scan::backend::tests`), out of reach of the drive-only public scan.
 
 // The backend module only exists on Windows, which is also the only platform
 // that has an MFT to read.
 #![cfg(windows)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use nomnom_core::scan::backend::mft::paths::{DirRecord, PathBuilder, ROOT_RECORD, respell_under};
 use nomnom_core::scan::backend::mft::{strip_verbatim, volume};
-use nomnom_core::scan::{Backend, BackendUsed, ScanFailure, ScanOptions, scan};
+use nomnom_core::scan::{Backend, BackendUsed, ScanOptions, VolumeRoot, scan};
 use volume::{AlignedReader, FileSource};
-
-// ---------------------------------------------------------------------------
-// Backend availability
-// ---------------------------------------------------------------------------
-
-/// Regression: an MFT path that cannot run (no elevation, wrong filesystem,
-/// unopenable volume) crashing or returning a half-filled report instead of the
-/// `MftUnavailable` signal `Backend::Auto` needs to fall back on.
-#[test]
-fn explicit_mft_request_reports_a_reason_rather_than_panicking() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-
-    let opts = ScanOptions { backend: Backend::Mft, ..ScanOptions::default() };
-    match scan(dir.path(), &opts) {
-        // Elevated: the backend really ran, and says so.
-        Ok(report) => {
-            assert_eq!(report.backend_used, BackendUsed::Mft);
-            assert_eq!(report.root, dir.path());
-        }
-        // Unelevated, or a non-NTFS temp volume: a reason the user can act on.
-        Err(ScanFailure::MftUnavailable(reason)) => {
-            assert!(!reason.trim().is_empty(), "MftUnavailable carried an empty reason");
-            assert!(
-                reason.contains("volume") || reason.contains("NTFS") || reason.contains("MFT"),
-                "reason does not name the obstacle: {reason}"
-            );
-        }
-        Err(other) => panic!("expected MftUnavailable, got {other:?}"),
-    }
-}
-
-/// Regression: a missing root reported as "MFT unavailable", which would send
-/// `Backend::Auto` off to re-walk a path that does not exist.
-#[test]
-fn missing_root_is_root_unreadable_not_mft_unavailable() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("no-such-directory");
-
-    let opts = ScanOptions { backend: Backend::Mft, ..ScanOptions::default() };
-    match scan(&missing, &opts) {
-        Err(ScanFailure::RootUnreadable(path)) => assert_eq!(path, missing),
-        other => panic!("expected RootUnreadable, got {other:?}"),
-    }
-}
-
-/// Regression: `Backend::Auto` propagating the MFT's unavailability to the
-/// caller instead of silently falling back to the walk backend.
-#[test]
-fn auto_falls_back_to_walk_and_keeps_the_reason() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-
-    let report = scan(dir.path(), &ScanOptions::default()).expect("Auto must never fail here");
-    match report.backend_used {
-        BackendUsed::Mft => {}
-        BackendUsed::Walk { mft_unavailable } => {
-            let reason = mft_unavailable.expect("the fallback must carry why it happened");
-            assert!(!reason.trim().is_empty());
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Sector-aligned reader
@@ -245,41 +184,6 @@ fn canonical_roots_are_stripped_back_to_plain_drive_paths() {
     assert_eq!(plain, dir.path());
 }
 
-/// Regression: the MFT backend spelling a path even slightly differently from
-/// the walk backend — a separator, a case change, a prefix — which fragments
-/// the catalog into orphans that all re-attach to the root.
-#[test]
-fn reconstructed_paths_are_spelled_exactly_as_the_walk_backend_spells_them() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    fs::create_dir_all(root.join("Alpha").join("Beta")).unwrap();
-    fs::write(root.join("two.txt"), b"..").unwrap();
-    fs::write(root.join("Alpha").join("one.txt"), b".").unwrap();
-    fs::write(root.join("Alpha").join("Beta").join("deep.txt"), b"...").unwrap();
-
-    let opts = ScanOptions { backend: Backend::Walk, ..ScanOptions::default() };
-    let walked: HashSet<PathBuf> =
-        scan(&root, &opts).unwrap().entries.into_iter().map(|e| e.path).collect();
-
-    // The same tree as the MFT would hand it over: names and parent references,
-    // with the temp directory standing in for the volume root.
-    let dirs = dir_map(&[(20, "Alpha", ROOT_RECORD), (21, "Beta", 20)]);
-    let mut builder = PathBuilder::new(&dirs, root.clone(), ROOT_RECORD);
-
-    let mut rebuilt = HashSet::new();
-    rebuilt.insert(respell_under(&root, &root, &root).expect("the root is its own subtree"));
-    for record in [20u64, 21] {
-        let full = builder.dir_path(record).unwrap();
-        rebuilt.insert(respell_under(&full, &root, &root).unwrap());
-    }
-    for (parent, name) in [(ROOT_RECORD, "two.txt"), (20, "one.txt"), (21, "deep.txt")] {
-        let full = builder.child_path(parent, name).unwrap();
-        rebuilt.insert(respell_under(&full, &root, &root).unwrap());
-    }
-
-    assert_eq!(rebuilt, walked, "MFT-style paths differ from the walk backend's paths");
-}
-
 /// Regression: the subtree filter admitting a sibling whose path merely starts
 /// with the same characters, or rejecting the scan root itself.
 #[test]
@@ -322,14 +226,16 @@ fn subtree_filter_keeps_the_root_and_rejects_near_misses() {
 #[test]
 #[ignore = "needs an elevated process for a raw volume handle"]
 fn real_volume_enumeration_produces_paths_that_exist() {
-    let root = std::env::current_dir().unwrap();
+    let root = VolumeRoot::new(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()))
+        .expect("the system drive is a volume root");
     let opts = ScanOptions { backend: Backend::Mft, ..ScanOptions::default() };
     let report = scan(&root, &opts).expect("run this elevated");
+    let root = root.as_path();
 
     assert_eq!(report.backend_used, BackendUsed::Mft);
     assert!(!report.entries.is_empty());
     for entry in report.entries.iter().take(200) {
-        assert!(entry.path.starts_with(&root), "{} escaped the root", entry.path.display());
+        assert!(entry.path.starts_with(root), "{} escaped the root", entry.path.display());
         assert!(entry.path.symlink_metadata().is_ok(), "{} does not exist", entry.path.display());
     }
 }

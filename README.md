@@ -2,15 +2,33 @@
 
 Find what is eating your disk, say what each path is and why, and reclaim it with a journal you can undo. The rule language is described in [docs/lang.md](docs/lang.md).
 
+## CLI
+
+`nomnom` scans whole drives only: every command that scans takes a drive root such as `C:\`, `C:` or `D:/`, and refuses a folder with a nonzero exit.
+
+```sh
+cargo run -p nomnom-cli -- scan C:\             # the tree, biggest first
+cargo run -p nomnom-cli -- suggest D:           # what each path is, and why
+cargo run -p nomnom-cli -- clean D:             # the dry-run plan; add --apply to act
+cargo run -p nomnom-cli -- undo <journal>       # reverse an apply with the journal it printed
+cargo run -p nomnom-cli -- pack list --drive D: # the rule packs a drive's runs load
+```
+
+`--json` gives machine-readable output on every command. `--backend mft|walk` overrides the scanner; the default tries the fast MFT read and falls back to a walk. The pack lock a drive's runs obey lives at `<drive>\.nomnom\packs.lock`, the same file the GUI's Packs screen edits; `pack` commands use the working directory's drive unless `--drive` names another.
+
 ## GUI
 
-`nomnom-gui` is a desktop front-end over the same pipeline as the `nomnom` CLI: Scan, Suggest, Clean, Packs and Undo, each a screen in the sidebar.
+`nomnom-gui` is a desktop front-end over the same pipeline as the `nomnom` CLI, laid out after WizTree, and it offers the same features as the CLI. The sidebar holds the drive views (Drives, Tree, File types, Largest files) and a Cleanup group (Suggest, Clean, Packs, Undo).
 
 ```sh
 cargo run -p nomnom-gui
 ```
 
-Pass a folder as the first argument (or set `NOMNOM_GUI_ROOT`) to open and scan it at launch; otherwise choose one with **Choose folder…**. Clean always shows the dry run first, and Apply asks for confirmation before anything moves.
+nomnom scans whole drives only, like the CLI. The app opens on **Drives**, one card per fixed drive; clicking a card scans that drive and opens the **Tree**: a size-sorted tree table above a treemap, where clicking a rectangle selects its entry in the tree. A progress bar shows how far the scan has got, with the entry count and elapsed time.
+
+Every scan of an NTFS drive asks for Administrator access through a UAC prompt, because reading the Master File Table is much faster than walking the drive and also reports on-disk sizes. Decline the prompt, or let the elevated scan fail, and nomnom walks the drive instead and says so in a banner. When the app already runs as Administrator, no prompt appears. The header's **Backend** switch matches the CLI's `--backend`: **Walk** never prompts, and **MFT** fails rather than falling back.
+
+Suggest and Clean judge the drive only when you press **Analyze**, since hashing duplicate candidates on a whole drive takes minutes. Clean always shows the dry run first, and Apply asks for confirmation before anything moves.
 
 A release build (`cargo build -p nomnom-gui --release`) compiles GPUI's shaders with the Windows SDK's `fxc.exe`. When Windows SDK 10.0.26100.0 is not installed, point `GPUI_FXC_PATH` at the `fxc.exe` of an SDK you do have, for example:
 

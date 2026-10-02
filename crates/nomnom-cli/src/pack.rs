@@ -12,11 +12,13 @@
 //! sentence does not name what is being trusted is not deliberate — it is a
 //! name the user typed being echoed back at them.
 
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use nomnom_core::scan::VolumeRoot;
 use nomnom_core::verdict::{KnownPack, PackRow, find_pack, pack_inventory};
 use nomnom_pack::{Lock, LockedPack, Store, Tier, Trust};
 use serde::Serialize;
@@ -30,7 +32,7 @@ pub enum PackCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Every pack this project resolves: name, tier, pinned SHA, trust state.
+    /// Every pack this drive resolves: name, tier, pinned SHA, trust state.
     List {
         /// Also list an explicit pack directory, as `--pack` would load it.
         #[arg(long = "pack", value_name = "DIR")]
@@ -70,82 +72,102 @@ pub enum PackCommand {
     },
 }
 
-/// Pack commands do not take a scan root, so the project is the working
-/// directory. `Lock::load` treats a project that has never added a pack as an
-/// empty lock rather than an error, so this is safe anywhere.
-fn project_root() -> Result<PathBuf> {
-    std::env::current_dir().context("cannot read the working directory to find .nomnom/packs.lock")
+/// The lock a run reads lives on the drive it scans, at
+/// `<drive>\.nomnom\packs.lock` — the same file the GUI's Packs screen edits —
+/// so a grant made here is the one `suggest` and `clean` on that drive obey.
+/// Without `--drive`, the drive is the one holding the working directory.
+fn drive_lock_root(drive: Option<VolumeRoot>) -> Result<VolumeRoot> {
+    if let Some(drive) = drive {
+        return Ok(drive);
+    }
+    let cwd =
+        std::env::current_dir().context("cannot read the working directory to find its drive")?;
+    let root: PathBuf = cwd
+        .components()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .collect();
+    VolumeRoot::new(&root).with_context(|| {
+        format!("the working directory {} is not on a drive; pass --drive", cwd.display())
+    })
 }
 
-pub fn run(command: PackCommand) -> Result<ExitCode> {
-    let root = project_root()?;
+pub fn run(drive: Option<VolumeRoot>, command: PackCommand) -> Result<ExitCode> {
+    let root = drive_lock_root(drive)?;
+    dispatch(root.as_path(), command, &mut std::io::stdout().lock())
+}
+
+pub(crate) fn dispatch(root: &Path, command: PackCommand, out: &mut dyn Write) -> Result<ExitCode> {
     match command {
-        PackCommand::Add { url, json } => add(&root, &url, json),
-        PackCommand::List { packs, json } => list(&root, &packs, json),
-        PackCommand::Trust { name, packs, json } => set_trust(&root, &name, &packs, true, json),
-        PackCommand::Untrust { name, packs, json } => set_trust(&root, &name, &packs, false, json),
-        PackCommand::Update { name, json } => update(&root, &name, json),
-        PackCommand::Remove { name, json } => remove(&root, &name, json),
+        PackCommand::Add { url, json } => add(root, &url, json, out),
+        PackCommand::List { packs, json } => list(root, &packs, json, out),
+        PackCommand::Trust { name, packs, json } => set_trust(root, &name, &packs, true, json, out),
+        PackCommand::Untrust { name, packs, json } => {
+            set_trust(root, &name, &packs, false, json, out)
+        }
+        PackCommand::Update { name, json } => update(root, &name, json, out),
+        PackCommand::Remove { name, json } => remove(root, &name, json, out),
     }
 }
 
-fn add(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
+fn add(root: &Path, url: &str, json: bool, out: &mut dyn Write) -> Result<ExitCode> {
     let store = Store::open()?;
     let mut lock = Lock::load(root)?;
     let added = nomnom_pack::add(&store, &mut lock, url)?;
     lock.save(root)?;
 
     if json {
-        print_json(&AddOutput { added: &added, lock: &lock_path(root) })?;
+        print_json(out, &AddOutput { added: &added, lock: &lock_path(root) })?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("Added pack `{}`.", added.name);
-    println!("  url:    {}", added.url.as_deref().unwrap_or("-"));
-    println!("  pinned: {}", added.sha.as_deref().unwrap_or("-"));
+    writeln!(out, "Added pack `{}`.", added.name)?;
+    writeln!(out, "  url:    {}", added.url.as_deref().unwrap_or("-"))?;
+    writeln!(out, "  pinned: {}", added.sha.as_deref().unwrap_or("-"))?;
     if let Some(subdir) = &added.subdir {
-        println!("  subdir: {subdir}");
+        writeln!(out, "  subdir: {subdir}")?;
     }
-    println!("  lock:   {}", lock_path(root));
-    println!();
-    println!("A pack is pinned to a commit, never to a branch: the SHA above is what loads.");
+    writeln!(out, "  lock:   {}", lock_path(root))?;
+    writeln!(out)?;
+    writeln!(out, "A pack is pinned to a commit, never to a branch: the SHA above is what loads.")?;
     if added.trusted {
-        println!("Pack `{}` is trusted; its rules may say `reclaimable`.", added.name);
+        writeln!(out, "Pack `{}` is trusted; its rules may say `reclaimable`.", added.name)?;
     } else {
-        println!(
+        writeln!(
+            out,
             "Pack `{}` is not trusted, so its `reclaimable` rules show as `review`.",
             added.name
-        );
-        println!("Run `nomnom pack trust {}` once you have read them.", added.name);
+        )?;
+        writeln!(out, "Run `nomnom pack trust {}` once you have read them.", added.name)?;
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn list(root: &Path, explicit: &[PathBuf], json: bool) -> Result<ExitCode> {
+fn list(root: &Path, explicit: &[PathBuf], json: bool, out: &mut dyn Write) -> Result<ExitCode> {
     let rows: Vec<Row> = pack_inventory(root, explicit)?.into_iter().map(Row::from).collect();
 
     if json {
-        print_json(&ListOutput { lock: &lock_path(root), packs: &rows })?;
+        print_json(out, &ListOutput { lock: &lock_path(root), packs: &rows })?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let width = |f: fn(&Row) -> &str| rows.iter().map(|r| f(r).len()).max().unwrap_or(0);
     let (name_w, tier_w, trust_w) =
         (width(|r| &r.name).max(4), width(|r| r.tier).max(4), width(|r| r.trust).max(5));
-    println!("{:name_w$}  {:tier_w$}  {:trust_w$}  PINNED", "NAME", "TIER", "TRUST");
+    writeln!(out, "{:name_w$}  {:tier_w$}  {:trust_w$}  PINNED", "NAME", "TIER", "TRUST")?;
     for row in &rows {
-        println!(
+        writeln!(
+            out,
             "{:name_w$}  {:tier_w$}  {:trust_w$}  {}",
             row.name,
             row.tier,
             row.trust,
             row.sha.as_deref().unwrap_or("-")
-        );
+        )?;
     }
     if rows.iter().any(|row| row.trust == UNTRUSTED) {
-        println!();
-        println!("An untrusted pack's `reclaimable` rules are capped at `review`.");
-        println!("Grant it with `nomnom pack trust <name>`.");
+        writeln!(out)?;
+        writeln!(out, "An untrusted pack's `reclaimable` rules are capped at `review`.")?;
+        writeln!(out, "Grant it with `nomnom pack trust <name>`.")?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -156,6 +178,7 @@ fn set_trust(
     explicit: &[PathBuf],
     trusted: bool,
     json: bool,
+    out: &mut dyn Write,
 ) -> Result<ExitCode> {
     let mut lock = Lock::load(root)?;
     let known = Known::from(find_pack(root, name, explicit, &lock)?);
@@ -163,18 +186,23 @@ fn set_trust(
     if !json {
         if trusted {
             // Named in full before the grant is recorded, not after.
-            println!("Trusting pack `{name}`:");
-            println!("  url:    {}", known.url.as_deref().unwrap_or("(a local directory)"));
-            println!("  pinned: {}", known.sha.as_deref().unwrap_or("-"));
-            println!("  from:   {}", known.dir);
-            println!();
-            println!(
+            writeln!(out, "Trusting pack `{name}`:")?;
+            writeln!(out, "  url:    {}", known.url.as_deref().unwrap_or("(a local directory)"))?;
+            writeln!(out, "  pinned: {}", known.sha.as_deref().unwrap_or("-"))?;
+            writeln!(out, "  from:   {}", known.dir)?;
+            writeln!(out)?;
+            writeln!(
+                out,
                 "Its rules may then say `reclaimable`, which makes the paths they match \
                  deletion candidates."
-            );
+            )?;
         } else {
-            println!("Revoking trust for pack `{name}`.");
-            println!("It stays pinned at {}; its rules cap at `review` again.", known.pinned());
+            writeln!(out, "Revoking trust for pack `{name}`.")?;
+            writeln!(
+                out,
+                "It stays pinned at {}; its rules cap at `review` again.",
+                known.pinned()
+            )?;
         }
     }
 
@@ -182,16 +210,16 @@ fn set_trust(
     lock.save(root)?;
 
     if json {
-        print_json(&TrustOutput { pack: &known, trusted, lock: &lock_path(root) })?;
+        print_json(out, &TrustOutput { pack: &known, trusted, lock: &lock_path(root) })?;
     } else if trusted {
-        println!("Trusted `{name}`.");
+        writeln!(out, "Trusted `{name}`.")?;
     } else {
-        println!("Untrusted `{name}`.");
+        writeln!(out, "Untrusted `{name}`.")?;
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn update(root: &Path, name: &str, json: bool) -> Result<ExitCode> {
+fn update(root: &Path, name: &str, json: bool, out: &mut dyn Write) -> Result<ExitCode> {
     let store = Store::open()?;
     let mut lock = Lock::load(root)?;
     let before = lock.get(name).and_then(|pack| pack.sha.clone());
@@ -199,29 +227,32 @@ fn update(root: &Path, name: &str, json: bool) -> Result<ExitCode> {
     lock.save(root)?;
 
     if json {
-        print_json(&UpdateOutput { pack: &moved, was: before.as_deref(), lock: &lock_path(root) })?;
+        print_json(
+            out,
+            &UpdateOutput { pack: &moved, was: before.as_deref(), lock: &lock_path(root) },
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
     let now = moved.sha.as_deref().unwrap_or("-");
     match before.as_deref() {
-        Some(was) if was == now => println!("Pack `{name}` is already at {now}."),
-        Some(was) => println!("Pack `{name}` moved from {was} to {now}."),
-        None => println!("Pack `{name}` pinned at {now}."),
+        Some(was) if was == now => writeln!(out, "Pack `{name}` is already at {now}.")?,
+        Some(was) => writeln!(out, "Pack `{name}` moved from {was} to {now}.")?,
+        None => writeln!(out, "Pack `{name}` pinned at {now}.")?,
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn remove(root: &Path, name: &str, json: bool) -> Result<ExitCode> {
+fn remove(root: &Path, name: &str, json: bool, out: &mut dyn Write) -> Result<ExitCode> {
     let mut lock = Lock::load(root)?;
     if !lock.remove(name) {
         return Err(nomnom_pack::Error::NotLocked { name: name.to_string() }.into());
     }
     lock.save(root)?;
     if json {
-        print_json(&RemoveOutput { removed: name, lock: &lock_path(root) })?;
+        print_json(out, &RemoveOutput { removed: name, lock: &lock_path(root) })?;
     } else {
-        println!("Removed `{name}` from {}.", lock_path(root));
-        println!("Its cached checkout is left in place; nothing loads it now.");
+        writeln!(out, "Removed `{name}` from {}.", lock_path(root))?;
+        writeln!(out, "Its cached checkout is left in place; nothing loads it now.")?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -286,8 +317,8 @@ fn lock_path(root: &Path) -> String {
     Lock::path_in(root).display().to_string()
 }
 
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+fn print_json<T: Serialize>(out: &mut dyn Write, value: &T) -> Result<()> {
+    writeln!(out, "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
@@ -321,4 +352,155 @@ struct UpdateOutput<'a> {
 struct RemoveOutput<'a> {
     removed: &'a str,
     lock: &'a str,
+}
+
+/// Run against a temp directory's lock rather than a real drive's. The git
+/// tests drive a real repository through the fixture helpers `nomnom-pack`'s
+/// own acquire tests use, with no network.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack_fixtures as fixtures;
+    use crate::test_support::{local_pack, pack_err, pack_ok};
+
+    fn list_json(root: &Path, packs: Vec<PathBuf>) -> serde_json::Value {
+        serde_json::from_str(&pack_ok(root, PackCommand::List { packs, json: true }))
+            .expect("valid JSON")
+    }
+
+    /// The regression: `--drive` being ignored in favour of the working
+    /// directory, or the lock landing anywhere but the drive's own
+    /// `.nomnom\packs.lock` that `suggest` on that drive reads.
+    #[cfg(windows)]
+    #[test]
+    fn an_explicit_drive_wins_and_names_its_lock() {
+        let drive = VolumeRoot::new("d:").unwrap();
+        assert_eq!(drive_lock_root(Some(drive.clone())).unwrap(), drive);
+        assert_eq!(lock_path(drive.as_path()), "D:\\.nomnom\\packs.lock");
+    }
+
+    /// `pack list` is how a user answers "what rules is this run loading?". The
+    /// regression: a listing that omits the built-in pack or loses a pack's
+    /// tier or trust state, which are the two facts that explain a verdict
+    /// they did not expect.
+    #[test]
+    fn pack_list_names_every_resolved_pack_with_its_tier_and_trust_in_both_forms() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let explicit = local_pack(root, "vendor", "reclaimable");
+        fixtures::write_pack(
+            &root.join(".nomnom").join("packs").join("house"),
+            "house-style",
+            &fixtures::rule("house-rule", "review"),
+        );
+
+        let text = pack_ok(root, PackCommand::List { packs: vec![explicit.clone()], json: false });
+        for expected in ["NAME", "TIER", "TRUST", "PINNED", "built-in", "house-style", "project"] {
+            assert!(text.contains(expected), "`{expected}` missing from:\n{text}");
+        }
+        assert!(text.contains("untrusted"), "{text}");
+
+        let json = list_json(root, vec![explicit]);
+        let packs = json["packs"].as_array().expect("packs array");
+        let rows: Vec<(&str, &str, &str)> = packs
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().expect("name"),
+                    row["tier"].as_str().expect("tier"),
+                    row["trust"].as_str().expect("trust"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("builtin", "built-in", "built-in"),
+                ("house-style", "project", "untrusted"),
+                ("vendor", "explicit", "untrusted"),
+            ],
+            "resolution order is built-in, user, project, --pack"
+        );
+        // Every row carries the pin slot even when it is empty, so a consumer
+        // never has to tell "no key" from "not pinned".
+        assert!(packs.iter().all(|row| row.get("sha").is_some()), "{packs:?}");
+    }
+
+    /// `docs/lang.md`: a pack is "pinned to a commit, never to a branch". The
+    /// regression: `add` acknowledging the branch name the user typed, which
+    /// leaves them believing the lock tracks that branch.
+    #[test]
+    fn pack_add_prints_the_commit_sha_it_pinned_to_not_the_ref_that_was_asked_for() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let repo = root.join("packs.git");
+        fixtures::init_repo(&repo);
+        fixtures::write_pack(
+            &repo.join("rust"),
+            "rust",
+            &fixtures::rule("cargo-target", "reclaimable"),
+        );
+        let sha = fixtures::commit(&repo, "the pack");
+        let url = format!("{}/rust@main", fixtures::file_url(&repo));
+
+        let text = pack_ok(root, PackCommand::Add { url, json: false });
+
+        assert!(text.contains(&sha), "the resolved SHA is missing:\n{text}");
+        assert!(text.contains("never to a branch"), "{text}");
+        assert!(text.contains("not trusted"), "a freshly added pack is untrusted:\n{text}");
+
+        let json = list_json(root, Vec::new());
+        let rust = json["packs"]
+            .as_array()
+            .expect("packs")
+            .iter()
+            .find(|row| row["name"] == "rust")
+            .expect("the added pack is listed");
+        assert_eq!(rust["sha"].as_str(), Some(sha.as_str()));
+        assert_eq!(rust["tier"].as_str(), Some("user"));
+
+        // `update` is the only operation allowed to move the pin, and `remove`
+        // takes the row back out again.
+        let updated = pack_ok(root, PackCommand::Update { name: "rust".into(), json: false });
+        assert!(updated.contains(&sha), "{updated}");
+        let removed = pack_ok(root, PackCommand::Remove { name: "rust".into(), json: true });
+        assert!(removed.contains("\"removed\": \"rust\""), "{removed}");
+        let after = list_json(root, Vec::new());
+        assert_eq!(after["packs"].as_array().expect("packs").len(), 1, "only the built-in is left");
+    }
+
+    /// The regression: flattening a `nomnom-pack` error to "could not add
+    /// pack". An auth failure and a missing repository both exit 128 from
+    /// `git`, so the command and its stderr are what separate them, and `main`
+    /// prints `{error:#}` — which only helps if the detail survives the chain.
+    #[test]
+    fn a_failed_git_fetch_surfaces_the_command_and_its_stderr() {
+        let project = tempfile::tempdir().unwrap();
+        let missing = fixtures::file_url(&project.path().join("no-such-repository"));
+
+        let error = pack_err(project.path(), PackCommand::Add { url: missing, json: false });
+
+        assert!(error.contains("ls-remote"), "the git command is missing:\n{error}");
+        assert!(error.contains("repository"), "git's own stderr is missing:\n{error}");
+        assert!(error.contains("command:"), "{error}");
+        assert!(error.contains("stderr:"), "{error}");
+    }
+
+    /// Trust is keyed by a pack's own name, so a typo has no pack to attach
+    /// to. The regression: writing a trust row for a name nothing resolves to,
+    /// which reports success and leaves the real pack still capped.
+    #[test]
+    fn trusting_a_name_no_pack_resolves_to_fails_and_lists_what_does() {
+        let project = tempfile::tempdir().unwrap();
+        let pack = local_pack(project.path(), "vendor", "reclaimable");
+
+        let error = pack_err(
+            project.path(),
+            PackCommand::Trust { name: "vender".into(), packs: vec![pack], json: false },
+        );
+
+        assert!(error.contains("no pack named `vender`"), "{error}");
+        assert!(error.contains("vendor"), "the error must name what does resolve:\n{error}");
+        assert!(!Lock::path_in(project.path()).exists(), "a lock was written");
+    }
 }

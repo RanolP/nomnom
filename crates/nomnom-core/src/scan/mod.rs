@@ -1,5 +1,8 @@
 //! Facts about what is on disk. No judgement, no aggregation.
 //!
+//! A scan always covers a whole volume: [`scan`] takes a [`VolumeRoot`], which
+//! only a drive root such as `C:\` parses into.
+//!
 //! Two backends produce the same [`Entry`] stream:
 //!
 //! - [`backend::mft`] reads the NTFS Master File Table off the raw volume — the
@@ -16,10 +19,12 @@
 
 pub mod backend;
 mod drives;
+mod root;
 
 pub use drives::{Volume, volumes};
+pub use root::VolumeRoot;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -177,17 +182,19 @@ pub struct ScanReport {
     pub backend_used: BackendUsed,
 }
 
-/// Scan `root`, honouring `opts`.
+/// Scan the volume at `root`, honouring `opts`.
 ///
 /// Returns `Err` only when the scan could not start at all (root missing, or
 /// [`Backend::Mft`] demanded and unavailable). Per-entry failures land in
 /// [`ScanReport::errors`].
-pub fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
-    backend::dispatch(root, opts)
+pub fn scan(root: &VolumeRoot, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
+    backend::dispatch(root.as_path(), opts)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanFailure {
+    #[error("{0} is not a volume root; nomnom scans whole drives only, e.g. C:\\")]
+    NotAVolumeRoot(PathBuf),
     #[error("scan root {0} does not exist or is not readable")]
     RootUnreadable(PathBuf),
     #[error("MFT backend unavailable: {0}")]
