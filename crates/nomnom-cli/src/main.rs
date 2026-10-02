@@ -111,6 +111,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // The elevated MFT helper is this binary relaunched behind UAC.
+    if let Some(code) = nomnom_core::scan::maybe_run_helper() {
+        return code;
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,

@@ -19,9 +19,11 @@
 
 pub mod backend;
 mod drives;
+pub mod elevated;
 mod root;
 
 pub use drives::{Volume, volumes};
+pub use elevated::{is_elevated, maybe_run_helper};
 pub use root::VolumeRoot;
 
 use std::path::PathBuf;
