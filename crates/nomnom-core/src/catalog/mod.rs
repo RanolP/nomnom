@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
 
 mod file_types;
+mod largest;
 
 pub use file_types::{FileType, file_types};
+pub use largest::largest_files;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub u32);

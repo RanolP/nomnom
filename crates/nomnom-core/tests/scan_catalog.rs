@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nomnom_core::catalog::{Catalog, file_types};
+use nomnom_core::catalog::{Catalog, file_types, largest_files};
 use nomnom_core::scan::{
     Backend, BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport, scan,
 };
@@ -263,6 +263,30 @@ fn file_types_add_up_to_the_root_totals() {
     let summary: Vec<(&str, u64, u64)> =
         types.iter().map(|t| (t.ext.as_str(), t.bytes, t.count)).collect();
     assert_eq!(summary, vec![("jpg", 100, 1), ("rs", 50, 2), ("(none)", 10, 2)]);
+}
+
+/// Catches the bounded heap evicting the wrong end (keeping the smallest
+/// files) or returning them unsorted.
+#[test]
+fn largest_files_keeps_the_biggest_in_descending_order() {
+    let root = PathBuf::from("/r");
+    let catalog = Catalog::build(report(
+        &root,
+        vec![
+            dir_entry("/r"),
+            file_entry("/r/a", 5),
+            file_entry("/r/b", 50),
+            file_entry("/r/c", 1),
+            file_entry("/r/d", 20),
+            dir_entry("/r/e"),
+            file_entry("/r/e/f", 40),
+        ],
+    ));
+
+    let names: Vec<PathBuf> =
+        largest_files(&catalog, 3).into_iter().map(|id| catalog.path(id)).collect();
+    assert_eq!(names, ["/r/b", "/r/e/f", "/r/d"].map(PathBuf::from));
+    assert_eq!(largest_files(&catalog, 99).len(), 5, "n beyond the file count returns all files");
 }
 
 /// Catches the drive picker coming up empty or garbled: the system drive is
