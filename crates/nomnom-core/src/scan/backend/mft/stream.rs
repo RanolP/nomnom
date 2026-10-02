@@ -1,34 +1,39 @@
-//! The MFT read as one sequential stream.
+//! Where the table sits on the volume, read off `$MFT`'s own `$DATA`.
 //!
-//! `Ntfs::file` is the only way into a file record, and every call to it reads
-//! two places: record 0 (`$MFT`, to find where the requested record lives) and
-//! then the record itself. Behind a single-block cache those two evict each
-//! other, so a scan of a 4.6 GB table re-read a 1 MiB block twice per record.
-//!
-//! The three kinds of read are kept apart so none can evict another:
-//! - the table itself is read forward in large [`Chunk`]s, each one handed to
-//!   the parsing workers as soon as it lands, so the next device read runs
-//!   while the previous chunk is parsed;
-//! - record 0 is pinned in [`SharedVolume`], read once;
-//! - everything else (non-resident reparse values, attribute lists, extension
-//!   records outside the chunk) goes through one small-block reader behind a
-//!   lock. Those reads are rare, so the lock is uncontended in practice.
-//!
-//! A [`ChunkReader`] is the `Read + Seek` one worker hands `ntfs` for one
-//! record. Every byte still comes from the volume at the position `ntfs` asked
-//! for, so the parse is the same parse; only where the bytes are cached
-//! changes.
+//! The pass reads the table in large sequential device reads, one contiguous
+//! [`Extent`] at a time, and parses the bytes it gets with the hand-rolled
+//! [`super::record`] parser. Nothing here goes through the `ntfs` crate's
+//! per-file objects: `Ntfs::file` re-reads record 0 and re-walks the whole
+//! `$MFT` run list for every record it opens, and it cannot follow an `$MFT`
+//! whose run list spilled into an attribute list — which a multi-gigabyte,
+//! long-lived table is exactly the kind to need.
 
-use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::{Mutex, MutexGuard};
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 
-use ntfs::Ntfs;
-use ntfs::attribute_value::NtfsAttributeValue;
-
+use super::record::{
+    self, ATTR_ATTRIBUTE_LIST, ATTR_DATA, Attributes, for_each_run, u16_at, u64_at,
+};
 use super::volume::{AlignedReader, BlockSource};
 
-/// Where each part of the table sits on the volume, read off `$MFT`'s own
-/// `$DATA` run list.
+/// Largest `$ATTRIBUTE_LIST` value read for `$MFT`. Real ones are a few KiB;
+/// anything near this is corrupt, and must not become an allocation of
+/// whatever length the record claims.
+const MAX_ATTRIBUTE_LIST: u64 = 16 << 20;
+
+const REFERENCE_MASK: u64 = (1 << 48) - 1;
+
+/// Volume facts the boot sector gives, in bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    pub record_size: u64,
+    pub cluster: u64,
+    pub sector: u64,
+    /// Volume byte offset of record 0.
+    pub mft_pos: u64,
+}
+
+/// Where each part of the table sits on the volume.
 pub struct MftLayout {
     record_size: u64,
     /// Total length of the table in bytes, `$DATA`'s logical length.
@@ -37,6 +42,7 @@ pub struct MftLayout {
     runs: Vec<Run>,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct Run {
     /// Offset of the run's first byte within the table.
     vbyte: u64,
@@ -45,44 +51,67 @@ struct Run {
     len: u64,
 }
 
-/// Where one record's bytes start on the volume, and where the contiguous run
-/// holding them ends.
-#[derive(Debug, Clone, Copy)]
-pub struct RecordSpan {
+/// Records `first..first + count` sit back to back on the volume from `phys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub first: u64,
+    pub count: u64,
     pub phys: u64,
-    pub run_end: u64,
 }
 
 impl MftLayout {
-    /// Reads `$MFT`'s run list. Errors carry the wording the scan reports.
-    pub fn read<T: Read + Seek>(ntfs: &Ntfs, fs: &mut T) -> Result<Self, String> {
-        let mft = ntfs.file(fs, 0).map_err(|err| format!("reading $MFT failed: {err}"))?;
-        let data = mft
-            .data(fs, "")
-            .ok_or_else(|| "$MFT has no $DATA attribute".to_string())?
-            .map_err(|err| format!("reading $MFT $DATA failed: {err}"))?;
-        let attribute =
-            data.to_attribute().map_err(|err| format!("parsing $MFT $DATA failed: {err}"))?;
-        let record_size = u64::from(ntfs.file_record_size());
-        if record_size == 0 {
-            return Err("boot sector reports a zero record size".into());
+    /// Reads `$MFT`'s run list, following its attribute list into extension
+    /// records when it has one. Errors carry the wording the scan reports.
+    pub fn read<S: BlockSource>(fs: &mut AlignedReader<S>, geo: &Geometry) -> Result<Self, String> {
+        let rs = geo.record_size;
+        if rs < 512 || !rs.is_power_of_two() || geo.cluster == 0 {
+            return Err(format!(
+                "boot sector reports a {rs}-byte record and a {}-byte cluster",
+                geo.cluster
+            ));
         }
+        let record0 = read_fixed(fs, geo.mft_pos, rs)
+            .map_err(|why| format!("reading $MFT (record 0) failed: {why}"))?;
 
-        // A run list `ntfs` cannot hand over (an `$MFT` that itself needs an
-        // attribute list) leaves `runs` empty: every record then goes through
-        // the scattered-read path, slower but still correct.
-        let mut runs = Vec::new();
-        if let Ok(NtfsAttributeValue::NonResident(value)) = attribute.value(fs) {
-            let mut vbyte = 0u64;
-            for run in value.data_runs() {
-                let Ok(run) = run else { break };
-                let len = run.allocated_size();
-                runs.push(Run { vbyte, phys: run.data_position().value().map(|p| p.get()), len });
-                vbyte = vbyte.saturating_add(len);
+        let mut pieces: Vec<Piece> = Vec::new();
+        let mut len = None;
+        let list = data_pieces(&record0, &mut pieces, &mut len);
+
+        if let Some(list) = list {
+            let list = attribute_list_value(fs, list, geo)?;
+            let mut pending: Vec<u64> = list_data_records(&list);
+            pending.sort_unstable();
+            pending.dedup();
+            pending.retain(|&n| n != 0);
+            // An extension record of `$MFT` is located through the runs read
+            // so far; one that sits in a part not yet known waits a round.
+            while !pending.is_empty() {
+                let runs = runs_of(&mut pieces.clone(), geo.cluster);
+                let before = pending.len();
+                let mut waiting = Vec::new();
+                for number in pending {
+                    let Some(phys) = number.checked_mul(rs).and_then(|v| phys_at(&runs, v)) else {
+                        waiting.push(number);
+                        continue;
+                    };
+                    let ext = read_fixed(fs, phys, rs).map_err(|why| {
+                        format!("reading $MFT extension record {number} failed: {why}")
+                    })?;
+                    let _ = data_pieces(&ext, &mut pieces, &mut len);
+                }
+                if waiting.len() == before {
+                    return Err(format!(
+                        "$MFT extension record {} lies outside every run of the table found so far",
+                        waiting[0]
+                    ));
+                }
+                pending = waiting;
             }
         }
 
-        Ok(Self { record_size, len: attribute.value_length(), runs })
+        let len = len.ok_or_else(|| "$MFT has no unnamed $DATA attribute".to_string())?;
+        let runs = runs_of(&mut pieces, geo.cluster);
+        Ok(Self { record_size: rs, len, runs })
     }
 
     pub fn record_count(&self) -> u64 {
@@ -94,161 +123,177 @@ impl MftLayout {
         self.len
     }
 
-    pub fn span(&self, number: u64) -> Option<RecordSpan> {
-        let vbyte = number.checked_mul(self.record_size)?;
-        let index = self.runs.partition_point(|run| run.vbyte <= vbyte).checked_sub(1)?;
-        let run = &self.runs[index];
-        let into = vbyte - run.vbyte;
-        if into >= run.len {
-            return None;
+    /// The contiguous record ranges from `from` on, plus the record ranges no
+    /// extent holds (a sparse run, a record straddling two runs, a run list
+    /// shorter than the table), which the pass reports as errors.
+    pub fn extents(&self, from: u64) -> (Vec<Extent>, Vec<Range<u64>>) {
+        let rs = self.record_size;
+        let total = self.record_count();
+        let mut extents = Vec::new();
+        for run in &self.runs {
+            let Some(phys) = run.phys else { continue };
+            let first = run.vbyte.div_ceil(rs).max(from);
+            let end = (run.vbyte.saturating_add(run.len) / rs).min(total);
+            if first < end {
+                extents.push(Extent {
+                    first,
+                    count: end - first,
+                    phys: phys + (first * rs - run.vbyte),
+                });
+            }
         }
-        let phys = run.phys?;
-        Some(RecordSpan { phys: phys + into, run_end: phys + run.len })
+        extents.sort_by_key(|e| e.first);
+
+        let mut gaps = Vec::new();
+        let mut cursor = from;
+        for e in &extents {
+            if e.first > cursor {
+                gaps.push(cursor..e.first);
+            }
+            cursor = cursor.max(e.first + e.count);
+        }
+        if cursor < total {
+            gaps.push(cursor..total);
+        }
+        (extents, gaps)
     }
 }
 
-/// What every parsing worker shares: the scattered reader, behind a lock, and
-/// the pinned `$MFT` record.
-pub struct SharedVolume<S> {
-    scattered: Mutex<AlignedReader<S>>,
-    sector: u64,
-    chunk_cap: usize,
-    pinned: Vec<u8>,
-    pinned_start: u64,
+/// One `$DATA` attribute of `$MFT`: where in the table it starts, and its runs.
+#[derive(Clone)]
+struct Piece {
+    lowest_vcn: u64,
+    runs: Vec<(u64, Option<i64>)>,
 }
 
-impl<S: BlockSource> SharedVolume<S> {
-    /// `chunk` is the stream's read size; the scattered reader keeps whatever
-    /// block size it was built with.
-    pub fn new(scattered: AlignedReader<S>, sector: u64, chunk: usize) -> Self {
-        let sector = sector.max(1);
-        let chunk_cap = chunk.max(sector as usize).next_multiple_of(sector as usize);
-        Self {
-            scattered: Mutex::new(scattered),
-            sector,
-            chunk_cap,
-            pinned: Vec::new(),
-            pinned_start: 0,
+/// Adds every unnamed `$DATA` piece of a `$MFT` record to `pieces`, takes the
+/// table length from the first piece, and returns the attribute-list
+/// attribute's bytes when the record has one.
+fn data_pieces(record: &[u8], pieces: &mut Vec<Piece>, len: &mut Option<u64>) -> Option<ListValue> {
+    let mut list = None;
+    for attr in Attributes::new(record) {
+        match attr.ty {
+            ATTR_DATA if attr.name_len == 0 => {
+                let Some(nr) = attr.non_resident() else { continue };
+                if nr.lowest_vcn == 0 {
+                    *len = Some(nr.data_size);
+                }
+                let mut runs = Vec::new();
+                for_each_run(nr.runs, |n, lcn| runs.push((n, lcn)));
+                pieces.push(Piece { lowest_vcn: nr.lowest_vcn, runs });
+            }
+            ATTR_ATTRIBUTE_LIST => {
+                list = Some(match (attr.resident_value(), attr.non_resident()) {
+                    (Some(v), _) => ListValue::Resident(v.to_vec()),
+                    (None, Some(nr)) => {
+                        let mut runs = Vec::new();
+                        for_each_run(nr.runs, |n, lcn| runs.push((n, lcn)));
+                        ListValue::NonResident { runs, len: nr.data_size }
+                    }
+                    (None, None) => continue,
+                });
+            }
+            _ => {}
         }
     }
+    list
+}
 
-    /// Keeps `len` bytes at `at` for the life of the volume. A failed read
-    /// pins nothing, so the bytes are fetched — and fail — the ordinary way.
-    pub fn pin(&mut self, at: u64, len: usize) {
-        let mut bytes = vec![0; len];
-        let scattered = self.scattered.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ok =
-            scattered.seek(SeekFrom::Start(at)).is_ok() && scattered.read_exact(&mut bytes).is_ok();
-        if ok {
-            self.pinned = bytes;
-            self.pinned_start = at;
+enum ListValue {
+    Resident(Vec<u8>),
+    NonResident { runs: Vec<(u64, Option<i64>)>, len: u64 },
+}
+
+/// The attribute list's value bytes, reading them off the volume when the
+/// list is non-resident.
+fn attribute_list_value<S: BlockSource>(
+    fs: &mut AlignedReader<S>,
+    list: ListValue,
+    geo: &Geometry,
+) -> Result<Vec<u8>, String> {
+    let (runs, len) = match list {
+        ListValue::Resident(bytes) => return Ok(bytes),
+        ListValue::NonResident { runs, len } => (runs, len),
+    };
+    if len > MAX_ATTRIBUTE_LIST {
+        return Err(format!("$MFT attribute list claims {len} bytes"));
+    }
+    let mut out = Vec::with_capacity(len as usize);
+    for (clusters, lcn) in runs {
+        let bytes = clusters.saturating_mul(geo.cluster).min(len - out.len() as u64) as usize;
+        match lcn.filter(|&l| l >= 0) {
+            None => out.resize(out.len() + bytes, 0),
+            Some(lcn) => {
+                let mut buf = vec![0; bytes];
+                fs.seek(SeekFrom::Start((lcn as u64).saturating_mul(geo.cluster)))
+                    .and_then(|_| fs.read_exact(&mut buf))
+                    .map_err(|err| format!("reading the $MFT attribute list failed: {err}"))?;
+                out.extend(buf);
+            }
+        }
+        if out.len() as u64 >= len {
+            break;
         }
     }
-
-    /// The chunk holding the `len` bytes at `span.phys` and the rest of the
-    /// run after them, up to a full chunk. A failed read yields an empty
-    /// chunk, so the bytes are fetched — and fail — through the scattered
-    /// reader exactly as an unbuffered read would.
-    pub fn load_chunk(&self, span: RecordSpan) -> Chunk {
-        let start = span.phys - span.phys % self.sector;
-        let want = span
-            .run_end
-            .next_multiple_of(self.sector)
-            .saturating_sub(start)
-            .min(self.chunk_cap as u64) as usize;
-        let mut bytes = vec![0; want];
-        let read = self.scattered().source_mut().read_at(start, &mut bytes).unwrap_or_default();
-        bytes.truncate(read);
-        Chunk { start, bytes }
-    }
-
-    pub fn source_mut(&mut self) -> &mut S {
-        self.scattered.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).source_mut()
-    }
-
-    fn scattered(&self) -> MutexGuard<'_, AlignedReader<S>> {
-        self.scattered.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    Ok(out)
 }
 
-/// A run of table bytes read in one device read.
-#[derive(Default)]
-pub struct Chunk {
-    start: u64,
-    bytes: Vec<u8>,
-}
-
-impl Chunk {
-    /// Whether the `len` bytes at `phys` are all in this chunk.
-    pub fn holds(&self, phys: u64, len: u64) -> bool {
-        phys >= self.start && phys + len <= self.start + self.bytes.len() as u64
-    }
-}
-
-/// `Read + Seek` for one worker: the chunk its records came in, then the
-/// pinned record, then the shared scattered reader.
-pub struct ChunkReader<'a, S> {
-    volume: &'a SharedVolume<S>,
-    chunk: &'a Chunk,
-    pos: u64,
-}
-
-impl<'a, S> ChunkReader<'a, S> {
-    pub fn new(volume: &'a SharedVolume<S>, chunk: &'a Chunk) -> Self {
-        Self { volume, chunk, pos: 0 }
-    }
-}
-
-/// Copies from `buf` (which holds the device bytes starting at `start`) when
-/// `pos` falls inside it.
-fn serve(buf: &[u8], start: u64, pos: u64, out: &mut [u8]) -> Option<usize> {
-    let offset = usize::try_from(pos.checked_sub(start)?).ok()?;
-    let available = buf.get(offset..).filter(|rest| !rest.is_empty())?;
-    let n = available.len().min(out.len());
-    out[..n].copy_from_slice(&available[..n]);
-    Some(n)
-}
-
-impl<S: BlockSource> Read for ChunkReader<'_, S> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
+/// Record numbers the attribute list files an unnamed `$DATA` piece under.
+fn list_data_records(list: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let (Some(ty), Some(entry_len)) = (record::u32_at(list, at), u16_at(list, at + 4)) {
+        if entry_len < 26 {
+            break;
         }
-        let volume = self.volume;
-        let n = match serve(&self.chunk.bytes, self.chunk.start, self.pos, out)
-            .or_else(|| serve(&volume.pinned, volume.pinned_start, self.pos, out))
+        if ty == ATTR_DATA
+            && list.get(at + 6) == Some(&0)
+            && let Some(reference) = u64_at(list, at + 16)
         {
-            Some(n) => n,
-            None => {
-                let mut scattered = volume.scattered();
-                scattered.seek(SeekFrom::Start(self.pos))?;
-                scattered.read(out)?
-            }
-        };
-        self.pos += n as u64;
-        Ok(n)
+            out.push(reference & REFERENCE_MASK);
+        }
+        at += entry_len as usize;
     }
+    out
 }
 
-impl<S: BlockSource> Seek for ChunkReader<'_, S> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = match pos {
-            SeekFrom::Start(n) => n,
-            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range")
-            })?,
-            // Same contract as `AlignedReader`: `ntfs` never seeks from the end.
-            SeekFrom::End(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "seeking from the end of a raw volume is not supported",
-                ));
-            }
-        };
-        Ok(self.pos)
+fn runs_of(pieces: &mut [Piece], cluster: u64) -> Vec<Run> {
+    pieces.sort_by_key(|p| p.lowest_vcn);
+    let mut runs = Vec::new();
+    for piece in pieces.iter() {
+        let mut vcn = piece.lowest_vcn;
+        for &(clusters, lcn) in &piece.runs {
+            let (Some(vbyte), Some(len)) =
+                (vcn.checked_mul(cluster), clusters.checked_mul(cluster))
+            else {
+                break;
+            };
+            let phys = lcn.filter(|&l| l >= 0).and_then(|l| (l as u64).checked_mul(cluster));
+            runs.push(Run { vbyte, phys, len });
+            vcn = vcn.saturating_add(clusters);
+        }
     }
+    runs
+}
 
-    fn stream_position(&mut self) -> io::Result<u64> {
-        Ok(self.pos)
+fn phys_at(runs: &[Run], vbyte: u64) -> Option<u64> {
+    let run = runs.iter().find(|r| vbyte >= r.vbyte && vbyte - r.vbyte < r.len)?;
+    Some(run.phys? + (vbyte - run.vbyte))
+}
+
+/// One record read through the scattered reader, fixed up.
+fn read_fixed<S: BlockSource>(
+    fs: &mut AlignedReader<S>,
+    pos: u64,
+    rs: u64,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![0; rs as usize];
+    fs.seek(SeekFrom::Start(pos))
+        .and_then(|_| fs.read_exact(&mut bytes))
+        .map_err(|err| err.to_string())?;
+    if bytes.get(..4) != Some(b"FILE") {
+        return Err("bad FILE signature".into());
     }
+    record::fixup(&mut bytes)?;
+    Ok(bytes)
 }

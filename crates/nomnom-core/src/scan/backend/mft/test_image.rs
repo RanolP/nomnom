@@ -66,25 +66,49 @@ impl BlockSource for MemSource {
 /// `records` slots in three fragments laid out out of order on the volume, so
 /// table order and disk order disagree.
 pub fn build(records: u64) -> Image {
+    build_fragmented(records, 3)
+}
+
+/// `build` with the table split into `count` fragments. Three fragments are
+/// laid out A, C, B on disk; more are laid out in reverse table order. Many
+/// fragments is what a long-lived system volume's `$MFT` looks like, and what
+/// makes any per-record walk of its run list expensive.
+pub fn build_fragmented(records: u64, count: u64) -> Image {
     assert!(records >= 64, "room for the metafiles and every special case");
+    assert!((3..=120).contains(&count), "the run list has to fit in record 0");
     let per_cluster = CLUSTER / RECORD as u64;
     let clusters = records.div_ceil(per_cluster);
+    assert!(clusters > 4 * count, "every fragment needs a few clusters");
     // Fragment lengths in clusters: deliberately not multiples of anything.
-    let a = clusters / 3 + 1;
-    let b = clusters / 4 + 3;
-    let c = clusters - a - b;
-    // Disk order: boot, A, C, B, then a data area for non-resident values.
-    let lcn_a = 8;
-    let lcn_c = lcn_a + a + 5;
-    let lcn_b = lcn_c + c + 7;
-    let data_lcn = lcn_b + b + 3;
+    let lens: Vec<u64> = if count == 3 {
+        let (a, b) = (clusters / 3 + 1, clusters / 4 + 3);
+        vec![a, b, clusters - a - b]
+    } else {
+        let even = clusters / count;
+        let mut lens: Vec<u64> = (0..count).map(|i| even - 1 + i % 3).collect();
+        let used: u64 = lens.iter().sum();
+        *lens.last_mut().unwrap() += clusters - used;
+        lens
+    };
+    // Disk order: boot, then the fragments in `order`, each followed by a gap,
+    // then a data area for non-resident values.
+    let order: Vec<usize> =
+        if count == 3 { vec![0, 2, 1] } else { (0..count as usize).rev().collect() };
+    let mut lcns = vec![0u64; lens.len()];
+    let mut next = 8u64;
+    for (k, &i) in order.iter().enumerate() {
+        lcns[i] = next;
+        next += lens[i] + [5, 7, 3][k % 3];
+    }
+    let data_lcn = next;
     let reparse_values = records / 23 / 5 + 1;
     let total_clusters = data_lcn + 8 + reparse_values;
+    let lcn_a = lcns[0];
 
-    let fragments = [(lcn_a, a), (lcn_b, b), (lcn_c, c)];
+    let fragments: Vec<(u64, u64)> = lcns.iter().copied().zip(lens.iter().copied()).collect();
     let record_pos = |n: u64| -> usize {
         let mut cluster = n / per_cluster;
-        for (lcn, len) in fragments {
+        for &(lcn, len) in &fragments {
             if cluster < len {
                 return ((lcn + cluster) * CLUSTER + (n % per_cluster) * RECORD as u64) as usize;
             }
@@ -96,7 +120,9 @@ pub fn build(records: u64) -> Image {
     let mut put = |n: u64, record: [u8; RECORD]| writes.push((record_pos(n), record.to_vec()));
 
     // Record 0, `$MFT`: its `$DATA` run list is the fragment list.
-    let mft_runs = encode_runs(&fragments.map(|(lcn, len)| (len, Some(lcn))));
+    let runs: Vec<(u64, Option<u64>)> =
+        fragments.iter().map(|&(lcn, len)| (len, Some(lcn))).collect();
+    let mft_runs = encode_runs(&runs);
     let mft_len = records * RECORD as u64;
     put(0, record(IN_USE, 0, &[non_resident(DATA, 1, &mft_runs, clusters * CLUSTER, mft_len)]));
     for n in 1..16 {
@@ -247,7 +273,10 @@ fn record(flags: u16, base: u64, attributes: &[Vec<u8>]) -> [u8; RECORD] {
     r[20..22].copy_from_slice(&(FIRST_ATTRIBUTE as u16).to_le_bytes());
     r[22..24].copy_from_slice(&flags.to_le_bytes());
     r[28..32].copy_from_slice(&(RECORD as u32).to_le_bytes());
-    r[32..40].copy_from_slice(&base.to_le_bytes());
+    // An extension record names its base with the base's sequence number,
+    // which every record here has as 1.
+    let base_ref = if base == 0 { 0 } else { base | (1 << 48) };
+    r[32..40].copy_from_slice(&base_ref.to_le_bytes());
 
     let mut at = FIRST_ATTRIBUTE;
     for attribute in attributes {

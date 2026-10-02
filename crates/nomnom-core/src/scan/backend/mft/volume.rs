@@ -210,6 +210,21 @@ mod win {
 
     impl VolumeSource {
         pub fn open(device: &OsStr) -> io::Result<Self> {
+            Self::open_with(device, 0)
+        }
+
+        /// A second handle for the sequential pass over the table, bypassing
+        /// the cache manager: the table is read once, so caching it only
+        /// costs a copy and gigabytes of standby memory, and an uncached read
+        /// goes to the device as one large transfer. Every read through it
+        /// must land in a sector-aligned buffer, which `read_records` honours.
+        pub fn open_unbuffered(device: &OsStr) -> io::Result<Self> {
+            const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+            Self::open_with(device, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN)
+        }
+
+        fn open_with(device: &OsStr, flags: u32) -> io::Result<Self> {
             use std::os::windows::fs::OpenOptionsExt;
 
             const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -218,6 +233,7 @@ mod win {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(flags)
                 .open(device)?;
             Ok(Self(FileSource::new(file)))
         }
