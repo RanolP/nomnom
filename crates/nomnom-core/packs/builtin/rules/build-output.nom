@@ -1,0 +1,268 @@
+# Directories a toolchain rebuilds from source.
+#
+# The dangerous half of this file is the generic names. `target`, `build`, `bin`
+# and `obj` are also ordinary words: someone's shooting-range dataset lives in
+# `target/`, and deleting it because of a name would be the worst thing this
+# tool could do. Those names therefore need a sibling file proving a toolchain
+# owns the directory, and without it the verdict drops to `review`.
+#
+# Every rule here sets `unit = true`: the directory is one decision, not one per
+# file inside it.
+
+# -- unambiguous names -----------------------------------------------------
+#
+# These mean the same thing everywhere they appear, so a name is enough.
+
+rule "node-modules" {
+  when  dir.name == "node_modules"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: npm dependency tree, rebuilt by `npm install`"
+}
+
+rule "dot-venv" {
+  when  dir.name == ".venv"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall"
+}
+
+rule "venv" {
+  when  dir.name == "venv"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall"
+}
+
+rule "pycache" {
+  when  dir.name == "__pycache__"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: Python bytecode cache, rewritten on the next import"
+}
+
+rule "next-build" {
+  when  dir.name == ".next"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: Next.js build output, rebuilt by `next build`"
+}
+
+rule "gradle-cache" {
+  when  dir.name == ".gradle"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: Gradle project cache, rebuilt on the next Gradle run"
+}
+
+rule "tox" {
+  when  dir.name == ".tox"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: tox environments, rebuilt by `tox`"
+}
+
+rule "mypy-cache" {
+  when  dir.name == ".mypy_cache"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: mypy incremental cache, rebuilt on the next type-check"
+}
+
+rule "pytest-cache" {
+  when  dir.name == ".pytest_cache"
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.95
+        reason      = "regenerable: pytest run cache, rewritten on the next test run"
+}
+
+# -- generic names, corroborated -------------------------------------------
+#
+# One rule per (name, corroborating sibling) pair, because the reason names the
+# file it found and the language has no way to interpolate a match.
+
+rule "cargo-target" {
+  when  dir.name == "target" and sibling("Cargo.toml")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: Cargo build output, rebuilt by `cargo build` — `Cargo.toml` sits beside it"
+}
+
+rule "build-with-package-json" {
+  when  dir.name == "build" and sibling("package.json")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `package.json` sits beside it"
+}
+
+rule "build-with-pyproject" {
+  when  dir.name == "build" and sibling("pyproject.toml")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `pyproject.toml` sits beside it"
+}
+
+rule "build-with-cmakelists" {
+  when  dir.name == "build" and sibling("CMakeLists.txt")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `CMakeLists.txt` sits beside it"
+}
+
+rule "dist-with-package-json" {
+  when  dir.name == "dist" and sibling("package.json")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `package.json` sits beside it"
+}
+
+rule "dist-with-pyproject" {
+  when  dir.name == "dist" and sibling("pyproject.toml")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `pyproject.toml` sits beside it"
+}
+
+rule "dist-with-cmakelists" {
+  when  dir.name == "dist" and sibling("CMakeLists.txt")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: build output, rebuilt by the project's build command — `CMakeLists.txt` sits beside it"
+}
+
+# DEVIATION from the hand-written Rust these rules replace: the .NET cases
+# corroborate with a glob, and a reason can interpolate a field but not the
+# name of whatever `sibling_matches` happened to match. The reason therefore
+# names the pattern (`*.csproj`) where the Rust named the matched file
+# (`App.csproj`). Naming the pattern is still evidence a human can check, and
+# bending the language into a match-capture to avoid it would buy one word at
+# the cost of the property that makes packs safe to load.
+
+rule "dotnet-bin-with-csproj" {
+  when  dir.name == "bin" and sibling_matches("*.csproj")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: .NET build output, rebuilt by `dotnet build` — `*.csproj` sits beside it"
+}
+
+rule "dotnet-bin-with-sln" {
+  when  dir.name == "bin" and sibling_matches("*.sln")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: .NET build output, rebuilt by `dotnet build` — `*.sln` sits beside it"
+}
+
+rule "dotnet-obj-with-csproj" {
+  when  dir.name == "obj" and sibling_matches("*.csproj")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: .NET build output, rebuilt by `dotnet build` — `*.csproj` sits beside it"
+}
+
+rule "dotnet-obj-with-sln" {
+  when  dir.name == "obj" and sibling_matches("*.sln")
+  then  label       = build-output
+        disposition = reclaimable
+        unit        = true
+        confidence  = 0.9
+        reason      = "regenerable: .NET build output, rebuilt by `dotnet build` — `*.sln` sits beside it"
+}
+
+# -- generic names, uncorroborated -----------------------------------------
+#
+# The name matched and nothing backs it up. Still labelled, because the human
+# wants to see it, but `review` and low confidence: this is as likely to be
+# their data as it is to be build output.
+
+rule "target-uncorroborated" {
+  when  dir.name == "target" and not sibling("Cargo.toml")
+  then  label       = build-output
+        disposition = review
+        unit        = true
+        confidence  = 0.35
+        reason      = "named `target`, but no Cargo.toml beside it — `target` is also an ordinary directory name, so this may be your data rather than build output"
+}
+
+rule "build-uncorroborated" {
+  when  dir.name == "build"
+        and not sibling("package.json")
+        and not sibling("pyproject.toml")
+        and not sibling("CMakeLists.txt")
+  then  label       = build-output
+        disposition = review
+        unit        = true
+        confidence  = 0.35
+        reason      = "named `build`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `build` is also an ordinary directory name, so this may be your data rather than build output"
+}
+
+rule "dist-uncorroborated" {
+  when  dir.name == "dist"
+        and not sibling("package.json")
+        and not sibling("pyproject.toml")
+        and not sibling("CMakeLists.txt")
+  then  label       = build-output
+        disposition = review
+        unit        = true
+        confidence  = 0.35
+        reason      = "named `dist`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `dist` is also an ordinary directory name, so this may be your data rather than build output"
+}
+
+rule "bin-uncorroborated" {
+  when  dir.name == "bin"
+        and not sibling_matches("*.csproj")
+        and not sibling_matches("*.sln")
+  then  label       = build-output
+        disposition = review
+        unit        = true
+        confidence  = 0.35
+        reason      = "named `bin`, but no *.csproj or *.sln beside it — `bin` is also an ordinary directory name, so this may be your data rather than build output"
+}
+
+rule "obj-uncorroborated" {
+  when  dir.name == "obj"
+        and not sibling_matches("*.csproj")
+        and not sibling_matches("*.sln")
+  then  label       = build-output
+        disposition = review
+        unit        = true
+        confidence  = 0.35
+        reason      = "named `obj`, but no *.csproj or *.sln beside it — `obj` is also an ordinary directory name, so this may be your data rather than build output"
+}

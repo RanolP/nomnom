@@ -1,0 +1,27 @@
+[package]
+name = "nomnom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "File-tree analysis and cleanup core: scan, catalog, verdict, action."
+
+[dependencies]
+nomnom-lang.workspace = true
+nomnom-pack.workspace = true
+ignore.workspace = true
+globset.workspace = true
+toml.workspace = true
+rayon.workspace = true
+blake3.workspace = true
+trash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ntfs.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

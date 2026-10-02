@@ -1,0 +1,6 @@
+name = "builtin"
+version = "1.0.0"
+
+# Every label this pack uses is one of `nomnom_lang::pack::BUILTIN_LABELS`, so
+# `labels` stays empty. A pack that wants a label of its own declares it here.
+labels = []
