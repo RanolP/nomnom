@@ -7,14 +7,20 @@ Find what is eating your disk, say what each path is and why, and reclaim it wit
 `nomnom` scans whole drives only: every command that scans takes a drive root such as `C:\`, `C:` or `D:/`, and refuses a folder with a nonzero exit.
 
 ```sh
+cargo run -p nomnom-cli -- drives               # fixed drives: label, filesystem, used, free, total
 cargo run -p nomnom-cli -- scan C:\             # the tree, biggest first
+cargo run -p nomnom-cli -- types D:             # bytes, share and file count per extension
+cargo run -p nomnom-cli -- largest D: -n 1000   # the largest files: size, modified, path
 cargo run -p nomnom-cli -- suggest D:           # what each path is, and why
 cargo run -p nomnom-cli -- clean D:             # the dry-run plan; add --apply to act
+cargo run -p nomnom-cli -- undo                 # the journals there are to undo
 cargo run -p nomnom-cli -- undo <journal>       # reverse an apply with the journal it printed
 cargo run -p nomnom-cli -- pack list --drive D: # the rule packs a drive's runs load
 ```
 
-`--json` gives machine-readable output on every command. `--backend mft|walk` overrides the scanner; the default tries the fast MFT read and falls back to a walk. The pack lock a drive's runs obey lives at `<drive>\.nomnom\packs.lock`, the same file the GUI's Packs screen edits; `pack` commands use the working directory's drive unless `--drive` names another.
+The CLI and the GUI offer the same features, one subcommand per GUI screen.
+
+`--json` gives machine-readable output on every command. A scan reads the NTFS Master File Table, which is much faster than walking the drive: when the shell is not already Administrator, nomnom asks through a UAC prompt, and if you decline it walks the drive instead and says so. In a terminal, a progress line shows the percent done, the entry count and the elapsed time. `--backend walk` never prompts; `--backend mft` fails rather than falling back. The pack lock a drive's runs obey lives at `<drive>\.nomnom\packs.lock`, the same file the GUI's Packs screen edits; `pack` commands use the working directory's drive unless `--drive` names another.
 
 ## GUI
 
