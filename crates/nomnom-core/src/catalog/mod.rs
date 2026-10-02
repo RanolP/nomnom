@@ -57,7 +57,6 @@ pub struct Node {
 pub struct Catalog {
     nodes: Vec<Node>,
     root: NodeId,
-    index: HashMap<PathBuf, NodeId>,
     errors: Vec<ScanError>,
     backend_used: BackendUsed,
 }
@@ -66,18 +65,23 @@ impl Catalog {
     /// Build the tree from a scan.
     ///
     /// Entry order is not assumed: the MFT backend emits entries in MFT-record
-    /// order, so a child routinely arrives before its parent. Every entry is
-    /// interned into a path index first, parents are resolved afterwards, and
-    /// the aggregates roll up in one iterative bottom-up pass.
+    /// order, so a child routinely arrives before its parent. Entries are
+    /// sorted so every subtree is one contiguous run right after its root,
+    /// which lets parents be resolved with a stack of open ancestors instead of
+    /// a path index -- an index would pin every full path in memory for the
+    /// catalog's lifetime, the bulk of a volume scan's footprint.
     pub fn build(report: ScanReport) -> Self {
-        let ScanReport { root: root_path, entries, errors, backend_used } = report;
+        let ScanReport { root: root_path, mut entries, errors, backend_used } = report;
+
+        entries.par_sort_unstable_by(|a, b| subtree_order(&a.path, &b.path));
 
         let mut nodes: Vec<Node> = Vec::with_capacity(entries.len() + 1);
-        let mut index: HashMap<PathBuf, NodeId> = HashMap::with_capacity(entries.len() + 1);
-
         let root = NodeId(0);
         nodes.push(blank_node(root, root_path.clone().into_os_string(), EntryKind::Dir));
-        index.insert(root_path.clone(), root);
+
+        // The previous entry and its scanned ancestors, root at the bottom. The
+        // root is never popped, so an entry outside it still lands somewhere.
+        let mut open: Vec<(PathBuf, NodeId)> = vec![(root_path.clone(), root)];
 
         for entry in entries {
             if entry.path == root_path {
@@ -88,61 +92,39 @@ impl Catalog {
                 node.accessed = entry.accessed;
                 continue;
             }
+            // A path repeated by the backend must not become a second node: its
+            // bytes would be counted twice. Sorting made repeats adjacent, so
+            // the repeat is always the top of the stack.
+            if open.len() > 1 && open[open.len() - 1].0 == entry.path {
+                continue;
+            }
+            // Attach to the nearest ANCESTOR that was actually scanned, so an
+            // entry whose parent fell outside the set still lands somewhere sane
+            // instead of being dropped.
+            while open.len() > 1 && !entry.path.starts_with(&open[open.len() - 1].0) {
+                open.pop();
+            }
+            let parent = open[open.len() - 1].1;
+
             let name = entry
                 .path
                 .file_name()
                 .map(OsString::from)
                 .unwrap_or_else(|| entry.path.clone().into_os_string());
-            // A path repeated by the backend must not become a second node:
-            // that node would be unreachable from the root and its bytes would
-            // be counted twice.
-            if index.contains_key(&entry.path) {
-                continue;
-            }
             let id = NodeId(nodes.len() as u32);
             let mut node = blank_node(id, name, entry.kind);
+            node.parent = Some(parent);
             node.size = entry.size;
             node.modified = entry.modified;
             node.accessed = entry.accessed;
-            index.insert(entry.path, id);
             nodes.push(node);
+            // Ids are handed out in sorted order, so every parent's children
+            // arrive already sorted and sibling order is reproducible.
+            nodes[parent.index()].children.push(id);
+            open.push((entry.path, id));
         }
 
-        // Link: attach to the nearest ANCESTOR that was actually scanned, so an
-        // entry whose parent fell outside the set still lands somewhere sane
-        // instead of being dropped.
-        let parents: Vec<Option<NodeId>> = {
-            let mut by_id: Vec<Option<NodeId>> = vec![None; nodes.len()];
-            for (path, &id) in &index {
-                if id == root {
-                    continue;
-                }
-                let mut cursor = path.parent();
-                let mut parent = root;
-                while let Some(p) = cursor {
-                    if let Some(&found) = index.get(p) {
-                        parent = found;
-                        break;
-                    }
-                    cursor = p.parent();
-                }
-                by_id[id.index()] = Some(parent);
-            }
-            by_id
-        };
-        for (i, parent) in parents.iter().enumerate() {
-            if let Some(parent) = *parent {
-                nodes[i].parent = Some(parent);
-                nodes[parent.index()].children.push(NodeId(i as u32));
-            }
-        }
-        // HashMap iteration order is arbitrary, so sibling order would otherwise
-        // vary run to run and make the tree unreproducible.
-        for node in &mut nodes {
-            node.children.sort_unstable();
-        }
-
-        let mut catalog = Self { nodes, root, index, errors, backend_used };
+        let mut catalog = Self { nodes, root, errors, backend_used };
         catalog.recompute();
         catalog
     }
@@ -218,8 +200,17 @@ impl Catalog {
         path
     }
 
+    /// Walks `path` down from the root one component at a time, scanning the
+    /// siblings at each level: fine for a lookup, wrong for resolving every node.
     pub fn find(&self, path: &Path) -> Option<NodeId> {
-        self.index.get(path).copied()
+        let root_path = Path::new(&self.nodes[self.root.index()].name);
+        let rest = path.strip_prefix(root_path).ok()?;
+        let mut cursor = self.root;
+        for component in rest.components() {
+            let name = component.as_os_str();
+            cursor = *self.children(cursor).iter().find(|&&child| self.node(child).name == name)?;
+        }
+        Some(cursor)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
@@ -313,6 +304,19 @@ impl Catalog {
         groups.sort_unstable();
         groups
     }
+}
+
+/// Byte order with every path separator ranked below every other byte, so a
+/// directory is followed immediately by its whole subtree: `a/b`, `a/b/c`,
+/// `a/b-x`. Plain byte order puts `a/b-x` between `a/b` and `a/b/c`, and the
+/// stack in [`Catalog::build`] would pop `a/b` before reaching its child.
+fn subtree_order(a: &Path, b: &Path) -> std::cmp::Ordering {
+    // Separators are ASCII and every byte of a multi-byte character is >= 0x80,
+    // so testing single bytes cannot mistake part of a character for one.
+    let key = |byte: &u8| if std::path::is_separator(char::from(*byte)) { 0 } else { *byte };
+    let a = a.as_os_str().as_encoded_bytes().iter().map(key);
+    let b = b.as_os_str().as_encoded_bytes().iter().map(key);
+    a.cmp(b)
 }
 
 fn blank_node(id: NodeId, name: OsString, kind: EntryKind) -> Node {

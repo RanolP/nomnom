@@ -167,15 +167,17 @@ fn duplicates_keep_exactly_the_oldest_copy() {
 /// MFT and walk backends and not repeated run to run — so which copy survives
 /// flips between two runs of the same command over the same tree. The path is
 /// a property of the tree, so it decides the same way every time.
+///
+/// `Catalog::build` now hands out ids in path order, so the fixture can no
+/// longer make the two orders disagree; it still pins which copy survives in
+/// case id assignment ever goes back to following scan order.
 #[test]
 fn a_duplicate_group_with_identical_mtimes_keeps_the_lowest_path_not_the_lowest_node_id() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
     let blob = vec![b'q'; 1024 * 1024 + 5];
     let stamp = SystemTime::now() - Duration::from_secs(86_400);
-    // `a/copy.bin` sorts before `b.bin` by path; the scan reaches `b.bin`
-    // first, so the two orders disagree and the assertion below can tell them
-    // apart.
+    // `a/copy.bin` sorts before `b.bin` by path; a walk reaches `b.bin` first.
     for name in ["a/copy.bin", "b.bin"] {
         let path = root.join(name);
         write(&path, &blob);
@@ -203,11 +205,6 @@ fn a_duplicate_group_with_identical_mtimes_keeps_the_lowest_path_not_the_lowest_
         catalog.path(*kept_id).ends_with(Path::new("a").join("copy.bin")),
         "kept {}, but the lowest path in the group is a/copy.bin",
         catalog.path(*kept_id).display()
-    );
-    let lowest_id = dups.iter().map(|(id, _)| *id).min().expect("a group");
-    assert_ne!(
-        *kept_id, lowest_id,
-        "this fixture only pins the tie-break if the id order and the path order disagree"
     );
 }
 
