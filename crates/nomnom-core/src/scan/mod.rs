@@ -3,12 +3,13 @@
 //! A scan always covers a whole volume: [`scan_drive`] takes a [`VolumeRoot`],
 //! which only a drive root such as `C:\` parses into.
 //!
-//! Two backends produce the same [`Entry`] stream:
+//! Two backends produce the same [`ScanTable`]:
 //!
 //! - [`backend::mft`] reads the NTFS Master File Table off the raw volume — the
 //!   mechanism WizTree uses. It enumerates the whole volume in one sequential
-//!   read and reconstructs paths from parent file references, so it does not
-//!   pay one `stat` per file. It needs Administrator (a raw `\\.\C:` handle is
+//!   read and files each name under its parent's file reference, so it pays
+//!   neither one `stat` per file nor one path per entry. It needs
+//!   Administrator (a raw `\\.\C:` handle is
 //!   privileged) and an NTFS volume.
 //! - [`backend::walk`] walks the tree with the `ignore` crate. Portable, needs
 //!   no privileges, and is the fallback whenever the MFT path is unavailable.
@@ -22,10 +23,12 @@ pub mod backend;
 mod drives;
 pub mod elevated;
 mod root;
+pub mod table;
 
 pub use drives::{Volume, volumes};
 pub use elevated::{is_elevated, maybe_run_helper};
 pub use root::VolumeRoot;
+pub use table::{Blob, ScanTable};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,9 +173,24 @@ impl ScanProgress {
 #[derive(Debug, Clone)]
 pub struct ScanReport {
     pub root: PathBuf,
-    pub entries: Vec<Entry>,
+    /// Every name found, filed under its parent by index; row 0 is `root`.
+    pub table: ScanTable,
     pub errors: Vec<ScanError>,
     pub backend_used: BackendUsed,
+}
+
+impl ScanReport {
+    /// A report from whole paths, the walk's shape: see
+    /// [`ScanTable::from_entries`].
+    pub fn from_entries(
+        root: PathBuf,
+        entries: Vec<Entry>,
+        errors: Vec<ScanError>,
+        backend_used: BackendUsed,
+    ) -> Self {
+        let table = ScanTable::from_entries(&root, entries);
+        Self { root, table, errors, backend_used }
+    }
 }
 
 /// Set to any value, [`scan_drive`] treats the elevated scan as failed without

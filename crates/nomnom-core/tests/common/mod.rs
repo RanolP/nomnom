@@ -35,12 +35,12 @@ pub fn report_of(root: &Path) -> ScanReport {
             entries.push(entry);
         }
     }
-    ScanReport {
-        root: root.to_path_buf(),
+    ScanReport::from_entries(
+        root.to_path_buf(),
         entries,
-        errors: Vec::new(),
-        backend_used: BackendUsed::Walk { mft_unavailable: None },
-    }
+        Vec::new(),
+        BackendUsed::Walk { mft_unavailable: None },
+    )
 }
 
 fn entry(path: &Path) -> Entry {

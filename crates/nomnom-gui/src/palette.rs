@@ -29,7 +29,7 @@ impl Palette {
     pub fn new(catalog: &Catalog) -> Self {
         let mut bytes: HashMap<String, u64> = HashMap::new();
         for node in catalog.nodes().filter(|node| node.kind == EntryKind::File) {
-            *bytes.entry(ext_key(&node.name)).or_default() += node.size;
+            *bytes.entry(ext_key(catalog.name(node.id))).or_default() += node.size;
         }
         let mut ranked: Vec<(String, u64)> = bytes.into_iter().collect();
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

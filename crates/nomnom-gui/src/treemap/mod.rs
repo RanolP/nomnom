@@ -42,9 +42,11 @@ impl Treemap {
         self.fills = self
             .tiles
             .iter()
-            .map(|tile| {
-                if tile.dir { DIR_FILL } else { data.palette.for_name(&catalog.node(tile.id).name) }
-            })
+            .map(
+                |tile| {
+                    if tile.dir { DIR_FILL } else { data.palette.for_name(catalog.name(tile.id)) }
+                },
+            )
             .collect();
         self.index = self.tiles.iter().enumerate().map(|(ix, tile)| (tile.id, ix)).collect();
         self.key = Some(key);

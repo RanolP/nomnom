@@ -234,13 +234,8 @@ fn run_helper(args: &[OsString]) -> u8 {
     done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
     match result {
-        Ok(mut report) => {
-            // The catalog sorts entries this way anyway. Sorted here, each path
-            // shares most of the one before it, so the stream is a fifth the
-            // size and the parent's sort finds the order already in place.
+        Ok(report) => {
             let started = Instant::now();
-            crate::catalog::sort_subtrees(&mut report.entries);
-            let started = timings::lap("helper sort for the wire", started);
             send(&|out| wire::write_report(out, &report));
             timings::lap("helper encode + send", started);
             0

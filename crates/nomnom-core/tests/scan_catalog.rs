@@ -36,12 +36,12 @@ fn dir_entry(path: impl Into<PathBuf>) -> Entry {
 }
 
 fn report(root: impl Into<PathBuf>, entries: Vec<Entry>) -> ScanReport {
-    ScanReport {
-        root: root.into(),
+    ScanReport::from_entries(
+        root.into(),
         entries,
-        errors: Vec::new(),
-        backend_used: BackendUsed::Walk { mft_unavailable: None },
-    }
+        Vec::new(),
+        BackendUsed::Walk { mft_unavailable: None },
+    )
 }
 
 /// Catches aggregate roll-up drifting: subtree_size, file_count and dir_count
@@ -107,11 +107,18 @@ fn build_is_independent_of_entry_order() {
     assert_eq!(from_sorted.len(), from_shuffled.len());
     for path in ["/r", "/r/a", "/r/a/b", "/r/a/b/deep.bin", "/r/a/mid.bin", "/r/c", "/r/c/leaf.bin"]
     {
-        let a = from_sorted.node(from_sorted.find(Path::new(path)).unwrap());
-        let b = from_shuffled.node(from_shuffled.find(Path::new(path)).unwrap());
+        let a_id = from_sorted.find(Path::new(path)).unwrap();
+        let b_id = from_shuffled.find(Path::new(path)).unwrap();
+        let (a, b) = (from_sorted.node(a_id), from_shuffled.node(b_id));
         assert_eq!(
-            (a.subtree_size, a.file_count, a.dir_count, a.depth, a.children.len()),
-            (b.subtree_size, b.file_count, b.dir_count, b.depth, b.children.len()),
+            (a.subtree_size, a.file_count, a.dir_count, a.depth, from_sorted.children(a_id).len()),
+            (
+                b.subtree_size,
+                b.file_count,
+                b.dir_count,
+                b.depth,
+                from_shuffled.children(b_id).len()
+            ),
             "{path} differs between sorted and shuffled builds"
         );
     }

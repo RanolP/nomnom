@@ -350,7 +350,7 @@ impl ScanScreen {
         let catalog = &data.catalog;
         let node = catalog.node(id);
         let expanded = self.tree.is_expanded(id);
-        let is_dir = node.kind == EntryKind::Dir && !node.children.is_empty();
+        let is_dir = node.kind == EntryKind::Dir && !catalog.children(id).is_empty();
         let marker = match (is_dir, expanded) {
             (false, _) => "  ",
             (true, false) => "▸ ",
@@ -398,7 +398,7 @@ impl ScanScreen {
                             }))
                         },
                     ))
-                    .child(format!("{}{suffix}", node.name.to_string_lossy())),
+                    .child(format!("{}{suffix}", catalog.name(id).to_string_lossy())),
             )
             .child(
                 h_flex()

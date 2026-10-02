@@ -5,22 +5,28 @@
 //! frame    = 1 entries:u64 total:u64 bytes:u64      progress, little-endian
 //!          | 2 report                               the result; ends the stream
 //!          | 3 text                                 the helper's failure; ends it
-//! report   = path backend count:varint entry* count:varint error*
-//! entry    = flags:u8 shared:varint len:varint unit{len} size:varint
-//!            [allocated:varint] [modified:u64] [accessed:u64]
+//! report   = path backend names odd_names blobs nodes errors
+//! names    = len:varint utf8{len}
+//! odd      = count:varint (units)*
+//! blobs    = count:varint (size:u64 allocated:u64 modified:u64 accessed:u64 has:u8)*
+//! nodes    = count:varint (parent:u32 name_off:u32 name_len:u32 blob:u32 kind_flags:u8)*
+//! errors   = count:varint (0 | 1 units) text)*
 //! ```
 //!
-//! Paths travel as UTF-16 code units, exactly as `encode_wide` gives them, so
-//! a name that is not valid Unicode survives the trip. Each entry's path
-//! carries only what differs from the previous entry's: `shared` units are
-//! kept from it and `len` new ones follow, which is what keeps millions of
-//! entries under one directory cheap to send. Times are 100 ns ticks since
-//! 1601, the resolution Windows keeps them in.
+//! The report is the scan's [`ScanTable`] as it lies in memory: fixed-size
+//! little-endian rows and one names buffer, in the order the backend produced
+//! them, so encoding is a copy and nothing is sorted or rebuilt on either side.
+//! Odd names and error paths travel as UTF-16 code units, exactly as
+//! `encode_wide` gives them, so a name that is not valid Unicode survives the
+//! trip. Times are 100 ns ticks since 1601, the resolution Windows keeps them
+//! in; `has` says which of `allocated`, `modified` and `accessed` are present.
 //!
 //! The parent decodes this from another process, so every count and length is
-//! checked against a hard limit before it is trusted, and a malformed or
-//! truncated stream is an `InvalidData` / `UnexpectedEof` error, never a
-//! panic or an unbounded allocation.
+//! checked against a hard limit before it is trusted, every index a row holds
+//! (parent, name range, blob) is checked against what came before it, and a
+//! malformed or truncated stream is an `InvalidData` / `UnexpectedEof` error,
+//! never a panic or an unbounded allocation. Rows are only bounds-checked: a
+//! cycle or an orphan among valid indices is the catalog's to drop.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -28,19 +34,26 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::scan::{BackendUsed, Entry, EntryKind, ScanError, ScanReport};
+use crate::scan::table::{Blob, EXTRA_LINK, NO_BLOB, Name, ODD_NAME, ScanTable};
+use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
 
 const MAGIC: &[u8; 4] = b"NNEH";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 const TAG_PROGRESS: u8 = 1;
 const TAG_REPORT: u8 = 2;
 const TAG_FAILURE: u8 = 3;
 
 const KIND_MASK: u8 = 0b0000_0011;
-const HAS_ALLOCATED: u8 = 0b0000_0100;
-const HAS_MODIFIED: u8 = 0b0000_1000;
-const HAS_ACCESSED: u8 = 0b0001_0000;
+const FLAGS_SHIFT: u8 = 2;
+const KNOWN_FLAGS: u8 = ODD_NAME | EXTRA_LINK;
+
+const HAS_ALLOCATED: u8 = 0b001;
+const HAS_MODIFIED: u8 = 0b010;
+const HAS_ACCESSED: u8 = 0b100;
+
+const NODE_BYTES: usize = 17;
+const BLOB_BYTES: usize = 33;
 
 /// Windows caps a path at 32,767 UTF-16 units; twice that leaves room for a
 /// verbatim prefix without admitting a nonsense length.
@@ -48,11 +61,15 @@ const MAX_PATH_UNITS: u64 = 1 << 16;
 const MAX_TEXT_BYTES: u64 = 1 << 20;
 /// Far above the largest NTFS volumes nomnom meets (tens of millions of
 /// records), far below what would exhaust memory before the stream ran dry.
-const MAX_ENTRIES: u64 = 1 << 30;
+const MAX_ROWS: u64 = 1 << 30;
 const MAX_ERRORS: u64 = 1 << 26;
-/// A claimed count only reserves this much up front; the rest grows as
-/// entries actually arrive, so a lying count cannot allocate on its own.
+/// Rows index the names buffer with `u32`.
+const MAX_NAMES_BYTES: u64 = u32::MAX as u64;
+/// A claimed count only reserves this much up front; the rest grows as rows
+/// actually arrive, so a lying count cannot allocate on its own.
 const PREALLOC_CAP: u64 = 1 << 12;
+/// Rows encoded or decoded per pipe read or write.
+const ROWS_PER_CHUNK: usize = 1 << 15;
 
 /// Seconds from 1601-01-01 to 1970-01-01.
 const UNIX_FROM_1601: Duration = Duration::from_secs(11_644_473_600);
@@ -90,7 +107,16 @@ pub(crate) fn write_failure(w: &mut impl Write, message: &str) -> io::Result<()>
     w.write_all(&buf)
 }
 
+fn kind_code(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::File => 0,
+        EntryKind::Dir => 1,
+        EntryKind::Symlink => 2,
+    }
+}
+
 pub(crate) fn write_report(w: &mut impl Write, report: &ScanReport) -> io::Result<()> {
+    let table = &report.table;
     let mut buf = vec![TAG_REPORT];
     put_units(&mut buf, &units(&report.root));
     match &report.backend_used {
@@ -101,48 +127,47 @@ pub(crate) fn write_report(w: &mut impl Write, report: &ScanReport) -> io::Resul
             put_text(&mut buf, reason);
         }
     }
-    put_varint(&mut buf, report.entries.len() as u64);
+    put_varint(&mut buf, table.names.len() as u64);
     w.write_all(&buf)?;
+    w.write_all(table.names.as_bytes())?;
 
-    // One scratch buffer, one write per entry: the encoder runs once per
-    // record of the volume, so it allocates nothing it does not have to.
-    let mut previous: Vec<u16> = Vec::new();
-    let mut current: Vec<u16> = Vec::new();
-    for entry in &report.entries {
-        buf.clear();
-        current.clear();
-        current.extend(entry.path.as_os_str().encode_wide());
-        let shared = previous.iter().zip(&current).take_while(|(a, b)| a == b).count();
-        let modified = entry.modified.and_then(ticks);
-        let accessed = entry.accessed.and_then(ticks);
-
-        let mut flags = match entry.kind {
-            EntryKind::File => 0,
-            EntryKind::Dir => 1,
-            EntryKind::Symlink => 2,
-        };
-        if entry.allocated.is_some() {
-            flags |= HAS_ALLOCATED;
+    buf.clear();
+    put_varint(&mut buf, table.odd_names.len() as u64);
+    for name in &table.odd_names {
+        put_units(&mut buf, &name.encode_wide().collect::<Vec<u16>>());
+    }
+    put_varint(&mut buf, table.blobs.len() as u64);
+    w.write_all(&buf)?;
+    write_rows(w, &table.blobs, BLOB_BYTES, |blob, out| {
+        let modified = blob.modified.and_then(ticks);
+        let accessed = blob.accessed.and_then(ticks);
+        let mut has = 0;
+        if blob.allocated.is_some() {
+            has |= HAS_ALLOCATED;
         }
         if modified.is_some() {
-            flags |= HAS_MODIFIED;
+            has |= HAS_MODIFIED;
         }
         if accessed.is_some() {
-            flags |= HAS_ACCESSED;
+            has |= HAS_ACCESSED;
         }
-        buf.push(flags);
-        put_varint(&mut buf, shared as u64);
-        put_units(&mut buf, &current[shared..]);
-        put_varint(&mut buf, entry.size);
-        if let Some(allocated) = entry.allocated {
-            put_varint(&mut buf, allocated);
-        }
-        for time in [modified, accessed].into_iter().flatten() {
-            buf.extend_from_slice(&time.to_le_bytes());
-        }
-        w.write_all(&buf)?;
-        std::mem::swap(&mut previous, &mut current);
-    }
+        out.extend_from_slice(&blob.size.to_le_bytes());
+        out.extend_from_slice(&blob.allocated.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&modified.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&accessed.unwrap_or(0).to_le_bytes());
+        out.push(has);
+    })?;
+
+    buf.clear();
+    put_varint(&mut buf, table.nodes.len() as u64);
+    w.write_all(&buf)?;
+    write_rows(w, &table.nodes, NODE_BYTES, |node, out| {
+        out.extend_from_slice(&node.parent.to_le_bytes());
+        out.extend_from_slice(&node.name_off.to_le_bytes());
+        out.extend_from_slice(&node.name_len.to_le_bytes());
+        out.extend_from_slice(&node.blob.to_le_bytes());
+        out.push(kind_code(node.kind) | (node.flags << FLAGS_SHIFT));
+    })?;
 
     buf.clear();
     put_varint(&mut buf, report.errors.len() as u64);
@@ -157,6 +182,24 @@ pub(crate) fn write_report(w: &mut impl Write, report: &ScanReport) -> io::Resul
         put_text(&mut buf, &error.message);
     }
     w.write_all(&buf)
+}
+
+/// Writes fixed-size rows a chunk at a time through one reused buffer.
+fn write_rows<T>(
+    w: &mut impl Write,
+    rows: &[T],
+    size: usize,
+    put: impl Fn(&T, &mut Vec<u8>),
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(size * ROWS_PER_CHUNK.min(rows.len()));
+    for chunk in rows.chunks(ROWS_PER_CHUNK) {
+        buf.clear();
+        for row in chunk {
+            put(row, &mut buf);
+        }
+        w.write_all(&buf)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn read_header(r: &mut impl Read) -> io::Result<()> {
@@ -194,50 +237,70 @@ fn read_report(r: &mut impl Read) -> io::Result<ScanReport> {
         tag => return Err(invalid(format!("unknown backend tag {tag}"))),
     };
 
-    let count = read_count(r, MAX_ENTRIES, "entry count")?;
-    let mut entries = Vec::with_capacity(count.min(PREALLOC_CAP) as usize);
-    let mut path_units: Vec<u16> = Vec::new();
-    let mut scratch: Vec<u8> = Vec::new();
-    for index in 0..count {
-        let flags = read_u8(r)?;
-        if flags & !(KIND_MASK | HAS_ALLOCATED | HAS_MODIFIED | HAS_ACCESSED) != 0 {
-            return Err(invalid(format!("entry {index}: unknown flag bits {flags:#04x}")));
+    let len = read_count(r, MAX_NAMES_BYTES, "names length")?;
+    // `take` + `read_to_end` grows with the bytes that actually arrive, so a
+    // lying length cannot allocate on its own.
+    let mut bytes = Vec::new();
+    r.by_ref().take(len).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "names buffer cut short"));
+    }
+    let names = String::from_utf8(bytes).map_err(|e| invalid(format!("names: {e}")))?;
+
+    let count = read_count(r, MAX_ROWS, "odd name count")?;
+    let mut odd_names = Vec::with_capacity(count.min(PREALLOC_CAP) as usize);
+    for _ in 0..count {
+        odd_names.push(OsString::from_wide(&read_units(r, MAX_PATH_UNITS, "odd name")?));
+    }
+
+    let count = read_count(r, MAX_ROWS, "blob count")?;
+    let blobs = read_rows(r, count, BLOB_BYTES, |row, index| {
+        let u = |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap_or_default());
+        let has = row[32];
+        if has & !(HAS_ALLOCATED | HAS_MODIFIED | HAS_ACCESSED) != 0 {
+            return Err(invalid(format!("blob {index}: unknown flag bits {has:#04x}")));
         }
-        let kind = match flags & KIND_MASK {
+        Ok(Blob {
+            size: u(0),
+            allocated: (has & HAS_ALLOCATED != 0).then(|| u(8)),
+            modified: if has & HAS_MODIFIED != 0 { time_from(u(16)) } else { None },
+            accessed: if has & HAS_ACCESSED != 0 { time_from(u(24)) } else { None },
+        })
+    })?;
+
+    let count = read_count(r, MAX_ROWS, "node count")?;
+    if count == 0 {
+        return Err(invalid("a table without its root row"));
+    }
+    let nodes = read_rows(r, count, NODE_BYTES, |row, index| {
+        let u = |at: usize| u32::from_le_bytes(row[at..at + 4].try_into().unwrap_or_default());
+        let (parent, name_off, name_len, blob, code) = (u(0), u(4), u(8), u(12), row[16]);
+        let kind = match code & KIND_MASK {
             0 => EntryKind::File,
             1 => EntryKind::Dir,
             2 => EntryKind::Symlink,
-            other => return Err(invalid(format!("entry {index}: unknown kind {other}"))),
+            other => return Err(invalid(format!("node {index}: unknown kind {other}"))),
         };
-        let shared = read_varint(r)?;
-        if shared > path_units.len() as u64 {
-            return Err(invalid(format!(
-                "entry {index}: shares {shared} units with a {}-unit previous path",
-                path_units.len()
-            )));
+        let flags = code >> FLAGS_SHIFT;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(invalid(format!("node {index}: unknown flag bits {flags:#04x}")));
         }
-        path_units.truncate(shared as usize);
-        // Into reused buffers: two allocations per entry were a fifth of the
-        // decode.
-        let len = read_count(r, MAX_PATH_UNITS - shared, "path suffix")? as usize;
-        scratch.resize(len * 2, 0);
-        r.read_exact(&mut scratch)?;
-        path_units
-            .extend(scratch.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])));
-
-        let size = read_varint(r)?;
-        let allocated = if flags & HAS_ALLOCATED != 0 { Some(read_varint(r)?) } else { None };
-        let modified = if flags & HAS_MODIFIED != 0 { time_from(read_u64(r)?) } else { None };
-        let accessed = if flags & HAS_ACCESSED != 0 { time_from(read_u64(r)?) } else { None };
-        entries.push(Entry {
-            path: path_from(&path_units),
-            kind,
-            size,
-            allocated,
-            modified,
-            accessed,
-        });
-    }
+        if u64::from(parent) >= count {
+            return Err(invalid(format!("node {index}: parent {parent} past {count} rows")));
+        }
+        let named = if flags & ODD_NAME != 0 {
+            (name_off as usize) < odd_names.len()
+        } else {
+            (name_off as usize).checked_add(name_len as usize).is_some_and(|end| end <= names.len())
+        };
+        if !named {
+            return Err(invalid(format!("node {index}: name {name_off}+{name_len} out of range")));
+        }
+        if blob != NO_BLOB && blob as usize >= blobs.len() {
+            return Err(invalid(format!("node {index}: blob {blob} past {} blobs", blobs.len())));
+        }
+        Ok(Name { parent, name_off, name_len, blob, kind, flags })
+    })?;
 
     let count = read_count(r, MAX_ERRORS, "error count")?;
     let mut errors = Vec::with_capacity(count.min(PREALLOC_CAP) as usize);
@@ -250,7 +313,32 @@ fn read_report(r: &mut impl Read) -> io::Result<ScanReport> {
         errors.push(ScanError { path, message: read_text(r)? });
     }
 
-    Ok(ScanReport { root, entries, errors, backend_used })
+    let table = ScanTable { nodes, names, odd_names, blobs };
+    Ok(ScanReport { root, table, errors, backend_used })
+}
+
+/// Reads `count` fixed-size rows a chunk at a time, growing the result only
+/// as rows arrive.
+fn read_rows<T>(
+    r: &mut impl Read,
+    count: u64,
+    size: usize,
+    mut parse: impl FnMut(&[u8], u64) -> io::Result<T>,
+) -> io::Result<Vec<T>> {
+    let mut out = Vec::with_capacity(count.min(PREALLOC_CAP) as usize);
+    let mut scratch = vec![0u8; size * (ROWS_PER_CHUNK as u64).min(count) as usize];
+    let mut index = 0u64;
+    while index < count {
+        let n = (count - index).min(ROWS_PER_CHUNK as u64) as usize;
+        let chunk = &mut scratch[..n * size];
+        r.read_exact(chunk)?;
+        out.reserve(n);
+        for row in chunk.chunks_exact(size) {
+            out.push(parse(row, index)?);
+            index += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn units(path: &Path) -> Vec<u16> {
@@ -365,6 +453,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::scan::Entry;
 
     fn entry(path: PathBuf, kind: EntryKind, size: u64) -> Entry {
         Entry { path, kind, size, allocated: None, modified: None, accessed: None }
@@ -383,27 +472,28 @@ mod tests {
         full.modified = Some(at(1_700_000_000));
         full.accessed = Some(UNIX_EPOCH - Duration::from_secs(86_400 * 365 * 100));
 
-        let mut report = ScanReport {
+        let mut entries = vec![
+            entry(root.clone(), EntryKind::Dir, 0),
+            entry(root.join("사진"), EntryKind::Dir, 0),
+            full,
+            entry(root.join("사"), EntryKind::Symlink, 0),
+            entry(root.join(&lone), EntryKind::File, u64::MAX),
+            entry(deep.join("leaf.bin"), EntryKind::File, 1 << 40),
+        ];
+        entries[5].allocated = Some(0);
+        let mut table = ScanTable::from_entries(&root, entries);
+        // A second name of the photo, sharing its blob.
+        let photo = table.nodes[2].blob;
+        table.push_node(0, "photo-link.jpg", photo, EntryKind::File, EXTRA_LINK);
+        ScanReport {
             root: root.clone(),
-            entries: vec![
-                entry(root.clone(), EntryKind::Dir, 0),
-                entry(root.join("사진"), EntryKind::Dir, 0),
-                full,
-                // Shorter than its predecessor, sharing only part of it.
-                entry(root.join("사"), EntryKind::Symlink, 0),
-                entry(root.join(&lone), EntryKind::File, u64::MAX),
-                entry(deep.join("leaf.bin"), EntryKind::File, 1 << 40),
-                // Shares nothing with the deep path before it.
-                entry(PathBuf::from("D:\\elsewhere"), EntryKind::File, 0),
-            ],
+            table,
             errors: vec![
                 ScanError { path: Some(root.join(&lone)), message: "접근 거부".into() },
                 ScanError { path: None, message: String::new() },
             ],
             backend_used: BackendUsed::Walk { mft_unavailable: Some("needs Administrator".into()) },
-        };
-        report.entries[5].allocated = Some(0);
-        report
+        }
     }
 
     fn encode(report: &ScanReport) -> Vec<u8> {
@@ -429,11 +519,12 @@ mod tests {
     }
 
     /// Catches a lossy encoder: a non-ASCII name, a lone surrogate, a path
-    /// longer than MAX_PATH, a path shorter than the one before it, and every
-    /// optional field must come back exactly as they went in.
+    /// longer than MAX_PATH, an extra hard-link name, and every optional field
+    /// must come back exactly as they went in.
     #[test]
-    fn odd_paths_and_every_field_survive_the_round_trip() {
+    fn odd_names_and_every_field_survive_the_round_trip() {
         let report = odd_report();
+        assert!(!report.table.odd_names.is_empty(), "the lone surrogate is an odd name");
         let bytes = encode(&report);
         let (frames, used) = decode(&bytes).expect("a well-formed stream decodes");
         assert_eq!(used, bytes.len(), "the report frame must end the stream exactly");
@@ -445,7 +536,7 @@ mod tests {
         };
         assert_eq!(back.root, report.root);
         assert_eq!(back.backend_used, report.backend_used);
-        assert_eq!(back.entries, report.entries);
+        assert_eq!(back.table, report.table);
         let errors = |r: &ScanReport| -> Vec<(Option<PathBuf>, String)> {
             r.errors.iter().map(|e| (e.path.clone(), e.message.clone())).collect()
         };
@@ -462,7 +553,8 @@ mod tests {
 
     /// Catches the parent trusting the pipe: every truncation of a valid
     /// stream, and every single-byte corruption of it, must decode to an error
-    /// or a value — never a panic or a runaway allocation.
+    /// or a value — never a panic or a runaway allocation — and a row pointing
+    /// past the table must be refused before anything indexes with it.
     #[test]
     fn truncated_or_corrupted_streams_are_errors_not_panics() {
         let bytes = encode(&odd_report());
@@ -477,16 +569,16 @@ mod tests {
             }
         }
 
-        let mut hostile = Vec::new();
-        write_header(&mut hostile).unwrap();
-        hostile.push(TAG_REPORT);
-        put_units(&mut hostile, &units(Path::new("C:\\")));
-        hostile.push(0);
-        put_varint(&mut hostile, MAX_ENTRIES);
-        // One entry claiming to share 5 units with a path that does not exist.
-        hostile.extend([0, 5, 0, 0]);
-        let error = decode(&hostile).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        for hostile in [
+            |t: &mut ScanTable| t.nodes[1].parent = 99,
+            |t: &mut ScanTable| t.nodes[1].name_off = u32::MAX,
+            |t: &mut ScanTable| t.nodes[1].blob = 99,
+        ] {
+            let mut report = odd_report();
+            hostile(&mut report.table);
+            let error = decode(&encode(&report)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        }
 
         let mut huge = Vec::new();
         write_header(&mut huge).unwrap();
@@ -503,13 +595,9 @@ mod tests {
     fn encode_and_decode_time_at_volume_scale() {
         // NOMNOM_TIMINGS=1 prints the catalog's phases as well.
         crate::timings::join_scan("bench");
-        let mut report = volume_scale_report(4_500_000);
-        let n = report.entries.len();
+        let report = volume_scale_report(4_500_000);
+        let n = report.table.nodes.len();
 
-        // As the helper does before it sends.
-        let started = Instant::now();
-        crate::catalog::sort_subtrees(&mut report.entries);
-        let sorted = started.elapsed();
         let started = Instant::now();
         let mut bytes = Vec::new();
         write_report(&mut bytes, &report).unwrap();
@@ -518,22 +606,20 @@ mod tests {
         let mut slice = bytes.as_slice();
         let Frame::Report(back) = read_frame(&mut slice).unwrap() else { panic!() };
         let decoded = started.elapsed();
-        assert_eq!(back.entries.len(), n);
+        assert_eq!(back.table.nodes.len(), n);
         let started = Instant::now();
         let catalog = crate::catalog::Catalog::build(back);
         let built = started.elapsed();
         assert!(catalog.len() > n / 2);
         println!(
-            "{n} entries: helper sort {sorted:?}, {} MiB on the wire, encode {encoded:?}, \
-             decode {decoded:?}, Catalog::build {built:?}",
+            "{n} rows: {} MiB on the wire, encode {encoded:?}, decode {decoded:?}, \
+             Catalog::build {built:?}",
             bytes.len() >> 20
         );
     }
 
     /// A C:-shaped report: about one directory per ten files, depth up to a
-    /// dozen, in creation order the way MFT record order is: each entry lands
-    /// in one of the 2000 most recent directories, so neighbours share some
-    /// of their path but the whole is far from sorted.
+    /// dozen, in creation order the way MFT record order is.
     fn volume_scale_report(n: usize) -> ScanReport {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
@@ -571,6 +657,6 @@ mod tests {
                 ..entry
             });
         }
-        ScanReport { root, entries, errors: Vec::new(), backend_used: BackendUsed::Mft }
+        ScanReport::from_entries(root, entries, Vec::new(), BackendUsed::Mft)
     }
 }

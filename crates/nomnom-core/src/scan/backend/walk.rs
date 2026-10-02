@@ -50,12 +50,12 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
         })
     });
 
-    Ok(ScanReport {
-        root: root.to_path_buf(),
-        entries: entries.into_inner().unwrap(),
-        errors: errors.into_inner().unwrap(),
-        backend_used: BackendUsed::Walk { mft_unavailable: None },
-    })
+    Ok(ScanReport::from_entries(
+        root.to_path_buf(),
+        entries.into_inner().unwrap(),
+        errors.into_inner().unwrap(),
+        BackendUsed::Walk { mft_unavailable: None },
+    ))
 }
 
 fn to_entry(dent: &ignore::DirEntry) -> Result<Entry, ScanError> {

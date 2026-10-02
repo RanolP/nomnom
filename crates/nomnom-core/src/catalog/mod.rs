@@ -5,16 +5,26 @@
 //! them contiguous, makes every reference a `Copy` `u32`, and lets traversals
 //! stay iterative — which is what keeps a 2000-deep chain from blowing the
 //! stack where a recursive `Rc` tree would.
+//!
+//! Ids are handed out in preorder, so a node's whole subtree is the id range
+//! `id..end` ([`Catalog::subtree`]). That one fact carries the roll-up (a single
+//! reverse pass sees every child before its parent), subtree containment for a
+//! cleanup plan (two integer compares), and [`Catalog::descendants`].
+//!
+//! Nodes store no paths. A path is built on demand from the names, so a volume
+//! of millions of entries does not pin millions of full paths in memory.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::scan::{BackendUsed, Entry, EntryKind, ScanError, ScanReport};
+use crate::scan::table::{Blob, EXTRA_LINK, ODD_NAME, ScanTable};
+use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
 use crate::timings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -30,20 +40,21 @@ impl NodeId {
 pub struct Node {
     pub id: NodeId,
     pub parent: Option<NodeId>,
-    pub children: Vec<NodeId>,
-    /// File-name component. The root holds its full root path instead, so
-    /// [`Catalog::path`] can rebuild absolute paths from names alone.
-    pub name: OsString,
     pub kind: EntryKind,
-    /// Own size; 0 for directories.
+    /// Own size; 0 for directories. A hard-linked file shows its full size on
+    /// every name it has.
     pub size: u64,
     /// Own on-disk size, as [`Entry::allocated`](crate::scan::Entry::allocated)
     /// reported it: `None` when the backend had no cheap answer.
     pub allocated: Option<u64>,
     pub modified: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
-    /// Rolled up over the subtree, inclusive of self.
+    /// Rolled up over the subtree, inclusive of self. A file's bytes count
+    /// once, under its primary name: an [`extra_link`](Self::extra_link) node
+    /// adds nothing to its ancestors.
     pub subtree_size: u64,
+    /// `allocated` rolled up the same way, a missing value counting as 0.
+    pub subtree_allocated: u64,
     /// Files in the subtree, inclusive of self if this is a file.
     pub file_count: u64,
     /// Directories in the subtree, excluding self.
@@ -56,136 +67,279 @@ pub struct Node {
     /// means.
     pub max_modified: Option<SystemTime>,
     pub depth: u32,
+    /// How many names the scan found for this node's file, itself included: 1
+    /// for anything that is not hard-linked.
+    pub links: u32,
+    /// A second (or later) name of a hard-linked file, whose bytes are
+    /// counted under another node.
+    pub extra_link: bool,
+    end: u32,
+    name: NameRef,
+    blob: u32,
+}
+
+impl Node {
+    /// What this node adds to its parent's `subtree_size`.
+    pub fn rolled_size(&self) -> u64 {
+        if self.extra_link { self.subtree_size - self.size } else { self.subtree_size }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NameRef {
+    off: u32,
+    len: u32,
+    odd: bool,
+}
+
+/// The names one hard-linked file has in the catalog.
+#[derive(Debug, Clone)]
+pub struct LinkGroup {
+    /// The node its bytes are counted under.
+    pub primary: NodeId,
+    /// Every name reachable from the root, `primary` included, in id order.
+    pub nodes: Vec<NodeId>,
+    /// False when the scan found names that are not in the catalog (filed
+    /// under an unreachable parent, or outside the scanned subtree): trashing
+    /// every node here still leaves the file alive.
+    pub complete: bool,
+    pub bytes: u64,
 }
 
 pub struct Catalog {
     nodes: Vec<Node>,
     root: NodeId,
+    root_path: PathBuf,
+    names: String,
+    odd_names: Vec<OsString>,
+    /// Children of node `i` are `child_ids[child_start[i]..child_start[i + 1]]`.
+    child_start: Vec<u32>,
+    child_ids: Vec<NodeId>,
+    /// Multi-link files: names of group `g` are
+    /// `link_ids[link_start[g]..link_start[g + 1]]`.
+    link_groups: Vec<(NodeId, bool, u64)>,
+    link_start: Vec<u32>,
+    link_ids: Vec<NodeId>,
     errors: Vec<ScanError>,
     backend_used: BackendUsed,
+}
+
+/// Counts, prefix sums and scatters `(parent, child)` pairs into a compressed
+/// child list: O(n), no hashing, no sorting. Children keep the order the pairs
+/// arrive in.
+fn csr(n: usize, pairs: impl Iterator<Item = (u32, u32)> + Clone) -> (Vec<u32>, Vec<u32>) {
+    let mut start = vec![0u32; n + 1];
+    for (parent, _) in pairs.clone() {
+        start[parent as usize + 1] += 1;
+    }
+    for i in 0..n {
+        start[i + 1] += start[i];
+    }
+    let mut fill = start.clone();
+    let mut ids = vec![0u32; start[n] as usize];
+    for (parent, child) in pairs {
+        let slot = &mut fill[parent as usize];
+        ids[*slot as usize] = child;
+        *slot += 1;
+    }
+    (start, ids)
 }
 
 impl Catalog {
     /// Build the tree from a scan.
     ///
-    /// Entry order is not assumed: the MFT backend emits entries in MFT-record
-    /// order, so a child routinely arrives before its parent. Entries are
-    /// sorted so every subtree is one contiguous run right after its root,
-    /// which lets parents be resolved with a stack of open ancestors instead of
-    /// a path index -- an index would pin every full path in memory for the
-    /// catalog's lifetime, the bulk of a volume scan's footprint.
+    /// Row order is not assumed: the MFT backend emits rows in record order,
+    /// where a child routinely comes before its parent. The rows are linked by
+    /// a compressed child list, then renumbered in preorder by one walk down
+    /// from the root. A row that walk never reaches — an orphan, or a cycle a
+    /// damaged table can hold — is dropped and counted in one error, so no
+    /// visited set and no cycle check is needed: every row has exactly one
+    /// parent, so the walk from the root can meet each row once at most.
     pub fn build(report: ScanReport) -> Self {
-        let ScanReport { root: root_path, mut entries, errors, backend_used } = report;
-
+        let ScanReport { root: root_path, table, mut errors, backend_used } = report;
+        let ScanTable { nodes: rows, names, odd_names, blobs } = table;
         let started = Instant::now();
-        sort_subtrees(&mut entries);
-        let started = timings::lap("Catalog::build sort", started);
 
-        let mut nodes: Vec<Node> = Vec::with_capacity(entries.len() + 1);
-        let root = NodeId(0);
-        nodes.push(blank_node(root, root_path.clone().into_os_string(), EntryKind::Dir));
-
-        // The previous entry and its scanned ancestors, root at the bottom. The
-        // root is never popped, so an entry outside it still lands somewhere.
-        let mut open: Vec<(PathBuf, NodeId)> = vec![(root_path.clone(), root)];
-
-        // Paths compare as bytes from here on. Both backends spell every path
-        // by joining names onto the root, so a byte prefix ending at a
-        // separator is exactly a component prefix, and `Path`'s component-wise
-        // comparisons, which re-parse both paths, are pure overhead: they were
-        // two thirds of building a 4.5M-entry catalog.
-        let root_bytes = root_path.as_os_str().as_encoded_bytes().to_vec();
-        for entry in entries {
-            let path = entry.path.as_os_str().as_encoded_bytes();
-            if path == root_bytes.as_slice() {
-                let node = &mut nodes[root.index()];
-                node.kind = entry.kind;
-                node.size = entry.size;
-                node.allocated = entry.allocated;
-                node.modified = entry.modified;
-                node.accessed = entry.accessed;
-                continue;
-            }
-            // A path repeated by the backend must not become a second node: its
-            // bytes would be counted twice. Sorting made repeats adjacent, so
-            // the repeat is always the top of the stack.
-            if open.len() > 1 && bytes_of(&open[open.len() - 1].0) == path {
-                continue;
-            }
-            // Attach to the nearest ANCESTOR that was actually scanned, so an
-            // entry whose parent fell outside the set still lands somewhere sane
-            // instead of being dropped.
-            while open.len() > 1 && !is_under(bytes_of(&open[open.len() - 1].0), path) {
-                open.pop();
-            }
-            let parent = open[open.len() - 1].1;
-
-            let name = entry
-                .path
-                .file_name()
-                .map(OsString::from)
-                .unwrap_or_else(|| entry.path.clone().into_os_string());
-            let id = NodeId(nodes.len() as u32);
-            let mut node = blank_node(id, name, entry.kind);
-            node.parent = Some(parent);
-            node.size = entry.size;
-            node.allocated = entry.allocated;
-            node.modified = entry.modified;
-            node.accessed = entry.accessed;
-            nodes.push(node);
-            // Ids are handed out in sorted order, so every parent's children
-            // arrive already sorted and sibling order is reproducible.
-            nodes[parent.index()].children.push(id);
-            open.push((entry.path, id));
+        let n = rows.len();
+        if n == 0 {
+            return Self::build(ScanReport {
+                root: root_path,
+                table: ScanTable::new(),
+                errors,
+                backend_used,
+            });
         }
 
+        // Children in table space. Row 0 is the root and never anyone's child;
+        // a row naming itself or an index past the table has no parent here.
+        let pairs = rows
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|&(i, row)| (row.parent as usize) < n && row.parent as usize != i)
+            .map(|(i, row)| (row.parent, i as u32));
+        let (start, kids) = csr(n, pairs);
+
+        // Preorder: `order[new] = row`. Children are pushed reversed so the
+        // first child is visited first and siblings keep table order.
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut parent_of: Vec<u32> = Vec::with_capacity(n);
+        let mut depth_of: Vec<u32> = Vec::with_capacity(n);
+        let mut stack: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
+        while let Some((row, parent, depth)) = stack.pop() {
+            let new = order.len() as u32;
+            order.push(row);
+            parent_of.push(parent);
+            depth_of.push(depth);
+            let range = start[row as usize] as usize..start[row as usize + 1] as usize;
+            stack.extend(kids[range].iter().rev().map(|&child| (child, new, depth + 1)));
+        }
+        drop(kids);
+        drop(start);
+        let reached = order.len();
+
+        // A blob's bytes count under its first name not flagged as an extra
+        // link, in preorder, or under its first reachable name when every
+        // name is flagged.
+        let mut links = vec![0u32; blobs.len()];
+        for row in &rows {
+            if let Some(count) = links.get_mut(row.blob as usize) {
+                *count += 1;
+            }
+        }
+        let mut primary = vec![u32::MAX; blobs.len()];
+        for pass_extra in [false, true] {
+            for (new, &row) in order.iter().enumerate() {
+                let r = &rows[row as usize];
+                let b = r.blob as usize;
+                if b < blobs.len()
+                    && primary[b] == u32::MAX
+                    && (pass_extra || r.flags & EXTRA_LINK == 0)
+                {
+                    primary[b] = new as u32;
+                }
+            }
+        }
+
+        let empty = Blob { size: 0, allocated: None, modified: None, accessed: None };
+        let mut nodes: Vec<Node> = order
+            .iter()
+            .enumerate()
+            .map(|(new, &row)| {
+                let r = &rows[row as usize];
+                let b = r.blob;
+                let facts = blobs.get(b as usize).copied().unwrap_or(empty);
+                let size = if r.kind == EntryKind::Dir { 0 } else { facts.size };
+                let extra_link = primary.get(b as usize).is_some_and(|&p| p != new as u32);
+                Node {
+                    id: NodeId(new as u32),
+                    parent: (new != 0).then_some(NodeId(parent_of[new])),
+                    kind: r.kind,
+                    size,
+                    allocated: facts.allocated,
+                    modified: facts.modified,
+                    accessed: facts.accessed,
+                    subtree_size: size,
+                    subtree_allocated: facts.allocated.unwrap_or(0),
+                    file_count: u64::from(r.kind == EntryKind::File),
+                    dir_count: 0,
+                    max_modified: facts.modified,
+                    depth: depth_of[new],
+                    links: links.get(b as usize).copied().unwrap_or(1),
+                    extra_link,
+                    end: new as u32 + 1,
+                    name: NameRef {
+                        off: r.name_off,
+                        len: r.name_len,
+                        odd: r.flags & ODD_NAME != 0,
+                    },
+                    blob: b,
+                }
+            })
+            .collect();
+        drop(depth_of);
+        drop(rows);
         let started = timings::lap("Catalog::build link", started);
-        let mut catalog = Self { nodes, root, errors, backend_used };
-        catalog.recompute();
-        timings::lap("Catalog::build roll-up", started);
-        catalog
-    }
 
-    /// Breadth-first order (parents before children), then aggregates rolled up
-    /// over its reverse. Iterative throughout — depth is unbounded in practice.
-    fn recompute(&mut self) {
-        let mut order: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
-        order.push(self.root);
-        self.nodes[self.root.index()].depth = 0;
-        let mut cursor = 0;
-        while cursor < order.len() {
-            let id = order[cursor];
-            cursor += 1;
-            let depth = self.nodes[id.index()].depth;
-            let children = std::mem::take(&mut self.nodes[id.index()].children);
-            for &child in &children {
-                self.nodes[child.index()].depth = depth + 1;
-                order.push(child);
-            }
-            self.nodes[id.index()].children = children;
+        // One reverse pass: every child has a higher id than its parent.
+        for new in (1..nodes.len()).rev() {
+            let child = &nodes[new];
+            let (size, allocated) = if child.extra_link {
+                (
+                    child.subtree_size - child.size,
+                    child.subtree_allocated - child.allocated.unwrap_or(0),
+                )
+            } else {
+                (child.subtree_size, child.subtree_allocated)
+            };
+            let (files, dirs, newest, end) = (
+                child.file_count,
+                child.dir_count + u64::from(child.kind == EntryKind::Dir),
+                child.max_modified,
+                child.end,
+            );
+            let parent = &mut nodes[parent_of[new] as usize];
+            parent.subtree_size += size;
+            parent.subtree_allocated += allocated;
+            parent.file_count += files;
+            parent.dir_count += dirs;
+            // `None` sorts below every `Some`, so this is "the newest known
+            // stamp, or nothing if nothing in the subtree has one".
+            parent.max_modified = parent.max_modified.max(newest);
+            parent.end = parent.end.max(end);
         }
 
-        for &id in order.iter().rev() {
-            let (mut subtree_size, mut file_count, mut dir_count, mut max_modified) = {
-                let node = &self.nodes[id.index()];
-                (node.size, u64::from(node.kind == EntryKind::File), 0, node.modified)
-            };
-            let children = std::mem::take(&mut self.nodes[id.index()].children);
-            for &child in &children {
-                let child = &self.nodes[child.index()];
-                subtree_size += child.subtree_size;
-                file_count += child.file_count;
-                dir_count += child.dir_count + u64::from(child.kind == EntryKind::Dir);
-                // `None` sorts below every `Some`, so this is "the newest known
-                // stamp, or nothing if nothing in the subtree has one".
-                max_modified = max_modified.max(child.max_modified);
+        let m = nodes.len();
+        let (child_start, child_ids) =
+            csr(m, (1..m as u32).map(|new| (parent_of[new as usize], new)));
+        let child_ids = child_ids.into_iter().map(NodeId).collect();
+
+        // Names of every multi-link file, grouped in id order.
+        let mut group_of = vec![u32::MAX; blobs.len()];
+        let mut link_groups = Vec::new();
+        for node in &nodes {
+            let b = node.blob as usize;
+            if node.links > 1 && b < blobs.len() && group_of[b] == u32::MAX {
+                group_of[b] = link_groups.len() as u32;
+                link_groups.push((NodeId(primary[b]), false, blobs[b].size));
             }
-            let node = &mut self.nodes[id.index()];
-            node.children = children;
-            node.subtree_size = subtree_size;
-            node.file_count = file_count;
-            node.dir_count = dir_count;
-            node.max_modified = max_modified;
+        }
+        let pairs = nodes.iter().filter_map(|node| {
+            let g = *group_of.get(node.blob as usize)?;
+            (g != u32::MAX).then_some((g, node.id.0))
+        });
+        let (link_start, link_ids) = csr(link_groups.len(), pairs);
+        for (g, group) in link_groups.iter_mut().enumerate() {
+            let found = link_start[g + 1] - link_start[g];
+            group.1 = found == nodes[group.0.index()].links;
+        }
+        let link_ids = link_ids.into_iter().map(NodeId).collect();
+
+        let unreachable = n - reached;
+        if unreachable > 0 {
+            errors.push(ScanError {
+                path: None,
+                message: format!(
+                    "{unreachable} entries are not reachable from the root (orphaned or cyclic \
+                     parent reference); their bytes are not counted"
+                ),
+            });
+        }
+        timings::lap("Catalog::build roll-up", started);
+
+        Self {
+            nodes,
+            root: NodeId(0),
+            root_path,
+            names,
+            odd_names,
+            child_start,
+            child_ids,
+            link_groups,
+            link_start,
+            link_ids,
+            errors,
+            backend_used,
         }
     }
 
@@ -197,35 +351,59 @@ impl Catalog {
         &self.nodes[id.index()]
     }
 
+    /// Children in the order the scan found them.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
-        &self.nodes[id.index()].children
+        let i = id.index();
+        &self.child_ids[self.child_start[i] as usize..self.child_start[i + 1] as usize]
     }
 
-    /// Reconstructed by walking parents, since nodes store only their name.
+    /// The node's file-name component. The root's name is its full path.
+    pub fn name(&self, id: NodeId) -> &OsStr {
+        if id == self.root {
+            return self.root_path.as_os_str();
+        }
+        let name = self.nodes[id.index()].name;
+        if name.odd {
+            return self.odd_names.get(name.off as usize).map_or(OsStr::new(""), |n| n.as_os_str());
+        }
+        let start = name.off as usize;
+        let text = start
+            .checked_add(name.len as usize)
+            .and_then(|end| self.names.get(start..end))
+            .unwrap_or("");
+        OsStr::new(text)
+    }
+
+    /// Writes the node's absolute path into `out`, reusing its buffer.
+    pub fn path_into(&self, id: NodeId, out: &mut PathBuf) {
+        let mut chain = Vec::with_capacity(self.nodes[id.index()].depth as usize);
+        let mut cursor = id;
+        while let Some(parent) = self.nodes[cursor.index()].parent {
+            chain.push(cursor);
+            cursor = parent;
+        }
+        out.clear();
+        out.push(&self.root_path);
+        for &part in chain.iter().rev() {
+            out.push(self.name(part));
+        }
+    }
+
+    /// Built by walking parents, since nodes store only their name.
     pub fn path(&self, id: NodeId) -> PathBuf {
-        let mut parts = Vec::new();
-        let mut cursor = Some(id);
-        while let Some(current) = cursor {
-            let node = &self.nodes[current.index()];
-            parts.push(node.name.as_os_str());
-            cursor = node.parent;
-        }
-        let mut path = PathBuf::new();
-        for part in parts.iter().rev() {
-            path.push(part);
-        }
-        path
+        let mut out = PathBuf::new();
+        self.path_into(id, &mut out);
+        out
     }
 
     /// Walks `path` down from the root one component at a time, scanning the
     /// siblings at each level: fine for a lookup, wrong for resolving every node.
     pub fn find(&self, path: &Path) -> Option<NodeId> {
-        let root_path = Path::new(&self.nodes[self.root.index()].name);
-        let rest = path.strip_prefix(root_path).ok()?;
+        let rest = path.strip_prefix(&self.root_path).ok()?;
         let mut cursor = self.root;
         for component in rest.components() {
             let name = component.as_os_str();
-            cursor = *self.children(cursor).iter().find(|&&child| self.node(child).name == name)?;
+            cursor = *self.children(cursor).iter().find(|&&child| self.name(child) == name)?;
         }
         Some(cursor)
     }
@@ -250,21 +428,19 @@ impl Catalog {
         &self.backend_used
     }
 
+    /// The ids of `id`'s subtree, `id` included.
+    pub fn subtree(&self, id: NodeId) -> Range<u32> {
+        id.0..self.nodes[id.index()].end
+    }
+
     /// Every node in the subtree of `id`, `id` included, parents before children.
     pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
-        let mut out = vec![id];
-        let mut cursor = 0;
-        while cursor < out.len() {
-            let current = out[cursor];
-            cursor += 1;
-            out.extend_from_slice(&self.nodes[current.index()].children);
-        }
-        out
+        self.subtree(id).map(NodeId).collect()
     }
 
     /// Children of `id` sorted by `subtree_size` descending.
     pub fn children_by_size(&self, id: NodeId) -> Vec<NodeId> {
-        let mut out = self.nodes[id.index()].children.clone();
+        let mut out = self.children(id).to_vec();
         out.sort_by(|a, b| {
             self.nodes[b.index()]
                 .subtree_size
@@ -272,6 +448,14 @@ impl Catalog {
                 .then(a.cmp(b))
         });
         out
+    }
+
+    /// Every file the scan found under more than one name.
+    pub fn link_groups(&self) -> impl Iterator<Item = LinkGroup> + '_ {
+        self.link_groups.iter().enumerate().map(|(g, &(primary, complete, bytes))| {
+            let range = self.link_start[g] as usize..self.link_start[g + 1] as usize;
+            LinkGroup { primary, nodes: self.link_ids[range].to_vec(), complete, bytes }
+        })
     }
 
     /// blake3 of the file's contents. Computed on demand, never during
@@ -289,11 +473,13 @@ impl Catalog {
     /// Groups of 2+ nodes with identical size AND identical content hash.
     ///
     /// Size is the cheap discriminator: only files whose size already collides
-    /// with another file's get hashed, so the whole tree is never read.
+    /// with another file's get hashed, so the whole tree is never read. A
+    /// hard link's extra names are the same file, not a copy of it, so only
+    /// its primary name takes part.
     pub fn duplicate_groups(&self, min_size: u64) -> Vec<Vec<NodeId>> {
         let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
         for node in &self.nodes {
-            if node.kind == EntryKind::File && node.size >= min_size {
+            if node.kind == EntryKind::File && !node.extra_link && node.size >= min_size {
                 by_size.entry(node.size).or_default().push(node.id);
             }
         }
@@ -323,86 +509,16 @@ impl Catalog {
     }
 }
 
-/// Puts entries in the order [`Catalog::build`] links them in. Input already
-/// in this order sorts in one linear pass.
-pub(crate) fn sort_subtrees(entries: &mut [Entry]) {
-    entries.par_sort_unstable_by(|a, b| subtree_order(&a.path, &b.path));
-}
-
-/// Byte order with every path separator ranked below every other byte, so a
-/// directory is followed immediately by its whole subtree: `a/b`, `a/b/c`,
-/// `a/b-x`. Plain byte order puts `a/b-x` between `a/b` and `a/b/c`, and the
-/// stack in [`Catalog::build`] would pop `a/b` before reaching its child.
-fn subtree_order(a: &Path, b: &Path) -> std::cmp::Ordering {
-    // Separators are ASCII and every byte of a multi-byte character is >= 0x80,
-    // so testing single bytes cannot mistake part of a character for one.
-    let key = |byte: u8| if is_separator(byte) { 0 } else { byte };
-    let (a, b) = (bytes_of(a), bytes_of(b));
-    // Sorted neighbours share most of their path, so the shared prefix is
-    // skipped eight bytes at a time before any byte is mapped; this is the
-    // same order as comparing the mapped sequences, at a third of the cost.
-    let shared = a.len().min(b.len());
-    let mut i = 0;
-    while i + 8 <= shared && a[i..i + 8] == b[i..i + 8] {
-        i += 8;
-    }
-    while i < shared {
-        if a[i] != b[i] {
-            // Two different separators map to the same key; keep comparing.
-            match key(a[i]).cmp(&key(b[i])) {
-                std::cmp::Ordering::Equal => {}
-                unequal => return unequal,
-            }
-        }
-        i += 1;
-    }
-    a.len().cmp(&b.len())
-}
-
-fn bytes_of(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
-}
-
-fn is_separator(byte: u8) -> bool {
-    std::path::is_separator(char::from(byte))
-}
-
-/// Whether `path` lies strictly below `dir`, both spelled the way a backend
-/// spells them (see [`Catalog::build`]).
-fn is_under(dir: &[u8], path: &[u8]) -> bool {
-    path.len() > dir.len()
-        && path.starts_with(dir)
-        && (dir.last().copied().is_some_and(is_separator) || is_separator(path[dir.len()]))
-}
-
-fn blank_node(id: NodeId, name: OsString, kind: EntryKind) -> Node {
-    Node {
-        id,
-        parent: None,
-        children: Vec::new(),
-        name,
-        kind,
-        size: 0,
-        allocated: None,
-        modified: None,
-        accessed: None,
-        subtree_size: 0,
-        file_count: 0,
-        dir_count: 0,
-        max_modified: None,
-        depth: 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::Entry;
+    use crate::scan::table::NO_BLOB;
 
-    /// Regression: the byte-compared link treating `C:\a\b-x` as inside
-    /// `C:\a\b` because its bytes start with it, or `C:\a\b\c` as outside it,
-    /// or counting a repeated path twice.
+    /// Regression: linking `C:\a\b-x` inside `C:\a\b` because its bytes start
+    /// with it, or `C:\a\b\c` outside it, or counting a repeated path twice.
     #[test]
-    fn byte_link_respects_component_boundaries() {
+    fn whole_paths_link_on_component_boundaries() {
         let entry = |path: &str, kind, size| Entry {
             path: PathBuf::from(path),
             kind,
@@ -419,12 +535,12 @@ mod tests {
             entry(r"C:\a\b\c", EntryKind::File, 2),
             entry(r"C:\ab", EntryKind::File, 4),
         ];
-        let catalog = Catalog::build(ScanReport {
-            root: PathBuf::from(r"C:\"),
+        let catalog = Catalog::build(ScanReport::from_entries(
+            PathBuf::from(r"C:\"),
             entries,
-            errors: Vec::new(),
-            backend_used: BackendUsed::Mft,
-        });
+            Vec::new(),
+            BackendUsed::Mft,
+        ));
         let parent = |path: &str| {
             let id = catalog.find(Path::new(path)).unwrap_or_else(|| panic!("{path} missing"));
             catalog.path(catalog.node(id).parent.unwrap())
@@ -433,5 +549,72 @@ mod tests {
         assert_eq!(parent(r"C:\a\b\c"), Path::new(r"C:\a\b"));
         assert_eq!(parent(r"C:\ab"), Path::new(r"C:\"));
         assert_eq!(catalog.node(catalog.root()).subtree_size, 7);
+    }
+
+    fn blob(size: u64) -> Blob {
+        Blob { size, allocated: Some(size), modified: None, accessed: None }
+    }
+
+    /// Regression: a damaged table looping a chain of rows back on itself, or
+    /// naming a parent that does not exist, either hanging the build, panicking,
+    /// or counting those bytes into the tree.
+    #[test]
+    fn orphans_and_cycles_are_dropped_and_counted() {
+        let mut table = ScanTable::new();
+        let file = table.push_blob(blob(10));
+        let lost = table.push_blob(blob(1000));
+        let dir = table.push_node(0, "dir", NO_BLOB, EntryKind::Dir, 0);
+        table.push_node(dir, "kept.bin", file, EntryKind::File, 0);
+        // Rows 3 and 4 name each other; row 5 names a parent past the table;
+        // row 6 names itself.
+        table.push_node(4, "loop-a", NO_BLOB, EntryKind::Dir, 0);
+        table.push_node(3, "loop-b", lost, EntryKind::File, 0);
+        table.push_node(99, "orphan", lost, EntryKind::File, 0);
+        table.push_node(6, "self", lost, EntryKind::File, 0);
+
+        let catalog = Catalog::build(ScanReport {
+            root: PathBuf::from(r"C:\"),
+            table,
+            errors: Vec::new(),
+            backend_used: BackendUsed::Mft,
+        });
+        assert_eq!(catalog.len(), 3, "root, dir, kept.bin");
+        assert_eq!(catalog.node(catalog.root()).subtree_size, 10);
+        assert_eq!(catalog.errors().len(), 1);
+        assert!(catalog.errors()[0].message.starts_with("4 entries"), "{:?}", catalog.errors());
+        assert_eq!(catalog.path(NodeId(2)), Path::new(r"C:\dir\kept.bin"));
+        assert_eq!(catalog.subtree(NodeId(1)), 1..3);
+    }
+
+    /// Regression: a hard-linked file counted once per name in a directory
+    /// total, which inflates every ancestor by its size again for each link.
+    #[test]
+    fn a_hard_link_counts_its_bytes_once_under_its_primary_name() {
+        let mut table = ScanTable::new();
+        let shared = table.push_blob(blob(100));
+        let a = table.push_node(0, "a", NO_BLOB, EntryKind::Dir, 0);
+        let b = table.push_node(0, "b", NO_BLOB, EntryKind::Dir, 0);
+        table.push_node(b, "second.bin", shared, EntryKind::File, EXTRA_LINK);
+        table.push_node(a, "first.bin", shared, EntryKind::File, 0);
+
+        let catalog = Catalog::build(ScanReport {
+            root: PathBuf::from(r"C:\"),
+            table,
+            errors: Vec::new(),
+            backend_used: BackendUsed::Mft,
+        });
+        let first = catalog.find(Path::new(r"C:\a\first.bin")).unwrap();
+        let second = catalog.find(Path::new(r"C:\b\second.bin")).unwrap();
+        assert_eq!(catalog.node(catalog.root()).subtree_size, 100);
+        assert_eq!(catalog.node(catalog.root()).subtree_allocated, 100);
+        assert!(!catalog.node(first).extra_link && catalog.node(second).extra_link);
+        assert_eq!(catalog.node(second).size, 100, "an extra name still shows the size");
+        assert_eq!(catalog.node(catalog.node(second).parent.unwrap()).subtree_size, 0);
+        assert_eq!(catalog.node(first).links, 2);
+        let groups: Vec<LinkGroup> = catalog.link_groups().collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].primary, first);
+        assert!(groups[0].complete);
+        assert_eq!(groups[0].nodes.len(), 2);
     }
 }

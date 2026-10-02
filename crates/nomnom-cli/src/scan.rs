@@ -58,7 +58,7 @@ fn print_children(catalog: &Catalog, id: NodeId, depth: u32, top: usize, prefix:
         let marker = if node.kind == EntryKind::Dir { "/" } else { "" };
         println!(
             "{prefix}{branch}{}{marker}  {}",
-            node.name.to_string_lossy(),
+            catalog.name(child).to_string_lossy(),
             format_size(node.subtree_size, BINARY)
         );
         print_children(catalog, child, depth - 1, top, &format!("{prefix}{carry}"));
@@ -102,7 +102,7 @@ fn tree(catalog: &Catalog, id: NodeId, depth: u32, top: usize) -> TreeNode {
             .collect()
     };
     TreeNode {
-        name: node.name.to_string_lossy().into_owned(),
+        name: catalog.name(id).to_string_lossy().into_owned(),
         path: catalog.path(id).display().to_string(),
         kind: node.kind,
         size: node.size,

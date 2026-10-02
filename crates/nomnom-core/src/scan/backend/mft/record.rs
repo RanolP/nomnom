@@ -6,27 +6,46 @@
 //! attribute value through a `Read + Seek`. On a table of millions of records
 //! that bookkeeping, not the bytes, is the scan. This parser does the update
 //! sequence fixup in place, walks the attribute headers once, and allocates
-//! only the names it returns.
+//! nothing per record: names are decoded onto the end of a caller's buffer.
 //!
 //! Layouts follow <https://flatcap.github.io/linux-ntfs/ntfs/>. Every read is
 //! bounds-checked: a malformed record yields an error or a short attribute
 //! walk, never a panic.
 
+/// One `$FILE_NAME`: its parent and where its UTF-8 text sits in the names
+/// buffer the record was parsed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub parent: u64,
+    pub off: u32,
+    pub len: u32,
+    pub namespace: u8,
+}
+
+impl Link {
+    /// Win32 and Win32+DOS names first, POSIX next, the DOS 8.3 alias last:
+    /// the alias duplicates a long name that is also present, so it is only
+    /// ever a fallback.
+    pub fn rank(&self) -> u8 {
+        match self.namespace {
+            NAMESPACE_POSIX => 1,
+            NAMESPACE_DOS => 2,
+            _ => 0,
+        }
+    }
+}
+
 /// Facts one FILE record contributes. An extension record carries the same
 /// kinds of facts and is merged into its base record after the pass.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Facts {
     pub is_dir: bool,
     /// `(modified, accessed)` in NT ticks, from `$STANDARD_INFORMATION`.
     pub times: Option<(u64, u64)>,
-    /// `(parent record, name)` for every non-DOS `$FILE_NAME`, the Win32 and
-    /// Win32+DOS names first: the first of those is the name a file's bytes
-    /// are counted under when it has several.
-    pub names: Vec<(u64, String)>,
-    /// How many of `names`, from the front, are Win32 or Win32+DOS names.
-    pub win32_names: usize,
-    /// `(parent record, name)` for every DOS-only (8.3) `$FILE_NAME`.
-    pub short_names: Vec<(u64, String)>,
+    /// This record's `$FILE_NAME`s: `links[links_start..links_start + links_len]`
+    /// of the list it was parsed into, in on-disk order.
+    pub links_start: u32,
+    pub links_len: u32,
     /// Logical length of the unnamed `$DATA`, from its first piece.
     pub size: Option<u64>,
     /// Bytes of real clusters behind the unnamed `$DATA`, summed over every
@@ -75,8 +94,9 @@ const NAMESPACE_POSIX: u8 = 0;
 const NAMESPACE_DOS: u8 = 2;
 const REFERENCE_MASK: u64 = (1 << 48) - 1;
 
-/// Parses one record in place (the fixup rewrites the sector tails).
-pub fn parse(record: &mut [u8], cluster: u64) -> Slot {
+/// Parses one record in place (the fixup rewrites the sector tails). Its
+/// names are appended to `names` and `links`, which the returned facts index.
+pub fn parse(record: &mut [u8], cluster: u64, names: &mut String, links: &mut Vec<Link>) -> Slot {
     match &record.get(..4) {
         Some(b"FILE") => {}
         // A slot the table grew into but never formatted.
@@ -92,32 +112,34 @@ pub fn parse(record: &mut [u8], cluster: u64) -> Slot {
     }
     let sequence = u16_at(record, 16).unwrap_or(0);
     let base_ref = u64_at(record, 32).unwrap_or(0);
-    let mut facts = Facts { is_dir: flags & IS_DIR != 0, ..Facts::default() };
+    let links_start = links.len() as u32;
+    let mut facts = Facts { is_dir: flags & IS_DIR != 0, links_start, ..Facts::default() };
     for attr in Attributes::new(record) {
-        collect(&mut facts, &attr, cluster);
+        collect(&mut facts, &attr, cluster, names, links);
     }
+    facts.links_len = links.len() as u32 - links_start;
     match base_ref & REFERENCE_MASK {
         0 => Slot::Base { sequence, facts },
         base => Slot::Extension { base, base_sequence: (base_ref >> 48) as u16, facts },
     }
 }
 
-/// Folds an extension record's facts into its base record's.
-pub fn merge(into: &mut Facts, ext: Facts) {
-    let mut win32 = ext.names;
-    let posix = win32.split_off(ext.win32_names.min(win32.len()));
-    let at = into.win32_names.min(into.names.len());
-    into.win32_names = at + win32.len();
-    into.names.splice(at..at, win32);
-    into.names.extend(posix);
-    into.short_names.extend(ext.short_names);
+/// Folds an extension record's scalar facts into its base record's. Its names
+/// stay where they are; the caller files them under the base.
+pub fn merge(into: &mut Facts, ext: &Facts) {
     into.times = into.times.or(ext.times);
     into.size = into.size.or(ext.size);
     into.allocated = into.allocated.saturating_add(ext.allocated);
     into.reparse = into.reparse.or(ext.reparse);
 }
 
-fn collect(facts: &mut Facts, attr: &Attr<'_>, cluster: u64) {
+fn collect(
+    facts: &mut Facts,
+    attr: &Attr<'_>,
+    cluster: u64,
+    names: &mut String,
+    links: &mut Vec<Link>,
+) {
     match attr.ty {
         ATTR_STANDARD_INFORMATION => {
             // 48 bytes is the shortest `$STANDARD_INFORMATION` NTFS writes.
@@ -133,18 +155,14 @@ fn collect(facts: &mut Facts, attr: &Attr<'_>, cluster: u64) {
             };
             let Some(raw) = v.get(66..66 + 2 * len as usize) else { return };
             let units = raw.chunks_exact(2).map(|u| u16::from_le_bytes([u[0], u[1]]));
-            let name: String = char::decode_utf16(units)
-                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect();
-            let entry = (parent & REFERENCE_MASK, name);
-            match namespace {
-                NAMESPACE_DOS => facts.short_names.push(entry),
-                NAMESPACE_POSIX => facts.names.push(entry),
-                _ => {
-                    facts.names.insert(facts.win32_names, entry);
-                    facts.win32_names += 1;
-                }
-            }
+            // A buffer past 4 GiB cannot be indexed by a link; such a name
+            // reads back empty rather than as some other name.
+            let Ok(off) = u32::try_from(names.len()) else { return };
+            names.extend(
+                char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+            );
+            let len = (names.len() - off as usize) as u32;
+            links.push(Link { parent: parent & REFERENCE_MASK, off, len, namespace });
         }
         ATTR_DATA if attr.name_len == 0 => {
             if let Some(v) = attr.resident_value() {

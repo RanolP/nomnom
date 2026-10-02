@@ -3,8 +3,8 @@
 //! Every test here runs on an ordinary unelevated machine. The parts that need
 //! a raw volume handle — the enumeration itself — cannot be proven without
 //! Administrator, so what is pinned instead is everything that decides whether
-//! the enumeration would be correct: the alignment arithmetic under the reader,
-//! and the parent-chasing loop that rebuilds paths. The spelling of the paths
+//! the enumeration would be correct: the alignment arithmetic under the reader
+//! and the spelling of the drive root. The spelling of the paths
 //! that come out and the failure reported when the volume is closed to us run
 //! a folder through the dispatcher, so they live in the crate's own tests
 //! (`scan::backend::tests`), out of reach of the drive-only public scan.
@@ -13,12 +13,9 @@
 // that has an MFT to read.
 #![cfg(windows)]
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
 
-use nomnom_core::scan::backend::mft::paths::{DirRecord, PathBuilder, ROOT_RECORD, respell_under};
 use nomnom_core::scan::backend::mft::{strip_verbatim, volume};
 use nomnom_core::scan::elevated::scan_elevated;
 use nomnom_core::scan::{BackendUsed, ScanOptions, VolumeRoot};
@@ -110,61 +107,8 @@ fn aligned_reader_survives_seeking_backwards_between_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// Path reconstruction
+// Root spelling
 // ---------------------------------------------------------------------------
-
-fn dir_map(entries: &[(u64, &str, u64)]) -> HashMap<u64, DirRecord> {
-    entries
-        .iter()
-        .map(|(number, name, parent)| {
-            (*number, DirRecord { name: (*name).to_string(), parent: *parent })
-        })
-        .collect()
-}
-
-/// Regression: the parent-chasing loop losing a level, hanging on a cycle, or
-/// inventing a path for a record whose parent is not in the table.
-#[test]
-fn parent_chasing_resolves_deep_chains_and_refuses_broken_ones() {
-    let dirs = dir_map(&[
-        (20, "Users", ROOT_RECORD),
-        (21, "ranolp", 20),
-        (22, "Projects", 21),
-        (23, "nomnom", 22),
-        // Parent 900 is not in the table: a record whose chain dead-ends.
-        (40, "orphan", 900),
-        // A two-record cycle, which a naive loop would follow forever.
-        (50, "loop-a", 51),
-        (51, "loop-b", 50),
-    ]);
-    let mut builder = PathBuilder::new(&dirs, PathBuf::from("C:\\"), ROOT_RECORD);
-
-    assert_eq!(builder.dir_path(ROOT_RECORD), Some(PathBuf::from("C:\\")));
-    assert_eq!(builder.dir_path(20), Some(PathBuf::from("C:\\Users")));
-    assert_eq!(builder.dir_path(23), Some(PathBuf::from("C:\\Users\\ranolp\\Projects\\nomnom")));
-    assert_eq!(
-        builder.child_path(23, "Cargo.toml"),
-        Some(PathBuf::from("C:\\Users\\ranolp\\Projects\\nomnom\\Cargo.toml"))
-    );
-
-    assert_eq!(builder.dir_path(40), None, "a missing parent must not produce a path");
-    assert_eq!(builder.child_path(40, "x.txt"), None);
-    assert_eq!(builder.dir_path(50), None, "a cycle must terminate, not hang");
-}
-
-/// Regression: the directory cache being bypassed, turning path reconstruction
-/// quadratic — the exact cost the MFT backend exists to avoid.
-#[test]
-fn resolved_directories_are_cached_once_each() {
-    let dirs = dir_map(&[(20, "a", ROOT_RECORD), (21, "b", 20), (22, "c", 21)]);
-    let mut builder = PathBuilder::new(&dirs, PathBuf::from("C:\\"), ROOT_RECORD);
-
-    for i in 0..1000 {
-        assert!(builder.child_path(22, &format!("file{i}.bin")).is_some());
-    }
-    // Three directories walked, three cache entries — not one per file.
-    assert_eq!(builder.cached_len(), 3);
-}
 
 /// Regression: emitting the extended-length `\\?\C:\...` spelling that
 /// `fs::canonicalize` returns. `Catalog::build` re-attaches children to parents
@@ -183,32 +127,6 @@ fn canonical_roots_are_stripped_back_to_plain_drive_paths() {
     let text = plain.as_os_str().to_string_lossy().into_owned();
     assert!(!text.starts_with("\\\\?\\"), "verbatim prefix survived: {text}");
     assert_eq!(plain, dir.path());
-}
-
-/// Regression: the subtree filter admitting a sibling whose path merely starts
-/// with the same characters, or rejecting the scan root itself.
-#[test]
-fn subtree_filter_keeps_the_root_and_rejects_near_misses() {
-    let root_canon = Path::new("C:\\Users\\ranolp\\Projects");
-    let spelling = Path::new("C:\\Users\\ranolp\\projects");
-
-    assert_eq!(
-        respell_under(root_canon, root_canon, spelling),
-        Some(spelling.to_path_buf()),
-        "the scan root must be emitted, as the walk backend emits it"
-    );
-    assert_eq!(
-        respell_under(Path::new("C:\\Users\\ranolp\\PROJECTS\\nomnom"), root_canon, spelling),
-        Some(spelling.join("nomnom")),
-        "NTFS is case-insensitive, but the caller's spelling of the root must win"
-    );
-    assert_eq!(
-        respell_under(Path::new("C:\\Users\\ranolp\\Projects2\\x"), root_canon, spelling),
-        None,
-        "a sibling sharing a character prefix is not inside the root"
-    );
-    assert_eq!(respell_under(Path::new("C:\\Users\\ranolp"), root_canon, spelling), None);
-    assert_eq!(respell_under(Path::new("D:\\Users\\ranolp\\Projects"), root_canon, spelling), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,9 +151,8 @@ fn real_volume_enumeration_produces_paths_that_exist() {
     let root = root.as_path();
 
     assert_eq!(report.backend_used, BackendUsed::Mft);
-    assert!(!report.entries.is_empty());
-    for entry in report.entries.iter().take(200) {
-        assert!(entry.path.starts_with(root), "{} escaped the root", entry.path.display());
-        assert!(entry.path.symlink_metadata().is_ok(), "{} does not exist", entry.path.display());
+    assert!(report.table.nodes.len() > 1);
+    for path in report.table.paths(root).into_iter().flatten().take(200) {
+        assert!(path.symlink_metadata().is_ok(), "{} does not exist", path.display());
     }
 }

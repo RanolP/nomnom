@@ -186,6 +186,7 @@ mod tests {
                 provenance: Provenance::new("p", "r"),
                 capped: None,
             },
+            reach: None,
         }
     }
 
@@ -194,6 +195,7 @@ mod tests {
             root: root.to_path_buf(),
             groups: vec![Group { label: Label::CACHE, bytes: entries.len() as u64, entries }],
             reclaimable_bytes: 0,
+            shared: Vec::new(),
         }
     }
 

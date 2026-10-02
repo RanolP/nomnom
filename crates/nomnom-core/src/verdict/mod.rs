@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::catalog::{Catalog, NodeId};
 
-pub use assess::{Assessment, Entry, Group, assess};
+pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, charges};
 pub use builtin::builtin_pack;
 pub use dsl::{DslJudge, TrustedPack};
 pub use packs::{
@@ -247,18 +247,18 @@ pub fn rollup(ctx: &Catalog, verdicts: &[(NodeId, Verdict)]) -> Rollup {
     let mut out = Rollup::default();
     for (id, verdict) in verdicts {
         if verdict.disposition == Disposition::Reclaimable {
-            out.reclaimable_bytes += ctx.node(*id).subtree_size;
+            out.reclaimable_bytes += ctx.node(*id).rolled_size();
         }
         out.by_label.entry(verdict.label.clone()).or_default().push(*id);
     }
     out
 }
 
-/// The node's own file-name component. The root stores its full path as its
-/// name, so a plain `OsString` compare would never match there.
+/// The node's own file-name component. The root's name is its full path, so
+/// a plain compare would never match there.
 fn node_name(ctx: &Catalog, id: NodeId) -> String {
-    let name = &ctx.node(id).name;
-    Path::new(name).file_name().unwrap_or(name.as_os_str()).to_string_lossy().into_owned()
+    let name = ctx.name(id);
+    Path::new(name).file_name().unwrap_or(name).to_string_lossy().into_owned()
 }
 
 /// NTFS and the Windows API are case-insensitive, so `Node_Modules` is the

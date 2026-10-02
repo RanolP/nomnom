@@ -90,6 +90,7 @@ mod tests {
                 provenance: Provenance::new("p", "r"),
                 capped: None,
             },
+            reach: None,
         }
     }
 
@@ -119,6 +120,7 @@ mod tests {
             root: root.clone(),
             groups: vec![Group { label: Label::CACHE, bytes: 3, entries }],
             reclaimable_bytes: 1,
+            shared: Vec::new(),
         };
 
         let (plan, refused) = plan_from(&assessment, &HashSet::new(), true).unwrap();
