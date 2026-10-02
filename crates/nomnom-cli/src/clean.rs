@@ -10,15 +10,12 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use humansize::{BINARY, format_size};
 use nomnom_core::action::{
-    Action, ApplyOptions, Journal, Justification, Plan, RecordStatus, TrashPolicy,
-    default_journal_dir,
+    Action, ApplyOptions, Journal, Plan, RecordStatus, plain, plan_from, trash_policy,
 };
-use nomnom_core::verdict::Disposition;
+use nomnom_core::verdict::assess;
 use serde::Serialize;
 
 use crate::input::{self, BackendArg};
-use crate::paths::plain;
-use crate::suggest;
 
 pub struct Request<'a> {
     pub path: &'a Path,
@@ -38,39 +35,13 @@ pub fn run(request: Request<'_>) -> Result<ExitCode> {
     input::warn_backend(&catalog);
     input::report_errors(&catalog, request.show_errors);
 
-    let root = catalog.path(catalog.root());
-    let mut plan =
-        Plan::new(&root).with_context(|| format!("cannot anchor a plan at {}", root.display()))?;
-
-    let assessment = suggest::assess(&catalog, packs);
-    let mut candidates: Vec<(String, u64, Justification)> = assessment
-        .groups
-        .into_iter()
-        .flat_map(|group| group.entries)
-        .filter(|entry| included(entry.verdict.disposition, request.include_review))
-        .map(|entry| {
-            let verdict = entry.verdict;
-            (
-                entry.path,
-                entry.bytes,
-                Justification::new(
-                    verdict.reason,
-                    verdict.provenance.pack,
-                    verdict.provenance.rule,
-                ),
-            )
-        })
-        .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    for (path, bytes, justification) in candidates {
-        // A guard refusal is information, not a stop: the other actions are
-        // still sound, and the user can act on the named path.
-        if let Err(error) =
-            plan.push(Action::Trash { path: PathBuf::from(&path) }, bytes, justification)
-        {
-            eprintln!("skipping {path}: {error}");
-        }
+    let assessment = assess(&catalog, packs);
+    let (plan, refused) = plan_from(&assessment, None, request.include_review)
+        .with_context(|| format!("cannot anchor a plan at {}", assessment.root.display()))?;
+    // A guard refusal is information, not a stop: the other actions are still
+    // sound, and the user can act on the named path.
+    for (path, error) in refused {
+        eprintln!("skipping {}: {error}", path.display());
     }
 
     if request.apply {
@@ -81,37 +52,6 @@ pub fn run(request: Request<'_>) -> Result<ExitCode> {
     }
 
     report_plan(&plan, request.include_review, request.json)
-}
-
-fn included(disposition: Disposition, include_review: bool) -> bool {
-    match disposition {
-        Disposition::Reclaimable => true,
-        Disposition::Review => include_review,
-        Disposition::Keep => false,
-    }
-}
-
-/// `Recycle` is undoable on Windows and on Freedesktop systems and keeps the
-/// user's own recycle bin as the safety net they already know. On macOS the
-/// `trash` crate compiles its restore path out entirely, so a recycled item
-/// could never be undone there and `Stage` — a plain rename — is the default
-/// instead.
-fn trash_policy(stage: Option<PathBuf>) -> TrashPolicy {
-    match stage {
-        Some(dir) => TrashPolicy::Stage { dir },
-        None if cfg!(target_os = "macos") => TrashPolicy::Stage { dir: default_stage_dir() },
-        None => TrashPolicy::Recycle,
-    }
-}
-
-fn default_stage_dir() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    default_journal_dir()
-        .with_file_name("staged")
-        .join(format!("stage-{stamp}-{}", std::process::id()))
 }
 
 fn report_plan(plan: &Plan, include_review: bool, json: bool) -> Result<ExitCode> {

@@ -17,7 +17,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use nomnom_pack::{Lock, LockedPack, PackSource, Resolver, Store, Tier, Trust};
+use nomnom_core::verdict::{KnownPack, PackRow, find_pack, pack_inventory};
+use nomnom_pack::{Lock, LockedPack, Store, Tier, Trust};
 use serde::Serialize;
 
 #[derive(Debug, Subcommand)]
@@ -121,11 +122,7 @@ fn add(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
 }
 
 fn list(root: &Path, explicit: &[PathBuf], json: bool) -> Result<ExitCode> {
-    let lock = Lock::load(root)?;
-    let mut rows = vec![Row::builtin()];
-    for source in resolve(root, explicit, &lock)? {
-        rows.push(Row::resolved(&source, lock.get(&source.name)));
-    }
+    let rows: Vec<Row> = pack_inventory(root, explicit)?.into_iter().map(Row::from).collect();
 
     if json {
         print_json(&ListOutput { lock: &lock_path(root), packs: &rows })?;
@@ -161,7 +158,7 @@ fn set_trust(
     json: bool,
 ) -> Result<ExitCode> {
     let mut lock = Lock::load(root)?;
-    let known = find(root, name, explicit, &lock)?;
+    let known = Known::from(find_pack(root, name, explicit, &lock)?);
 
     if !json {
         if trusted {
@@ -229,54 +226,18 @@ fn remove(root: &Path, name: &str, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn resolve(root: &Path, explicit: &[PathBuf], lock: &Lock) -> Result<Vec<PackSource>> {
-    let store = Store::open()?;
-    Ok(Resolver::new(store, root).with_explicit(explicit.iter().cloned()).resolve(lock)?)
-}
-
-/// The pack a name refers to, as a row a human can be shown.
-///
-/// A pack can be known to the lock, or be a directory the lock has never
-/// mentioned, or be neither — and the third case is a typo, which must not
-/// silently create a trust row for a pack that does not exist.
-fn find(root: &Path, name: &str, explicit: &[PathBuf], lock: &Lock) -> Result<Known> {
-    if let Some(locked) = lock.get(name)
-        && locked.git().is_some()
-    {
-        let dir = nomnom_pack::materialize(&Store::open()?, locked)?;
-        return Ok(Known {
-            name: name.to_string(),
-            url: locked.url.clone(),
-            sha: locked.sha.clone(),
-            dir: dir.display().to_string(),
-        });
-    }
-    let sources = resolve(root, explicit, lock)?;
-    match sources.iter().find(|source| source.name == name) {
-        Some(source) => Ok(Known {
-            name: name.to_string(),
-            url: None,
-            sha: None,
-            dir: source.dir.display().to_string(),
-        }),
-        None => {
-            let known: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
-            Err(anyhow::anyhow!(
-                "no pack named `{name}` resolves for this project\n  \
-                 resolved packs: {}\n  \
-                 `nomnom pack list` shows them with their tiers",
-                if known.is_empty() { "(none)".to_string() } else { known.join(", ") }
-            ))
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct Known {
     name: String,
     url: Option<String>,
     sha: Option<String>,
     dir: String,
+}
+
+impl From<KnownPack> for Known {
+    fn from(pack: KnownPack) -> Self {
+        Known { name: pack.name, url: pack.url, sha: pack.sha, dir: pack.dir.display().to_string() }
+    }
 }
 
 impl Known {
@@ -299,34 +260,24 @@ struct Row {
     dir: String,
 }
 
-impl Row {
-    fn builtin() -> Row {
+impl From<PackRow> for Row {
+    fn from(pack: PackRow) -> Row {
         Row {
-            name: nomnom_core::verdict::builtin_pack().name.clone(),
-            tier: "built-in",
-            trust: "built-in",
-            sha: None,
-            url: None,
-            dir: "<built-in>".to_string(),
-        }
-    }
-
-    fn resolved(source: &PackSource, locked: Option<&LockedPack>) -> Row {
-        Row {
-            name: source.name.clone(),
-            tier: match source.tier {
-                Tier::User => "user",
-                Tier::Project => "project",
-                Tier::Explicit => "explicit",
+            name: pack.name,
+            tier: match pack.tier {
+                None => "built-in",
+                Some(Tier::User) => "user",
+                Some(Tier::Project) => "project",
+                Some(Tier::Explicit) => "explicit",
             },
-            trust: match source.trust {
+            trust: match pack.trust {
                 Trust::Builtin => "built-in",
                 Trust::Trusted => "trusted",
                 Trust::Untrusted => UNTRUSTED,
             },
-            sha: locked.and_then(|pack| pack.sha.clone()),
-            url: locked.and_then(|pack| pack.url.clone()),
-            dir: source.dir.display().to_string(),
+            sha: pack.sha,
+            url: pack.url,
+            dir: pack.dir.map_or_else(|| "<built-in>".to_string(), |dir| dir.display().to_string()),
         }
     }
 }

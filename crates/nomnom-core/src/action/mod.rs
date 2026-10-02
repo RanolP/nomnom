@@ -15,9 +15,12 @@
 //!   also arrive by deserialization.
 //!
 //! A plan holds paths, not verdicts: the `verdict` domain decides what should
-//! go, a front-end joins the two, and this domain stays testable without it.
+//! go, and [`plan_from`] is the one place the two are joined, so the plan and
+//! its guards stay testable without a judge.
 
 mod apply;
+mod candidates;
+mod display;
 mod journal;
 mod plan;
 
@@ -25,11 +28,13 @@ use std::path::PathBuf;
 
 pub use apply::{
     ApplyOptions, RestoredRecord, SkippedRecord, TrashPolicy, UndoConflict, UndoFailure,
-    UndoReport, apply, undo,
+    UndoReport, apply, default_stage_dir, trash_policy, undo,
 };
+pub use candidates::plan_from;
+pub use display::plain;
 pub use journal::{
-    ActionKind, FORMAT_VERSION, Journal, JournalRecord, RecordStatus, TrashHandle,
-    default_journal_dir, default_journal_path,
+    ActionKind, FORMAT_VERSION, Journal, JournalEntry, JournalRecord, JournalSummary, RecordStatus,
+    TrashHandle, default_journal_dir, default_journal_path, list_journals, list_journals_in,
 };
 pub use plan::{Action, Justification, Plan, PlanEntry};
 

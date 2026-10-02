@@ -7,6 +7,7 @@
 //! Nothing else in the codebase needs to know which one answered, which is the
 //! point: the ladder costs one trait and one mandatory field.
 
+mod assess;
 mod builtin;
 mod dsl;
 mod duplicate;
@@ -21,9 +22,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::catalog::{Catalog, NodeId};
 
+pub use assess::{Assessment, Entry, Group, assess};
 pub use builtin::builtin_pack;
 pub use dsl::{DslJudge, TrustedPack};
-pub use packs::resolve_packs;
+pub use packs::{
+    KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
+};
 
 /// Answers "what is this path, and should it go?" for one node.
 ///

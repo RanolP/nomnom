@@ -5,8 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use humansize::{BINARY, format_size};
-
-use crate::paths::plain;
+use nomnom_core::action::plain;
 
 pub fn run(journal: &Path, json: bool) -> Result<ExitCode> {
     let report = nomnom_core::action::undo(journal)

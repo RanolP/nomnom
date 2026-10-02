@@ -4,7 +4,6 @@
 mod clean;
 mod input;
 mod pack;
-mod paths;
 mod scan;
 mod suggest;
 mod undo;

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ActionError;
 use super::journal::{
-    ActionKind, Journal, JournalRecord, RecordStatus, TrashHandle, default_journal_path, now_unix,
+    ActionKind, Journal, JournalRecord, RecordStatus, TrashHandle, default_journal_dir,
+    default_journal_path, now_unix,
 };
 use super::plan::{Action, Plan};
 
@@ -34,6 +35,30 @@ pub enum TrashPolicy {
     Stage {
         dir: PathBuf,
     },
+}
+
+/// The policy a front-end should default to, given an optional `--stage` dir.
+///
+/// `Recycle` is undoable on Windows and on Freedesktop systems and keeps the
+/// user's own recycle bin as the safety net they already know. On macOS the
+/// `trash` crate compiles its restore path out entirely, so a recycled item
+/// could never be undone there and `Stage` — a plain rename — is the default
+/// instead.
+pub fn trash_policy(stage: Option<PathBuf>) -> TrashPolicy {
+    match stage {
+        Some(dir) => TrashPolicy::Stage { dir },
+        None if cfg!(target_os = "macos") => TrashPolicy::Stage { dir: default_stage_dir() },
+        None => TrashPolicy::Recycle,
+    }
+}
+
+/// A fresh staging directory beside the journals, unique per second and pid.
+pub fn default_stage_dir() -> PathBuf {
+    default_journal_dir().with_file_name("staged").join(format!(
+        "stage-{}-{}",
+        now_unix(),
+        std::process::id()
+    ))
 }
 
 #[derive(Debug, Clone, Default)]

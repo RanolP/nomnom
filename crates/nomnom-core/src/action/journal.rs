@@ -226,3 +226,113 @@ pub fn default_journal_path() -> PathBuf {
 pub(super) fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
+
+/// One journal file, as an undo listing shows it.
+#[derive(Debug)]
+pub struct JournalEntry {
+    pub path: PathBuf,
+    /// Unix seconds the apply began, or the file's modification time when the
+    /// journal cannot be read.
+    pub started_at: u64,
+    /// `Err` for a journal this version cannot read. It is still listed: a
+    /// journal that silently vanished from the list would be an apply nobody
+    /// could find to undo.
+    pub summary: Result<JournalSummary, ActionError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalSummary {
+    /// The clean root the apply was fenced to.
+    pub root: PathBuf,
+    pub actions: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub undone: usize,
+    pub bytes_reclaimed: u64,
+}
+
+impl From<&Journal> for JournalSummary {
+    fn from(journal: &Journal) -> Self {
+        let count = |pred: fn(&RecordStatus) -> bool| {
+            journal.records.iter().filter(|r| pred(&r.status)).count()
+        };
+        Self {
+            root: journal.root.clone(),
+            actions: journal.records.len(),
+            succeeded: count(|s| matches!(s, RecordStatus::Succeeded)),
+            failed: count(|s| matches!(s, RecordStatus::Failed { .. })),
+            undone: count(|s| matches!(s, RecordStatus::Undone)),
+            bytes_reclaimed: journal.bytes_reclaimed(),
+        }
+    }
+}
+
+/// Every journal in [`default_journal_dir`], newest first.
+pub fn list_journals() -> Result<Vec<JournalEntry>, ActionError> {
+    list_journals_in(&default_journal_dir())
+}
+
+/// Every `*.json` journal in `dir`, newest first. A directory that does not
+/// exist yet means no apply has run, which is an empty list rather than an
+/// error.
+pub fn list_journals_in(dir: &Path) -> Result<Vec<JournalEntry>, ActionError> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(ActionError::Io(e)),
+    };
+    let mut out = Vec::new();
+    for dirent in read_dir {
+        let path = dirent.map_err(ActionError::Io)?.path();
+        if path.extension().is_none_or(|ext| ext != "json") || !path.is_file() {
+            continue;
+        }
+        let (started_at, summary) = match Journal::read(&path) {
+            Ok(journal) => (journal.started_at, Ok(JournalSummary::from(&journal))),
+            Err(error) => (modified_unix(&path), Err(error)),
+        };
+        out.push(JournalEntry { path, started_at, summary });
+    }
+    out.sort_by(|a, b| b.started_at.cmp(&a.started_at).then_with(|| b.path.cmp(&a.path)));
+    Ok(out)
+}
+
+fn modified_unix(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Catches an undo listing in the wrong order, and an unreadable journal
+    // vanishing from it instead of showing up as an error.
+    #[test]
+    fn lists_newest_first_and_keeps_unreadable_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        for started_at in [100, 300] {
+            let mut journal = Journal::new(
+                PathBuf::from("/root"),
+                dir.path().join(format!("apply-{started_at}.json")),
+            );
+            journal.started_at = started_at;
+            journal.flush().unwrap();
+        }
+        fs::write(dir.path().join("broken.json"), b"{").unwrap();
+        fs::write(dir.path().join("apply-1.json.tmp"), b"{").unwrap();
+
+        let listed = list_journals_in(dir.path()).unwrap();
+        let names: Vec<_> =
+            listed.iter().map(|e| e.path.file_name().unwrap().to_string_lossy()).collect();
+        // The broken file falls back to its mtime, which is "now".
+        assert_eq!(names, ["broken.json", "apply-300.json", "apply-100.json"]);
+        assert!(listed[0].summary.is_err());
+        assert_eq!(listed[1].summary.as_ref().unwrap().actions, 0);
+
+        assert!(list_journals_in(&dir.path().join("missing")).unwrap().is_empty());
+    }
+}

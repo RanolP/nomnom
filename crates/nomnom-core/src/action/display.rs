@@ -14,3 +14,14 @@ pub fn plain(path: &Path) -> String {
         None => text,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Catches the verbatim prefix leaking into the plan a human approves on.
+    #[test]
+    fn strips_only_the_verbatim_prefix() {
+        use std::path::Path;
+        assert_eq!(super::plain(Path::new(r"\\?\C:\a\b")), r"C:\a\b");
+        assert_eq!(super::plain(Path::new(r"C:\a\b")), r"C:\a\b");
+    }
+}
