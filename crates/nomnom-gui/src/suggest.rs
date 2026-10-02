@@ -8,8 +8,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui_kit::component::alert::Alert;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use nomnom_core::verdict::{Assessment, Disposition};
@@ -60,31 +62,63 @@ pub fn label_name(label: &nomnom_core::verdict::Label) -> String {
     label.as_str().replace('-', " ")
 }
 
-/// Shared by Suggest and Clean: the "nothing yet" states of a screen that
-/// needs an assessment.
-pub fn waiting_for_assessment(session: &Session, cx: &App) -> Option<AnyElement> {
-    if let Some(error) = session.scan_error.as_ref().or(session.assess_error.as_ref()) {
+/// Shared by Suggest and Clean: the states of a screen that needs an
+/// assessment before it has one, including the Analyze button that starts it.
+/// Scans never judge on their own, because judging a whole drive hashes every
+/// duplicate candidate.
+pub fn waiting_for_assessment(session: &Entity<Session>, cx: &App) -> Option<AnyElement> {
+    let state = session.read(cx);
+    if let Some(error) = &state.scan_error {
         return Some(
-            v_flex().p_4().child(Alert::error("assess-error", error.clone())).into_any_element(),
+            v_flex().p_4().child(Alert::error("scan-error", error.clone())).into_any_element(),
         );
     }
-    if session.assessment.is_some() {
+    if state.assessment.is_some() {
         return None;
     }
-    let message = match session.busy {
-        Some(Phase::Scanning | Phase::Assessing) => "Waiting for the scan to finish…",
-        _ if session.root.is_none() => "Choose a folder to scan.",
-        _ => "No assessment yet.",
+    let muted = cx.theme().muted_foreground;
+    let panel = v_flex().p_4().gap_3().max_w(px(640.));
+    let panel = match state.busy {
+        Some(Phase::Assessing) => panel.child(
+            h_flex()
+                .gap_2()
+                .child(Spinner::new().small())
+                .child(Phase::Assessing.label())
+                .child(div().text_color(muted).child("Duplicate hashing can take minutes.")),
+        ),
+        Some(Phase::Scanning) => panel.text_color(muted).child("Waiting for the scan to finish…"),
+        _ if state.scan.is_none() => panel.text_color(muted).child("Scan a drive first."),
+        busy => {
+            let session = session.clone();
+            panel
+                .when_some(state.assess_error.clone(), |panel, error| {
+                    panel.child(Alert::error("assess-error", error))
+                })
+                .child(div().text_color(muted).child(
+                    "Suggest and Clean need an analysis: every path is judged against the rule \
+                     packs, and files of equal size are hashed to find duplicates. On a whole \
+                     drive this can take several minutes.",
+                ))
+                .child(
+                    Button::new("analyze")
+                        .primary()
+                        .label("Analyze")
+                        .disabled(busy.is_some())
+                        .on_click(move |_, _, cx| {
+                            session.update(cx, |session, cx| session.assess(cx))
+                        }),
+                )
+        }
     };
-    Some(v_flex().p_4().text_color(cx.theme().muted_foreground).child(message).into_any_element())
+    Some(panel.into_any_element())
 }
 
 impl Render for SuggestScreen {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = self.session.read(cx);
-        if let Some(waiting) = waiting_for_assessment(session, cx) {
+        if let Some(waiting) = waiting_for_assessment(&self.session, cx) {
             return waiting;
         }
+        let session = self.session.read(cx);
         let assessment = session.assessment.clone().expect("checked above");
         if assessment.groups.is_empty() {
             return v_flex()

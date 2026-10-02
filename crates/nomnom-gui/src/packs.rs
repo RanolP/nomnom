@@ -16,6 +16,7 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use nomnom_core::action::plain;
 use nomnom_core::verdict::{KnownPack, PackRow, find_pack, pack_inventory};
 use nomnom_pack::{Lock, Store, Tier, Trust};
 
@@ -47,6 +48,92 @@ impl PacksScreen {
         self.session.read(cx).root.clone()
     }
 
+    fn explicit(&self, cx: &App) -> Vec<PathBuf> {
+        self.session.read(cx).explicit_packs.clone()
+    }
+
+    /// The CLI's repeatable `--pack DIR`. The list lives on the session, so
+    /// Suggest and Clean judge with the same packs this table shows.
+    fn add_pack_dir(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Load this pack directory".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let chosen = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => {
+                    let message = format!("cannot open the folder picker: {error}");
+                    eprintln!("nomnom-gui: {message}");
+                    let _ = this.update(cx, |this, cx| {
+                        this.status = Some(Err(message));
+                        cx.notify();
+                    });
+                    None
+                }
+            };
+            if let Some(dir) = chosen {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_explicit(|dirs| dirs.push(dir), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_explicit(&mut self, change: impl FnOnce(&mut Vec<PathBuf>), cx: &mut Context<Self>) {
+        self.session.update(cx, |session, cx| {
+            change(&mut session.explicit_packs);
+            session.reassess(cx);
+        });
+        self.pending_trust = None;
+        self.reload(cx);
+    }
+
+    fn render_explicit(&self, busy: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let dirs = self.explicit(cx);
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().text_sm().font_weight(FontWeight::SEMIBOLD).child(
+                        "Pack directories — loaded last, a later one overriding an earlier one",
+                    ))
+                    .child(
+                        Button::new("add-pack-dir")
+                            .small()
+                            .outline()
+                            .label("Add pack directory…")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_pack_dir(cx))),
+                    ),
+            )
+            .when(dirs.is_empty(), |col| {
+                col.child(div().text_xs().text_color(muted).child("None loaded."))
+            })
+            .children(dirs.into_iter().enumerate().map(|(ix, dir)| {
+                h_flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(plain(&dir)))
+                    .child(
+                        Button::new(("remove-pack-dir", ix))
+                            .small()
+                            .ghost()
+                            .label("Remove")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_explicit(|dirs| drop(dirs.remove(ix)), cx)
+                            })),
+                    )
+            }))
+    }
+
     fn reload_if_root_changed(&mut self, cx: &mut Context<Self>) {
         let root = self.root(cx);
         if root != self.loaded_for {
@@ -63,11 +150,12 @@ impl PacksScreen {
             cx.notify();
             return;
         };
+        let explicit = self.explicit(cx);
         cx.spawn(async move |this, cx| {
             let pack_root = root.clone();
             let rows = cx
                 .background_executor()
-                .spawn(async move { pack_inventory(&pack_root, &[]) })
+                .spawn(async move { pack_inventory(&pack_root, &explicit) })
                 .await
                 .map_err(|error| {
                     let message = format!("cannot list packs for {}: {error}", root.display());
@@ -86,7 +174,7 @@ impl PacksScreen {
     }
 
     /// Run one lock mutation in the background under the Packs phase, then
-    /// reload the table and re-judge the catalog.
+    /// reload the table and re-judge an analyzed catalog.
     fn run(
         &mut self,
         what: String,
@@ -115,7 +203,7 @@ impl PacksScreen {
             });
             session.update(cx, |session, cx| {
                 session.end(cx);
-                session.assess(cx);
+                session.reassess(cx);
             });
         })
         .detach();
@@ -204,6 +292,7 @@ impl PacksScreen {
     /// grant waits in `pending_trust` for a second click.
     fn ask_trust(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(root) = self.loaded_for.clone() else { return };
+        let explicit = self.explicit(cx);
         let session = self.session.clone();
         if !session.update(cx, |session, cx| session.begin(Phase::Packs, cx)) {
             return;
@@ -216,7 +305,8 @@ impl PacksScreen {
                 .background_executor()
                 .spawn(async move {
                     let lock = Lock::load(&lookup_root).map_err(|e| e.to_string())?;
-                    find_pack(&lookup_root, &lookup_name, &[], &lock).map_err(|e| e.to_string())
+                    find_pack(&lookup_root, &lookup_name, &explicit, &lock)
+                        .map_err(|e| e.to_string())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -303,7 +393,7 @@ impl Render for PacksScreen {
             return v_flex()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Choose a folder: packs are pinned in its .nomnom/packs.lock.")
+                .child("Scan a drive first: its packs are pinned in its .nomnom\\packs.lock.")
                 .into_any_element();
         };
         let busy = self.session.read(cx).busy;
@@ -428,6 +518,7 @@ impl Render for PacksScreen {
                     .child(format!("Lock: {}", Lock::path_in(&root).display())),
             )
             .child(add_row)
+            .child(self.render_explicit(busy.is_some(), cx))
             .children(self.render_pending_trust(cx))
             .children(self.status.as_ref().map(|status| match status {
                 Ok(message) => Alert::success("pack-status", message.clone()).into_any_element(),

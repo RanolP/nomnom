@@ -15,6 +15,7 @@ nomnom-core.workspace = true
 nomnom-pack.workspace = true
 gpui-kit.workspace = true
 humansize.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -38,8 +38,12 @@ struct Outcome {
 pub struct CleanScreen {
     session: Entity<Session>,
     selection: Selection,
+    /// The CLI's `--stage DIR`: trashed paths move here instead of the
+    /// recycle bin.
+    stage: Option<PathBuf>,
     preview: Option<Result<Rc<Preview>, String>>,
     outcome: Option<Result<Outcome, String>>,
+    picker_error: Option<String>,
 }
 
 impl CleanScreen {
@@ -52,8 +56,14 @@ impl CleanScreen {
             this.refresh_preview(cx);
         })
         .detach();
-        let mut this =
-            Self { session, selection: Selection::default(), preview: None, outcome: None };
+        let mut this = Self {
+            session,
+            selection: Selection::default(),
+            stage: None,
+            preview: None,
+            outcome: None,
+            picker_error: None,
+        };
         this.refresh_preview(cx);
         this
     }
@@ -86,7 +96,7 @@ impl CleanScreen {
         if preview.plan.is_empty() {
             return;
         }
-        let policy = trash_policy(None);
+        let policy = trash_policy(self.stage.clone());
         let body = format!(
             "{} paths, {} in total, will be {}.\n\nA journal is written before anything moves; \
              the Undo screen can reverse this apply from it.",
@@ -112,6 +122,77 @@ impl CleanScreen {
                     true
                 })
         });
+    }
+
+    fn choose_stage(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Stage trashed paths here".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next().map(Ok),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => Some(Err(format!("cannot open the folder picker: {error}"))),
+            };
+            let _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Some(Ok(dir)) => {
+                        this.stage = Some(dir);
+                        this.picker_error = None;
+                    }
+                    Some(Err(message)) => {
+                        eprintln!("nomnom-gui: {message}");
+                        this.picker_error = Some(message);
+                    }
+                    None => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_stage(&self, busy: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let target = match &self.stage {
+            Some(dir) => format!("Trashed paths move into {}", plain(dir)),
+            None => "Trashed paths go to the recycle bin".to_string(),
+        };
+        h_flex()
+            .gap_2()
+            .text_sm()
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(muted)
+                    .child(target),
+            )
+            .child(
+                Button::new("choose-stage")
+                    .small()
+                    .outline()
+                    .label("Stage into folder…")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.choose_stage(cx))),
+            )
+            .when(self.stage.is_some(), |row| {
+                row.child(
+                    Button::new("clear-stage")
+                        .small()
+                        .ghost()
+                        .label("Use recycle bin")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.stage = None;
+                            cx.notify();
+                        })),
+                )
+            })
     }
 
     fn apply(&mut self, policy: TrashPolicy, cx: &mut Context<Self>) {
@@ -222,14 +303,14 @@ fn describe(policy: &TrashPolicy) -> String {
 impl Render for CleanScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = window;
-        let session = self.session.read(cx);
-        if let Some(waiting) = waiting_for_assessment(session, cx) {
+        if let Some(waiting) = waiting_for_assessment(&self.session, cx) {
             return v_flex()
                 .size_full()
                 .children(self.render_outcome(cx))
                 .child(waiting)
                 .into_any_element();
         }
+        let session = self.session.read(cx);
         let busy = session.busy;
         let assessment = session.assessment.clone().expect("checked above");
         let candidates: Rc<Vec<(String, u64, nomnom_core::verdict::Disposition, String)>> = Rc::new(
@@ -354,6 +435,10 @@ impl Render for CleanScreen {
             .p_4()
             .children(self.render_outcome(cx))
             .child(toggle)
+            .child(self.render_stage(busy.is_some(), cx))
+            .when_some(self.picker_error.clone(), |col, message| {
+                col.child(Alert::error("stage-picker-error", message))
+            })
             .child(
                 h_flex()
                     .gap_3()

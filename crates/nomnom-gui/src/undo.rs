@@ -60,6 +60,37 @@ impl UndoScreen {
         .detach();
     }
 
+    /// The CLI's `nomnom undo <journal>`: any journal file, including one
+    /// copied from elsewhere or not in the default journal directory.
+    fn open_journal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Undo this journal".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => {
+                    let message = format!("cannot open the file picker: {error}");
+                    eprintln!("nomnom-gui: {message}");
+                    let _ = this.update(cx, |this, cx| {
+                        this.report = Some(Err(message));
+                        cx.notify();
+                    });
+                    None
+                }
+            };
+            if let Some(journal) = chosen {
+                let _ =
+                    this.update_in(cx, |this, window, cx| this.confirm_undo(journal, window, cx));
+            }
+        })
+        .detach();
+    }
+
     fn confirm_undo(&mut self, journal: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = format!(
@@ -120,7 +151,7 @@ impl UndoScreen {
             // Restored paths change what the open scan shows.
             session.update(cx, |session, cx| {
                 session.end(cx);
-                if session.catalog.is_some() {
+                if session.scan.is_some() {
                     session.scan(cx);
                 }
             });
@@ -215,6 +246,14 @@ impl Render for UndoScreen {
             .when(busy == Some(Phase::Undoing), |row| {
                 row.child(Spinner::new().small()).child(Phase::Undoing.label())
             })
+            .child(
+                Button::new("open-journal")
+                    .small()
+                    .outline()
+                    .label("Open journal…")
+                    .disabled(busy.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| this.open_journal(window, cx))),
+            )
             .child(
                 Button::new("reload-journals")
                     .small()

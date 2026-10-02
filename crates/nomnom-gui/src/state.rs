@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use humansize::{BINARY, format_size};
 use nomnom_core::action::{ActionError, Plan, plan_from};
@@ -12,6 +13,23 @@ use nomnom_core::verdict::{Assessment, Disposition, Entry};
 
 pub fn size(bytes: u64) -> String {
     format_size(bytes, BINARY)
+}
+
+pub fn modified(time: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(time).format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// `4570123` as `4,570,123`.
+pub fn count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (ix, c) in digits.chars().enumerate() {
+        if ix > 0 && (digits.len() - ix).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One visible row of the scan tree.
@@ -55,6 +73,20 @@ impl TreeModel {
             self.expanded.insert(id);
         }
         self.rebuild(catalog);
+    }
+
+    /// Expand every ancestor of `id` and return its row.
+    pub fn reveal(&mut self, catalog: &Catalog, id: NodeId) -> Option<usize> {
+        let mut cursor = catalog.node(id).parent;
+        let mut opened = false;
+        while let Some(ancestor) = cursor {
+            opened |= self.expanded.insert(ancestor);
+            cursor = catalog.node(ancestor).parent;
+        }
+        if opened {
+            self.rebuild(catalog);
+        }
+        self.rows.iter().position(|row| row.id == id)
     }
 
     fn rebuild(&mut self, catalog: &Catalog) {
