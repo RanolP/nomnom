@@ -1,0 +1,20 @@
+[package]
+name = "nomnom-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop front-end for nomnom."
+
+[[bin]]
+name = "nomnom-gui"
+path = "src/main.rs"
+
+[dependencies]
+nomnom-core.workspace = true
+nomnom-pack.workspace = true
+gpui-kit.workspace = true
+humansize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

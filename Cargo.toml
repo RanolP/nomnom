@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nomnom-core", "crates/nomnom-lang", "crates/nomnom-pack", "crates/nomnom-cli"]
+members = ["crates/nomnom-core", "crates/nomnom-lang", "crates/nomnom-pack", "crates/nomnom-cli", "crates/nomnom-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,11 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 toml = "1.1.6"
 tempfile = "3.27.0"
+
+# GUI front-end: Longbridge's facade over gpui-component. gpui itself is
+# reachable as `gpui_kit::*`; Zed's `gpui` crate is a separate, incompatible
+# line and must not be added beside it.
+gpui-kit = "0.7.0"
 
 # Windows MFT backend (the WizTree mechanism): read the NTFS Master File Table
 # off the raw volume instead of walking the tree.
