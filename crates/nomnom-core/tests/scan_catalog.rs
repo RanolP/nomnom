@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nomnom_core::catalog::Catalog;
+use nomnom_core::catalog::{Catalog, file_types};
 use nomnom_core::scan::{
     Backend, BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport, scan,
 };
@@ -235,6 +235,34 @@ fn progress_counter_counts_every_scanned_entry() {
 
     assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
     assert_eq!(progress.load(Ordering::Relaxed), report.entries.len() as u64);
+}
+
+/// Catches directories being counted as files (twice over, once as a node and
+/// once through their children): the per-extension totals must add up to the
+/// root's file bytes and file count exactly.
+#[test]
+fn file_types_add_up_to_the_root_totals() {
+    let root = PathBuf::from("/r");
+    let catalog = Catalog::build(report(
+        &root,
+        vec![
+            dir_entry("/r"),
+            dir_entry("/r/src.d"),
+            file_entry("/r/src.d/main.RS", 30),
+            file_entry("/r/src.d/lib.rs", 20),
+            file_entry("/r/Makefile", 7),
+            file_entry("/r/.gitignore", 3),
+            file_entry("/r/photo.jpg", 100),
+        ],
+    ));
+
+    let types = file_types(&catalog);
+    let root_node = catalog.node(catalog.root());
+    assert_eq!(types.iter().map(|t| t.bytes).sum::<u64>(), root_node.subtree_size);
+    assert_eq!(types.iter().map(|t| t.count).sum::<u64>(), root_node.file_count);
+    let summary: Vec<(&str, u64, u64)> =
+        types.iter().map(|t| (t.ext.as_str(), t.bytes, t.count)).collect();
+    assert_eq!(summary, vec![("jpg", 100, 1), ("rs", 50, 2), ("(none)", 10, 2)]);
 }
 
 /// Catches the drive picker coming up empty or garbled: the system drive is

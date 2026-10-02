@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
 
+mod file_types;
+
+pub use file_types::{FileType, file_types};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
 
@@ -36,6 +40,9 @@ pub struct Node {
     pub kind: EntryKind,
     /// Own size; 0 for directories.
     pub size: u64,
+    /// Own on-disk size, as [`Entry::allocated`](crate::scan::Entry::allocated)
+    /// reported it: `None` when the backend had no cheap answer.
+    pub allocated: Option<u64>,
     pub modified: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     /// Rolled up over the subtree, inclusive of self.
@@ -88,6 +95,7 @@ impl Catalog {
                 let node = &mut nodes[root.index()];
                 node.kind = entry.kind;
                 node.size = entry.size;
+                node.allocated = entry.allocated;
                 node.modified = entry.modified;
                 node.accessed = entry.accessed;
                 continue;
@@ -115,6 +123,7 @@ impl Catalog {
             let mut node = blank_node(id, name, entry.kind);
             node.parent = Some(parent);
             node.size = entry.size;
+            node.allocated = entry.allocated;
             node.modified = entry.modified;
             node.accessed = entry.accessed;
             nodes.push(node);
@@ -327,6 +336,7 @@ fn blank_node(id: NodeId, name: OsString, kind: EntryKind) -> Node {
         name,
         kind,
         size: 0,
+        allocated: None,
         modified: None,
         accessed: None,
         subtree_size: 0,
