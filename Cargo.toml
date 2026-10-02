@@ -26,6 +26,7 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 toml = "1.1.6"
 tempfile = "3.27.0"
+chrono = "0.4.45"
 
 # GUI front-end: Longbridge's facade over gpui-component. gpui itself is
 # reachable as `gpui_kit::*`; Zed's `gpui` crate is a separate, incompatible

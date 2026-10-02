@@ -4249,6 +4249,7 @@ name = "nomnom-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "humansize",
  "nomnom-core",
@@ -4282,6 +4283,7 @@ dependencies = [
 name = "nomnom-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui-kit",
  "humansize",
  "nomnom-core",
