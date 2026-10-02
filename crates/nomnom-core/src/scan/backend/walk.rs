@@ -35,6 +35,7 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
 
     builder.build_parallel().run(|| {
         Box::new(|result| {
+            opts.tick();
             match result {
                 Ok(dent) => match to_entry(&dent) {
                     Ok(entry) => entries.lock().unwrap().push(entry),

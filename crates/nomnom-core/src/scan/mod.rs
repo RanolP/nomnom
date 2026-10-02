@@ -17,6 +17,8 @@
 pub mod backend;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -83,11 +85,30 @@ pub struct ScanOptions {
     /// volume, not the repo.
     pub respect_gitignore: bool,
     pub follow_symlinks: bool,
+    /// Bumped once per entry as the scan runs, so a UI on another thread can
+    /// show the scan is alive. The walk backend counts every visited entry,
+    /// unreadable ones included. The MFT backend counts in-use records of the
+    /// whole volume while reading the table, which outnumbers the entries of a
+    /// scan rooted below the volume root.
+    pub progress: Option<Arc<AtomicU64>>,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { backend: Backend::Auto, respect_gitignore: false, follow_symlinks: false }
+        Self {
+            backend: Backend::Auto,
+            respect_gitignore: false,
+            follow_symlinks: false,
+            progress: None,
+        }
+    }
+}
+
+impl ScanOptions {
+    pub(crate) fn tick(&self) {
+        if let Some(progress) = &self.progress {
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

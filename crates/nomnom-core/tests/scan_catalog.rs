@@ -2,6 +2,8 @@
 //! duplicate detection, error collection, and backend dispatch policy.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::{
@@ -216,4 +218,21 @@ fn auto_falls_back_to_walk_while_mft_fails_loudly() {
     let requested =
         scan(tmp.path(), &walk_opts()).expect("an explicitly requested walk must succeed");
     assert_eq!(requested.backend_used, BackendUsed::Walk { mft_unavailable: None });
+}
+
+/// Catches an unwired progress counter, which would freeze the GUI's scan
+/// indicator at 0 for the whole scan.
+#[test]
+fn progress_counter_counts_every_scanned_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    std::fs::write(tmp.path().join("a.bin"), b"a").unwrap();
+    std::fs::write(tmp.path().join("sub/b.bin"), b"b").unwrap();
+
+    let progress = Arc::new(AtomicU64::new(0));
+    let opts = ScanOptions { progress: Some(progress.clone()), ..walk_opts() };
+    let report = scan(tmp.path(), &opts).unwrap();
+
+    assert_eq!(report.entries.len(), 4, "root, sub, a.bin, sub/b.bin");
+    assert_eq!(progress.load(Ordering::Relaxed), report.entries.len() as u64);
 }

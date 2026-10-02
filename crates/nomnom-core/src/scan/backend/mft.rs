@@ -46,8 +46,8 @@ const MAX_ERRORS: usize = 1024;
 
 pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
     // `respect_gitignore` and `follow_symlinks` describe a tree walk. The MFT
-    // sees the volume, not a repository, and never traverses a link.
-    let _ = opts;
+    // sees the volume, not a repository, and never traverses a link. Only
+    // `progress` applies here.
 
     let canonical =
         std::fs::canonicalize(root).map_err(|_| ScanFailure::RootUnreadable(root.to_path_buf()))?;
@@ -91,7 +91,7 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
         ))
     })?;
 
-    enumerate(&ntfs, &mut fs, &target, root, &root_canon)
+    enumerate(&ntfs, &mut fs, &target, root, &root_canon, opts)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +118,7 @@ fn enumerate(
     target: &VolumeTarget,
     root: &Path,
     root_canon: &Path,
+    opts: &ScanOptions,
 ) -> Result<ScanReport, ScanFailure> {
     let total = mft_record_count(ntfs, fs)?;
 
@@ -137,6 +138,7 @@ fn enumerate(
         if !file.flags().contains(NtfsFileFlags::IN_USE) {
             continue;
         }
+        opts.tick();
 
         let is_dir = file.is_directory();
         let mut names: Vec<(u64, String)> = Vec::new();
