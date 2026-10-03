@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use ignore::{WalkBuilder, WalkState};
 
-use crate::scan::{BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport};
+use crate::scan::{
+    BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanOptions, ScanReport, ScanTable,
+};
 
 pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFailure> {
     // The only fatal case: a root we cannot even stat. Everything deeper is a
@@ -50,12 +52,14 @@ pub(crate) fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, ScanFa
         })
     });
 
-    Ok(ScanReport::from_entries(
-        root.to_path_buf(),
-        entries.into_inner().unwrap(),
-        errors.into_inner().unwrap(),
-        BackendUsed::Walk { mft_unavailable: None },
-    ))
+    let table =
+        ScanTable::from_entries_with(root, entries.into_inner().unwrap(), opts.progress.as_deref());
+    Ok(ScanReport {
+        root: root.to_path_buf(),
+        table,
+        errors: errors.into_inner().unwrap(),
+        backend_used: BackendUsed::Walk { mft_unavailable: None },
+    })
 }
 
 fn to_entry(dent: &ignore::DirEntry) -> Result<Entry, ScanError> {

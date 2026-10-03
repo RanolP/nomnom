@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter};
 use nomnom_core::catalog::{Catalog, NodeId};
-use nomnom_core::scan::{self, ScanFailure, Volume, VolumeRoot};
+use nomnom_core::scan::{self, ScanFailure, Stage, Volume, VolumeRoot};
 use nomnom_core::timings;
-use nomnom_core::verdict::{Assessment, assess, resolve_packs};
+use nomnom_core::verdict::{Assessment, assess_with, resolve_packs};
 
 use crate::palette::Palette;
 
@@ -53,10 +53,15 @@ impl ScanProgress {
         self.counters.entries.load(Ordering::Relaxed)
     }
 
-    /// Done so far, in 0..=1; `None` until the first numbers arrive. The
-    /// CLI's rule, so both front-ends show the same number.
+    /// Done so far of the whole run from the click to the judged result, in
+    /// 0..=1; `None` until the scan's first numbers arrive. The CLI's rule, so
+    /// both front-ends show the same number.
     pub fn fraction(&self) -> Option<f64> {
-        self.counters.fraction(self.used_bytes)
+        self.counters.overall(self.used_bytes)
+    }
+
+    pub fn stage(&self) -> Stage {
+        self.counters.stage()
     }
 
     /// Set the moment core's scan falls back to the walk, so the banner shows
@@ -85,9 +90,16 @@ pub struct ScanData {
 }
 
 impl ScanData {
-    fn new(catalog: Catalog, started: Instant) -> Self {
-        let palette = Palette::new(&catalog);
-        let allocated = subtree_allocated(&catalog);
+    /// Reports [`Stage::Aggregate`] in two units of the node count: the
+    /// palette's pass, then the allocation roll-up.
+    fn new(catalog: Catalog, started: Instant, progress: &scan::ScanProgress) -> Self {
+        let n = catalog.len();
+        progress.enter(Stage::Aggregate, 2 * n as u64);
+        let palette = Palette::new(&catalog, |done| progress.advance_to(done as u64));
+        progress.advance_to(n as u64);
+        let allocated =
+            subtree_allocated(&catalog, |done| progress.advance_to((n + done) as u64));
+        progress.advance_to(2 * n as u64);
         Self {
             catalog: Arc::new(catalog),
             palette,
@@ -112,12 +124,16 @@ impl ScanData {
 
 /// Node ids follow path order, so every child has a higher id than its parent
 /// and one reverse pass rolls sizes up.
-fn subtree_allocated(catalog: &Catalog) -> Option<Vec<u64>> {
+/// `advance` hears the nodes done so far, every [`Stage::BATCH`] of them.
+fn subtree_allocated(catalog: &Catalog, advance: impl Fn(usize)) -> Option<Vec<u64>> {
     if !catalog.nodes().any(|node| node.allocated.is_some()) {
         return None;
     }
     let mut sums: Vec<u64> = catalog.nodes().map(|node| node.allocated.unwrap_or(0)).collect();
     for ix in (0..sums.len()).rev() {
+        if ix % Stage::BATCH == 0 {
+            advance(sums.len() - ix);
+        }
         if let Some(parent) = catalog.node(NodeId(ix as u32)).parent {
             sums[parent.0 as usize] += sums[ix];
         }
@@ -214,7 +230,14 @@ impl Session {
         self.scan_notice = None;
         self.assess_error = None;
         timings::start_scan("gui");
-        let counters = Arc::new(scan::ScanProgress::default());
+        let counters = Arc::new(scan::ScanProgress::planned(&[
+            Stage::Link,
+            Stage::RollUp,
+            Stage::Aggregate,
+            Stage::Index,
+            Stage::Match,
+            Stage::Group,
+        ]));
         let started = Instant::now();
         self.progress = Some(ScanProgress {
             counters: counters.clone(),
@@ -243,11 +266,11 @@ impl Session {
                 .background_executor()
                 .spawn(async move {
                     let report = VolumeRoot::new(&scan_root)
-                        .and_then(|root| scan::scan_drive(&root, Some(progress)))?;
+                        .and_then(|root| scan::scan_drive(&root, Some(progress.clone())))?;
                     let catalog_started = timings::lap("gui click -> report in hand", started);
-                    let catalog = Catalog::build(report);
+                    let catalog = Catalog::build_with(report, Some(&progress));
                     let aggregates_started = timings::lap("Catalog::build total", catalog_started);
-                    let data = ScanData::new(catalog, started);
+                    let data = ScanData::new(catalog, started, &progress);
                     timings::lap("gui aggregates (ScanData::new)", aggregates_started);
                     Ok::<_, ScanFailure>(Arc::new(data))
                 })
@@ -267,12 +290,15 @@ impl Session {
                     return;
                 }
             };
+            // The bar runs on through the first judging, so the scan's phase
+            // ends when that lands rather than here.
             let landed = this.update(cx, |this, cx| {
                 this.scan = Some(data);
                 this.scan_notice = notice;
-                this.progress = None;
-                this.end(cx);
-                this.assess(cx);
+                if !this.assess(Some(counters), cx) {
+                    this.progress = None;
+                    this.end(cx);
+                }
             });
             if landed.is_err() {
                 eprintln!(
@@ -287,17 +313,26 @@ impl Session {
     /// Re-judge after a pack change alters which rules load or how far they
     /// are trusted.
     pub fn reassess(&mut self, cx: &mut Context<Self>) {
-        self.assess(cx);
+        self.assess(None, cx);
     }
 
     /// Judge the current catalog in the background. Starts by itself after
     /// every scan; a newer run supersedes an older one still in flight.
-    fn assess(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `scan_progress` is the scan's counters when this judging finishes that
+    /// scan: it reports the analysis stages into them, and ends the scan's
+    /// phase when it lands. `false` means no judging started.
+    fn assess(
+        &mut self,
+        scan_progress: Option<Arc<scan::ScanProgress>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (Some(root), Some(catalog)) =
             (self.root.clone(), self.scan.as_ref().map(|scan| scan.catalog.clone()))
         else {
-            return;
+            return false;
         };
+        let finishes_scan = scan_progress.is_some();
         self.assess_generation += 1;
         let generation = self.assess_generation;
         self.assessing = true;
@@ -311,14 +346,22 @@ impl Session {
             let judged = cx
                 .background_executor()
                 .spawn(async move {
+                    let progress = scan_progress.as_deref();
+                    if let Some(progress) = progress {
+                        progress.enter(Stage::Index, 0);
+                    }
                     let packs = resolve_packs(&pack_root, &explicit)?;
-                    Ok::<_, nomnom_pack::Error>(Arc::new(assess(&catalog, packs)))
+                    Ok::<_, nomnom_pack::Error>(Arc::new(assess_with(&catalog, packs, progress)))
                 })
                 .await;
             let elapsed = started.elapsed();
             timings::record("gui assess", elapsed);
             eprintln!("nomnom-gui: assessed {} in {:.1?}", root.display(), elapsed);
             let _ = this.update(cx, |this, cx| {
+                if finishes_scan && this.busy == Some(Phase::Scanning) {
+                    this.progress = None;
+                    this.end(cx);
+                }
                 if this.assess_generation != generation {
                     return;
                 }
@@ -339,5 +382,6 @@ impl Session {
             });
         })
         .detach();
+        true
     }
 }

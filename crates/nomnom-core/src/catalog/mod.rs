@@ -22,7 +22,9 @@ use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::scan::table::{Blob, EXTRA_LINK, ODD_NAME, ScanTable};
-use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
+use crate::scan::{
+    BackendUsed, EntryKind, ScanError, ScanProgress, ScanReport, Stage, advance,
+};
 use crate::timings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -154,18 +156,27 @@ impl Catalog {
     /// visited set and no cycle check is needed: every row has exactly one
     /// parent, so the walk from the root can meet each row once at most.
     pub fn build(report: ScanReport) -> Self {
+        Self::build_with(report, None)
+    }
+
+    /// [`Catalog::build`], reporting [`Stage::Link`] and [`Stage::RollUp`] into
+    /// `progress` as it goes.
+    pub fn build_with(report: ScanReport, progress: Option<&ScanProgress>) -> Self {
         let ScanReport { root: root_path, table, mut errors, backend_used } = report;
         let ScanTable { nodes: rows, names, odd_names, blobs } = table;
         let started = Instant::now();
 
         let n = rows.len();
         if n == 0 {
-            return Self::build(ScanReport {
-                root: root_path,
-                table: ScanTable::new(),
-                errors,
-                backend_used,
-            });
+            return Self::build_with(
+                ScanReport { root: root_path, table: ScanTable::new(), errors, backend_used },
+                progress,
+            );
+        }
+        // Link in four even units of `n`: the child lists, the preorder walk,
+        // the primary-link passes, the node records.
+        if let Some(progress) = progress {
+            progress.enter(Stage::Link, 4 * n as u64);
         }
 
         // Children in table space. Row 0 is the root and never anyone's child;
@@ -177,6 +188,7 @@ impl Catalog {
             .filter(|&(i, row)| (row.parent as usize) < n && row.parent as usize != i)
             .map(|(i, row)| (row.parent, i as u32));
         let (start, kids) = csr(n, pairs);
+        advance(progress, n);
 
         // Preorder: `order[new] = row`. Children are pushed reversed so the
         // first child is visited first and siblings keep table order.
@@ -186,6 +198,9 @@ impl Catalog {
         let mut stack: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
         while let Some((row, parent, depth)) = stack.pop() {
             let new = order.len() as u32;
+            if (new as usize).is_multiple_of(Stage::BATCH) {
+                advance(progress, n + new as usize);
+            }
             order.push(row);
             parent_of.push(parent);
             depth_of.push(depth);
@@ -195,6 +210,7 @@ impl Catalog {
         drop(kids);
         drop(start);
         let reached = order.len();
+        advance(progress, 2 * n);
 
         // A blob's bytes count under its first name not flagged as an extra
         // link, in preorder, or under its first reachable name when every
@@ -219,11 +235,15 @@ impl Catalog {
             }
         }
 
+        advance(progress, 3 * n);
         let empty = Blob { size: 0, allocated: None, modified: None, accessed: None };
         let mut nodes: Vec<Node> = order
             .iter()
             .enumerate()
             .map(|(new, &row)| {
+                if new % Stage::BATCH == 0 {
+                    advance(progress, 3 * n + new);
+                }
                 let r = &rows[row as usize];
                 let b = r.blob;
                 let facts = blobs.get(b as usize).copied().unwrap_or(empty);
@@ -259,8 +279,17 @@ impl Catalog {
         drop(rows);
         let started = timings::lap("Catalog::build link", started);
 
+        // Roll-up in two units of `m`: the reverse pass, then the child lists
+        // and link groups.
+        let m = nodes.len();
+        if let Some(progress) = progress {
+            progress.enter(Stage::RollUp, 2 * m as u64);
+        }
         // One reverse pass: every child has a higher id than its parent.
-        for new in (1..nodes.len()).rev() {
+        for new in (1..m).rev() {
+            if new % Stage::BATCH == 0 {
+                advance(progress, m - new);
+            }
             let child = &nodes[new];
             let (size, allocated) = if child.extra_link {
                 (
@@ -287,7 +316,7 @@ impl Catalog {
             parent.end = parent.end.max(end);
         }
 
-        let m = nodes.len();
+        advance(progress, m);
         let (child_start, child_ids) =
             csr(m, (1..m as u32).map(|new| (parent_of[new as usize], new)));
         let child_ids = child_ids.into_iter().map(NodeId).collect();
@@ -323,6 +352,7 @@ impl Catalog {
                 ),
             });
         }
+        advance(progress, 2 * m);
         timings::lap("Catalog::build roll-up", started);
 
         Self {

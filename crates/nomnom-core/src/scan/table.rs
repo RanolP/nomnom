@@ -16,7 +16,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::{Entry, EntryKind};
+use super::{Entry, EntryKind, ScanProgress, Stage, advance};
 
 /// `Name::blob` for a row with no blob of its own (a root no backend reported).
 pub const NO_BLOB: u32 = u32::MAX;
@@ -154,6 +154,20 @@ impl ScanTable {
     /// under its nearest ancestor that was reported, or under the root when
     /// none was, so a gap in the walk does not drop what lies below it.
     pub fn from_entries(root: &Path, entries: Vec<Entry>) -> Self {
+        Self::from_entries_with(root, entries, None)
+    }
+
+    /// [`ScanTable::from_entries`], reporting [`Stage::Table`] into `progress`
+    /// in two units per entry: the rows, then their parents.
+    pub(crate) fn from_entries_with(
+        root: &Path,
+        entries: Vec<Entry>,
+        progress: Option<&ScanProgress>,
+    ) -> Self {
+        let n = entries.len();
+        if let Some(progress) = progress {
+            progress.enter(Stage::Table, 2 * n as u64);
+        }
         let mut table = Self::new();
         table.nodes.reserve(entries.len());
         table.blobs.reserve(entries.len());
@@ -163,6 +177,9 @@ impl ScanTable {
         let mut row_of: HashMap<&[u8], u32> = HashMap::with_capacity(entries.len());
         let mut pending: Vec<(usize, u32)> = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
+            if index.is_multiple_of(Stage::BATCH) {
+                advance(progress, index);
+            }
             let bytes = entry.path.as_os_str().as_encoded_bytes();
             let blob = table.push_blob(Blob {
                 size: entry.size,
@@ -184,7 +201,10 @@ impl ScanTable {
             row_of.insert(bytes, row);
             pending.push((index, row));
         }
-        for (index, row) in pending {
+        for (done, (index, row)) in pending.into_iter().enumerate() {
+            if done.is_multiple_of(Stage::BATCH) {
+                advance(progress, n + done);
+            }
             let mut cursor = entries[index].path.as_path();
             table.nodes[row as usize].parent = loop {
                 let Some(parent) = cursor.parent() else { break 0 };

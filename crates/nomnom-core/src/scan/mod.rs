@@ -31,7 +31,7 @@ pub use root::VolumeRoot;
 pub use table::{Blob, ScanTable};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -146,6 +146,15 @@ pub struct ScanProgress {
     /// Why the MFT read was given up, set the moment [`scan_drive`] falls back
     /// to the walk, so a front-end can say so while the slower scan runs.
     pub fallback: OnceLock<String>,
+    /// The [`Stage`] running now, as its discriminant.
+    stage: AtomicU8,
+    stage_done: AtomicU64,
+    /// 0 means the stage has no count.
+    stage_total: AtomicU64,
+    /// Bit per [`Stage`] this run goes through; see [`ScanProgress::planned`].
+    plan: u8,
+    /// The highest [`ScanProgress::overall`] handed out, as f64 bits.
+    shown: AtomicU64,
 }
 
 impl ScanProgress {
@@ -166,6 +175,142 @@ impl ScanProgress {
             return None;
         }
         Some((bytes as f64 / used_bytes as f64).min(0.99))
+    }
+
+    /// Counters for a run that goes on past the scan through `stages`, so
+    /// [`ScanProgress::overall`] spreads one bar over all of them. The scan's
+    /// own stages, [`Stage::Scan`] and [`Stage::Table`], are always part of it.
+    pub fn planned(stages: &[Stage]) -> Self {
+        let scan = 1 << Stage::Scan as u8 | 1 << Stage::Table as u8;
+        let plan = stages.iter().fold(scan, |plan, &s| plan | 1 << s as u8);
+        Self { plan, ..Self::default() }
+    }
+
+    /// Moves the run on to `stage`, with `total` units of work in it; 0 means
+    /// the stage has no count and shows as not yet started until it ends.
+    pub fn enter(&self, stage: Stage, total: u64) {
+        self.stage_done.store(0, Ordering::Relaxed);
+        self.stage_total.store(total, Ordering::Relaxed);
+        self.stage.store(stage as u8, Ordering::Release);
+    }
+
+    /// Units of the current stage done so far. Callers report in batches of
+    /// [`Stage::BATCH`] or so: the reader only polls every 100 ms.
+    pub fn advance_to(&self, done: u64) {
+        self.stage_done.store(done, Ordering::Relaxed);
+    }
+
+    pub fn set_stage_total(&self, total: u64) {
+        self.stage_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn stage(&self) -> Stage {
+        Stage::ALL[usize::from(self.stage.load(Ordering::Acquire)).min(Stage::ALL.len() - 1)]
+    }
+
+    /// Completed fraction of the whole run in `0.0..=1.0`, or `None` while the
+    /// scan has no numbers yet. Each planned stage owns a segment of the bar
+    /// sized by `Stage::weight`; the value never goes down, even when a
+    /// failed elevated scan restarts the count on the walk.
+    pub fn overall(&self, used_bytes: u64) -> Option<f64> {
+        let stage = self.stage();
+        let within = if stage == Stage::Scan {
+            self.fraction(used_bytes)?
+        } else {
+            let total = self.stage_total.load(Ordering::Relaxed);
+            let done = self.stage_done.load(Ordering::Relaxed);
+            if total == 0 { 0.0 } else { (done as f64 / total as f64).min(1.0) }
+        };
+        let walk = self.entries_total.load(Ordering::Relaxed) == 0;
+        let planned =
+            || Stage::ALL.into_iter().filter(|&s| self.plan & 1 << s as u8 != 0 || s == stage);
+        let sum: f64 = planned().map(|s| s.weight(walk)).sum();
+        let before: f64 = planned().filter(|&s| s < stage).map(|s| s.weight(walk)).sum();
+        let value = ((before + stage.weight(walk) * within) / sum).clamp(0.0, 1.0);
+        // Non-negative f64s order the same as their bit patterns.
+        let shown = self.shown.fetch_max(value.to_bits(), Ordering::Relaxed);
+        Some(value.max(f64::from_bits(shown)))
+    }
+}
+
+/// One step of the work from the click to the judged result, in run order.
+/// The scan's own counters live in [`ScanProgress`]'s scan fields; every later
+/// stage reports through [`ScanProgress::enter`] and
+/// [`ScanProgress::advance_to`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Stage {
+    Scan,
+    /// The walk's whole paths filed under their parents. The MFT does this
+    /// while it reads, so a run on the MFT never enters it.
+    Table,
+    /// [`Catalog::build`](crate::catalog::Catalog::build): rows linked into a
+    /// preorder tree.
+    Link,
+    /// `Catalog::build`: sizes and counts summed up the tree.
+    RollUp,
+    /// A front-end's own drive-wide views, the GUI's palette and allocations.
+    Aggregate,
+    /// Assessment: pack resolution and the name index.
+    Index,
+    /// Assessment: every rule run against the index.
+    Match,
+    /// Assessment: conflicts resolved, verdicts grouped and sorted.
+    Group,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 8] = [
+        Stage::Scan,
+        Stage::Table,
+        Stage::Link,
+        Stage::RollUp,
+        Stage::Aggregate,
+        Stage::Index,
+        Stage::Match,
+        Stage::Group,
+    ];
+
+    /// Loop iterations between two progress stores in a per-node loop.
+    pub const BATCH: usize = 1 << 16;
+
+    /// What a front-end names the stage: the scan, the tree, or the analysis.
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Scan => "Scanning",
+            Stage::Table | Stage::Link | Stage::RollUp | Stage::Aggregate => "Building the tree",
+            Stage::Index | Stage::Match | Stage::Group => "Analyzing",
+        }
+    }
+
+    /// The stage's share of the bar, in milliseconds a whole-`C:` run spent in
+    /// it on the release GUI's MFT path (scan 9.0 s, link 0.69 s, roll-up
+    /// 0.18 s, aggregates 0.66 s, name index 0.23 s, rule match 0.04 s,
+    /// resolve and group 0.07 s). The walk is weighted by the CLI's walk run
+    /// instead: 77 s of walk, about 4 s of it filing paths into the table,
+    /// against 4.2 s of build and assessment, scaled onto the same post-scan
+    /// stages (1210 ms here).
+    fn weight(self, walk: bool) -> f64 {
+        match self {
+            Stage::Scan if walk => 73.0 / 4.2 * 1210.0,
+            Stage::Scan => 9000.0,
+            Stage::Table if walk => 4.0 / 4.2 * 1210.0,
+            Stage::Table => 0.0,
+            Stage::Link => 690.0,
+            Stage::RollUp => 180.0,
+            Stage::Aggregate => 660.0,
+            Stage::Index => 230.0,
+            Stage::Match => 40.0,
+            Stage::Group => 70.0,
+        }
+    }
+}
+
+/// [`ScanProgress::advance_to`] on an optional handle, for the build and
+/// assessment loops that run with or without a front-end watching.
+pub(crate) fn advance(progress: Option<&ScanProgress>, done: usize) {
+    if let Some(progress) = progress {
+        progress.advance_to(done as u64);
     }
 }
 

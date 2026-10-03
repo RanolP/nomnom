@@ -6,7 +6,7 @@ use std::path::Path;
 
 use gpui_kit::{Hsla, hsla};
 use nomnom_core::catalog::Catalog;
-use nomnom_core::scan::EntryKind;
+use nomnom_core::scan::{EntryKind, Stage};
 
 /// Distinct hues for the biggest extensions, biggest first. Everything past
 /// them shares [`Palette::OTHER`], since a drive has thousands of extensions
@@ -25,11 +25,17 @@ impl Palette {
     pub const OTHER: Hsla = hsla(0., 0., 0.55, 1.);
 
     /// Ranks extensions by the bytes their files hold, so the hues go to what
-    /// covers the most treemap area.
-    pub fn new(catalog: &Catalog) -> Self {
+    /// covers the most treemap area. `advance` hears the nodes passed so far,
+    /// every [`Stage::BATCH`] of them.
+    pub fn new(catalog: &Catalog, advance: impl Fn(usize)) -> Self {
         let mut bytes: HashMap<String, u64> = HashMap::new();
-        for node in catalog.nodes().filter(|node| node.kind == EntryKind::File) {
-            *bytes.entry(ext_key(catalog.name(node.id))).or_default() += node.size;
+        for (ix, node) in catalog.nodes().enumerate() {
+            if ix % Stage::BATCH == 0 {
+                advance(ix);
+            }
+            if node.kind == EntryKind::File {
+                *bytes.entry(ext_key(catalog.name(node.id))).or_default() += node.size;
+            }
         }
         let mut ranked: Vec<(String, u64)> = bytes.into_iter().collect();
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

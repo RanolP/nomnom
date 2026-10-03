@@ -13,7 +13,7 @@ use humansize::{BINARY, format_size};
 use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::VolumeRoot;
 use nomnom_core::verdict::{
-    Assessment, Disposition, Group, Label, TrustedPack, assess, resolve_packs,
+    Assessment, Disposition, Group, Label, resolve_packs,
 };
 use serde::Serialize;
 
@@ -26,21 +26,21 @@ pub fn run(
     json: bool,
 ) -> Result<ExitCode> {
     let packs = resolve_packs(drive.as_path(), explicit)?;
-    let catalog = input::load(drive)?;
+    let (catalog, assessment) = input::load_assessed(drive, packs)?;
     input::warn_backend(&catalog);
     input::report_errors(&catalog, show_errors);
 
-    render(&catalog, packs, json, &mut std::io::stdout().lock())?;
+    render(&catalog, assessment, json, &mut std::io::stdout().lock())?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn render(
     catalog: &Catalog,
-    packs: Vec<TrustedPack>,
+    assessment: Assessment,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let Assessment { groups, reclaimable_bytes, .. } = assess(catalog, packs);
+    let Assessment { groups, reclaimable_bytes, .. } = assessment;
 
     if json {
         let report = Output {
@@ -124,6 +124,8 @@ pub fn disposition_name(disposition: Disposition) -> &'static str {
 mod tests {
     use std::path::Path;
 
+    use nomnom_core::verdict::assess;
+
     use super::*;
     use crate::pack;
     use crate::scan_fixtures::catalog_of;
@@ -133,7 +135,9 @@ mod tests {
         isolated_store();
         let packs = resolve_packs(project, explicit).expect("packs resolve");
         let mut out = Vec::new();
-        render(&catalog_of(project), packs, json, &mut out).expect("suggest renders");
+        let catalog = catalog_of(project);
+        let assessment = assess(&catalog, packs);
+        render(&catalog, assessment, json, &mut out).expect("suggest renders");
         String::from_utf8(out).expect("utf-8 output")
     }
 

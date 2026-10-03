@@ -18,7 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::catalog::{Catalog, NodeId};
 
-pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, charges};
+pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, assess_with, charges};
 pub use builtin::builtin_pack;
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
@@ -196,7 +196,7 @@ pub struct Verdict {
 /// whole subtree, so no verdict lies inside another rule verdict's subtree —
 /// which is what keeps [`Rollup::reclaimable_bytes`] sound.
 pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
-    select::select(ctx, packs)
+    select::select(ctx, packs, None)
 }
 
 /// What the CLI prints after an assessment.

@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::{Disposition, Label, TrustedPack, Verdict, judge};
+use super::{Disposition, Label, TrustedPack, Verdict, select};
 use crate::catalog::Catalog;
+use crate::scan::ScanProgress;
 use crate::timings;
 
 pub struct Assessment {
@@ -104,7 +105,19 @@ pub fn charges(entries: &[&Entry], shared: &[SharedFile]) -> Vec<u64> {
 /// [`super::resolve_packs`]. Every entry's [`Verdict::provenance`] names the
 /// pack and rule that decided it.
 pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
-    let verdicts = judge(catalog, &packs);
+    assess_with(catalog, packs, None)
+}
+
+/// [`assess`], reporting [`Stage::Index`](crate::scan::Stage::Index) through
+/// [`Stage::Group`](crate::scan::Stage::Group) into
+/// `progress` as it goes. A front-end that resolves the packs first enters
+/// `Stage::Index` before that, so the bar names the analysis from its start.
+pub fn assess_with(
+    catalog: &Catalog,
+    packs: Vec<TrustedPack>,
+    progress: Option<&ScanProgress>,
+) -> Assessment {
+    let verdicts = select::select(catalog, &packs, progress);
     let started = Instant::now();
     let entries = verdicts
         .into_iter()

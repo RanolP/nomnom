@@ -10,7 +10,8 @@ use std::sync::atomic::Ordering;
 use common::report_of;
 use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::{
-    BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanProgress, ScanReport, VolumeRoot,
+    BackendUsed, Entry, EntryKind, ScanError, ScanFailure, ScanProgress, ScanReport, Stage,
+    VolumeRoot,
 };
 
 fn file_entry(path: impl Into<PathBuf>, size: u64) -> Entry {
@@ -203,6 +204,31 @@ fn progress_fraction_prefers_the_record_total_and_caps_the_byte_estimate() {
     progress.entries_total.store(200, Ordering::Relaxed);
     progress.entries.store(50, Ordering::Relaxed);
     assert_eq!(progress.fraction(1000), Some(0.25));
+}
+
+/// Catches the one bar from click to result breaking: a finished scan reading
+/// as 100% while the tree is still to build, the bar stepping back when the
+/// scan's counters restart, or `Catalog::build_with` not reporting its stages.
+#[test]
+fn overall_progress_spans_the_planned_stages_and_never_goes_back() {
+    let progress = ScanProgress::planned(&[Stage::Link, Stage::RollUp]);
+    progress.entries_total.store(100, Ordering::Relaxed);
+    progress.entries.store(100, Ordering::Relaxed);
+    let scanned = progress.overall(0).unwrap();
+    assert!(scanned > 0.5 && scanned < 1.0, "a done scan is not a done run: {scanned}");
+
+    // A failed elevated scan zeroes the counters and walks from the start.
+    progress.entries_total.store(0, Ordering::Relaxed);
+    progress.entries.store(0, Ordering::Relaxed);
+    progress.bytes.store(1, Ordering::Relaxed);
+    assert_eq!(progress.overall(1000), Some(scanned), "the bar must not go back");
+
+    let root = PathBuf::from("/r");
+    let report = report(&root, vec![dir_entry("/r"), file_entry("/r/a.bin", 3)]);
+    let catalog = Catalog::build_with(report, Some(&progress));
+    assert_eq!(catalog.node(catalog.root()).subtree_size, 3);
+    assert_eq!(progress.stage(), Stage::RollUp);
+    assert_eq!(progress.overall(1000), Some(1.0), "the last planned stage ended");
 }
 
 /// Catches the drive picker coming up empty or garbled: the system drive is

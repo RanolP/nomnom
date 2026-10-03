@@ -82,22 +82,23 @@ impl ScanScreen {
     fn render_progress(&self, session: &Session, cx: &App) -> AnyElement {
         let root = session.root.as_deref().map(plain).unwrap_or_default();
         let muted = cx.theme().muted_foreground;
-        let (fraction, line) = match &session.progress {
+        let (fraction, stage, line) = match &session.progress {
             Some(progress) => (
                 progress.fraction(),
+                Some(progress.stage()),
                 format!(
                     "{} entries · {:.1} s",
                     count(progress.entries()),
                     progress.started.elapsed().as_secs_f32()
                 ),
             ),
-            None => (None, String::new()),
+            None => (None, None, String::new()),
         };
-        let status = match fraction {
-            // The MFT counts every record before the tree is assembled.
-            Some(done) if done >= 1. => "Building the tree…".to_string(),
-            Some(done) => format!("{:.1} %", done * 100.),
-            None => "Starting…".to_string(),
+        // One bar from the click to the judged result; the label names the
+        // stage it is in.
+        let status = match (fraction, stage) {
+            (Some(done), Some(stage)) => format!("{}… {:.1} %", stage.label(), done * 100.),
+            _ => "Starting…".to_string(),
         };
         v_flex()
             .size_full()

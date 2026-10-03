@@ -37,6 +37,7 @@ use nomnom_lang::{
 use nomnom_pack::Trust;
 
 use super::{Disposition, Label, Provenance, Verdict, name_eq, node_name};
+use crate::scan::{ScanProgress, Stage, advance};
 use crate::catalog::{Catalog, NodeId};
 use crate::scan::EntryKind;
 use crate::timings;
@@ -62,19 +63,39 @@ impl TrustedPack {
 
 /// Every target some rule selects, each with the one rule that won it, with
 /// targets inside another target already dropped. In id order.
-pub(super) fn select(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
+pub(super) fn select(
+    ctx: &Catalog,
+    packs: &[TrustedPack],
+    progress: Option<&ScanProgress>,
+) -> Vec<(NodeId, Verdict)> {
     let started = Instant::now();
+    // The front-end may have entered Index already, before resolving packs.
+    if let Some(progress) = progress {
+        match progress.stage() {
+            Stage::Index => progress.set_stage_total(ctx.len() as u64),
+            _ => progress.enter(Stage::Index, ctx.len() as u64),
+        }
+    }
     let rules = compile(packs);
-    let index = NameIndex::build(ctx, &rules);
+    let index = NameIndex::build(ctx, &rules, progress);
     let started = timings::lap("assess: name index", started);
 
+    // One unit per rule: keyed rules first, then the universal ones.
+    if let Some(progress) = progress {
+        progress.enter(Stage::Match, rules.len() as u64);
+    }
     let clock = Clock { now: SystemTime::now() };
     let mut hits = Vec::new();
     let mut universal = Vec::new();
+    let mut ran = 0;
     for rule in &rules {
         match &rule.key {
             Key::Universal => universal.push(rule),
-            key => rule.run_keyed(ctx, &index, key, &clock, &mut hits),
+            key => {
+                rule.run_keyed(ctx, &index, key, &clock, &mut hits);
+                ran += 1;
+                advance(progress, ran);
+            }
         }
     }
     let mut started = timings::lap("assess: rule match", started);
@@ -83,6 +104,8 @@ pub(super) fn select(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdi
             for id in 0..ctx.len() as u32 {
                 rule.try_anchor(ctx, &index, NodeId(id), &clock, &mut hits);
             }
+            ran += 1;
+            advance(progress, ran);
         }
         started = timings::lap(
             &format!("assess: universal rules ({} with no key, full scan)", universal.len()),
@@ -90,6 +113,10 @@ pub(super) fn select(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdi
         );
     }
 
+    // Resolve and group run in well under a tenth of a second; no count.
+    if let Some(progress) = progress {
+        progress.enter(Stage::Group, 0);
+    }
     let verdicts = resolve(ctx, packs, &rules, hits, &clock);
     timings::lap("assess: resolve conflicts and nesting", started);
     verdicts
@@ -234,7 +261,7 @@ struct NameIndex {
 }
 
 impl NameIndex {
-    fn build(ctx: &Catalog, rules: &[Compiled]) -> NameIndex {
+    fn build(ctx: &Catalog, rules: &[Compiled], progress: Option<&ScanProgress>) -> NameIndex {
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
         for rule in rules {
             match &rule.key {
@@ -261,6 +288,9 @@ impl NameIndex {
         let root = ctx.root();
         let mut folded = String::new();
         for id in (0..ctx.len() as u32).map(NodeId) {
+            if (id.0 as usize).is_multiple_of(Stage::BATCH) {
+                advance(progress, id.0 as usize);
+            }
             let owned;
             let name = if id == root {
                 owned = node_name(ctx, id);

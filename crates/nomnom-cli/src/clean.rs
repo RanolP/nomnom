@@ -19,9 +19,8 @@ use nomnom_core::action::{
     Action, ApplyReport, Approval, Exclusions, Plan, RecordStatus, RuleGroup, by_rule, candidates,
     find_rule, plain, plan_from,
 };
-use nomnom_core::catalog::Catalog;
 use nomnom_core::scan::VolumeRoot;
-use nomnom_core::verdict::{Disposition, Entry, TrustedPack, Verdict, assess};
+use nomnom_core::verdict::{Assessment, Disposition, Entry, Verdict};
 use serde::Serialize;
 
 use crate::input;
@@ -73,11 +72,11 @@ pub fn run(request: Request<'_>) -> Result<ExitCode> {
         Edited::Continue(exclusions) => exclusions,
     };
     let packs = nomnom_core::verdict::resolve_packs(root, request.packs)?;
-    let catalog = input::load(request.drive)?;
+    let (catalog, assessment) = input::load_assessed(request.drive, packs)?;
     input::warn_backend(&catalog);
     input::report_errors(&catalog, request.show_errors);
 
-    execute(&catalog, packs, &exclusions, mode, &mut out)
+    execute(assessment, &exclusions, mode, &mut out)
 }
 
 /// What to do with a catalog once it is judged.
@@ -193,14 +192,12 @@ fn report_exclusions(
 }
 
 fn execute(
-    catalog: &Catalog,
-    packs: Vec<TrustedPack>,
+    assessment: Assessment,
     exclusions: &Exclusions,
     mode: Mode<'_>,
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
     mode.check()?;
-    let assessment = assess(catalog, packs);
     if !mode.picks() {
         let groups = by_rule(&candidates(&assessment, mode.include_review));
         if mode.json {
@@ -593,7 +590,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use nomnom_core::verdict::resolve_packs;
+    use nomnom_core::verdict::{assess, resolve_packs};
 
     use super::*;
     use crate::scan_fixtures::{catalog_of, write};
@@ -631,7 +628,8 @@ mod tests {
         let exclusions = Exclusions::load(root).expect("exclusions load");
         let mode = Mode { paths, rules, apply, include_review: false, json: false };
         let mut out = Vec::new();
-        let code = execute(&catalog_of(root), packs, &exclusions, mode, &mut out)?;
+        let catalog = catalog_of(root);
+        let code = execute(assess(&catalog, packs), &exclusions, mode, &mut out)?;
         Ok((code, String::from_utf8(out).expect("utf-8 output")))
     }
 
