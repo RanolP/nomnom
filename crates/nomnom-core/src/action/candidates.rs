@@ -184,7 +184,6 @@ mod tests {
             verdict: Verdict {
                 label: Label::CACHE,
                 disposition,
-                confidence: 1.0,
                 reason: "test".into(),
                 provenance: Provenance::new("p", rule),
                 capped: None,

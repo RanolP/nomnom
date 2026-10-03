@@ -17,7 +17,12 @@ use crate::kind::{Kind, Kinds, split_id};
 use crate::lex::{self, Word};
 use crate::vocab::{FIELDS, Field, Ty, nearest};
 
-const KEYS: [&str; 4] = ["description", "kind", "confidence", "disposition"];
+const KEYS: [&str; 3] = ["description", "kind", "disposition"];
+
+/// Why a rule or a kind that still writes `confidence` is refused, shared with
+/// `pack.toml` so both say the same thing.
+pub(crate) const CONFIDENCE_REMOVED: &str = "`confidence` was removed: two packs claiming one \
+     node now leave it unjudged, and within a pack the earlier rule wins; delete the line";
 
 /// `$v` alone, or `$v.field`.
 type Subject = (Spanned<String>, Option<Spanned<Field>>);
@@ -90,7 +95,6 @@ struct Draft {
     title: Spanned<String>,
     description: Option<Spanned<String>>,
     kind: Option<Spanned<String>>,
-    confidence: Option<Spanned<f32>>,
     disposition: Option<Spanned<Disposition>>,
     filter: Option<(Filter, Span)>,
 }
@@ -157,7 +161,6 @@ impl Parser<'_> {
             title: Spanned::new(title.to_owned(), Span::new(start, start + title.len())),
             description: None,
             kind: None,
-            confidence: None,
             disposition: None,
             filter: None,
         })
@@ -201,21 +204,10 @@ impl Parser<'_> {
                 rule.kind = Some(Spanned::new(value.to_owned(), value_span));
             }
             "confidence" => {
-                twice(rule.confidence.is_some())?;
-                let parsed: f64 = value.parse().map_err(|_| {
-                    self.error(value_span, format!("`{value}` is not a number"))
-                        .with_label("expected a number between 0.0 and 1.0")
-                })?;
-                if !(0.0..=1.0).contains(&parsed) {
-                    return Err(self
-                        .error(value_span, format!("confidence {value} is out of range"))
-                        .with_label("expected a number between 0.0 and 1.0")
-                        .with_help(
-                            "confidence is the first tie-break between competing rules, \
-                             so the scale has to mean the same thing in every pack",
-                        ));
-                }
-                rule.confidence = Some(Spanned::new(parsed as f32, value_span));
+                return Err(self
+                    .error(key_span, "unknown key `confidence`")
+                    .with_label("no longer a rule key")
+                    .with_help(CONFIDENCE_REMOVED));
             }
             "disposition" => {
                 twice(rule.disposition.is_some())?;
@@ -286,7 +278,6 @@ impl Parser<'_> {
             Some(written) => written.value,
             None => kind.value.disposition,
         };
-        let confidence = draft.confidence.map_or(kind.value.confidence, |c| c.value);
 
         let mut bound = vec![filter.var.value.as_str()];
         bound.extend(filter.constraints.iter().filter_map(|constraint| match constraint {
@@ -302,7 +293,6 @@ impl Parser<'_> {
             title: draft.title,
             description,
             kind,
-            confidence,
             disposition,
             filter,
         })

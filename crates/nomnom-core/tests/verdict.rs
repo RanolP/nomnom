@@ -139,7 +139,6 @@ fn every_verdict_carries_a_reason() {
     assert!(judged.len() >= 3,"fixture must exercise several rules: {judged:?}");
     for (path, verdict) in &judged {
         assert!(!verdict.reason.trim().is_empty(), "empty reason for {}", path.display());
-        assert!((0.0..=1.0).contains(&verdict.confidence), "confidence out of range for {path:?}");
     }
 }
 

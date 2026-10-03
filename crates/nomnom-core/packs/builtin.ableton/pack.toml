@@ -7,12 +7,9 @@ version = "1.0.0"
 
 [kinds."application/v1"]
 disposition = "keep"
-confidence = 0.9
 
 [kinds."settings/v1"]
 disposition = "keep"
-confidence = 0.9
 
 [kinds."user-content/v1"]
 disposition = "keep"
-confidence = 0.9

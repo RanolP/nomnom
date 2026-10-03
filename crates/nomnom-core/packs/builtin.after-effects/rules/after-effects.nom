@@ -4,7 +4,6 @@
 [After Effects application]
 description = the After Effects application — it holds `AfterFX.exe`; uninstall it through Creative Cloud
 kind = application/v1
-confidence = 0.97
 filter {
   $s has AfterFX.exe
   then $s/
@@ -19,7 +18,6 @@ filter {
 [After Effects preferences]
 description = After Effects preferences, presets and scripts for one version — it holds `{$prefs}`
 kind = settings/v1
-confidence = 0.93
 filter {
   $v has "Adobe After Effects * Prefs.txt" as $prefs
   then $v/
@@ -38,7 +36,6 @@ filter {
 description = Adobe's conformed-media cache, shared by After Effects, Premiere Pro and Media Encoder — it holds `{$marker}`; they conform the media again on the next import (Clean Database & Cache in their preferences does this safely)
 kind = cache/v1
 disposition = review
-confidence = 0.55
 filter {
   $m.dir.name == "Media Cache Files"
   $m has *.cfa | *.mpgindex as $marker

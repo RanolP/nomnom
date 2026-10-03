@@ -8,7 +8,6 @@
 [Cargo target directory]
 description = regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $t has .rustc_info.json
   $t has CACHEDIR.TAG
@@ -23,7 +22,6 @@ filter {
 [Cargo registry downloads]
 description = Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them
 kind = cache/v1
-confidence = 0.8
 filter {
   $r.dir.name == "registry"
   $r has CACHEDIR.TAG
@@ -34,7 +32,6 @@ filter {
 [Cargo registry sources]
 description = Cargo's unpacked crate sources; Cargo re-extracts them from its download cache on the next build
 kind = cache/v1
-confidence = 0.8
 filter {
   $r.dir.name == "registry"
   $r has CACHEDIR.TAG
@@ -45,7 +42,6 @@ filter {
 [Cargo git checkouts]
 description = Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build
 kind = cache/v1
-confidence = 0.8
 filter {
   $g.dir.name == "git"
   $g has CACHEDIR.TAG

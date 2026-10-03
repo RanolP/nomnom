@@ -18,7 +18,6 @@ pub struct Claim {
     /// `<pack>:<kind>`, e.g. `builtin.cargo:build-output/v1`.
     pub class: String,
     pub provenance: Provenance,
-    pub confidence: f32,
     /// Every short-form claim is exclusive; open claims arrive with the long
     /// form.
     pub exclusive: bool,
@@ -28,8 +27,12 @@ pub struct Claim {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum DropReason {
-    /// Another claim on the same node won the conflict.
+    /// An earlier rule of the same pack claimed the same node.
     Outranked { by: Provenance },
+    /// A rule of another pack claimed the same node too. Every rule matches
+    /// its own tool's signature, so one of the two signatures is wrong and
+    /// neither claim is trusted: the node stays unjudged, which keeps it.
+    Contested { with: Provenance },
     /// It lies inside another pack's exclusive claim.
     Inside { owner: Provenance },
 }

@@ -2,7 +2,6 @@
 [.mypy_cache/]
 description = regenerable: mypy incremental cache, rebuilt on the next type-check — it holds mypy's `CACHEDIR.TAG`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $c.dir.name == ".mypy_cache"
   $c has CACHEDIR.TAG

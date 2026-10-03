@@ -7,7 +7,6 @@
 [Edge HTTP cache]
 description = Edge's HTTP cache; Edge downloads pages again as you browse
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "Cache_Data"
   $c under Microsoft/
@@ -19,7 +18,6 @@ filter {
 [Edge code cache]
 description = Edge's compiled-script cache; Edge recompiles scripts as you browse
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "Code Cache"
   $c under Microsoft/

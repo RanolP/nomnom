@@ -134,8 +134,6 @@ struct Compiled<'a> {
     /// Position in the compiled list, which is what a [`Hit`] cites.
     id: usize,
     pack: usize,
-    /// Position within the pack, the last conflict tie-break.
-    order: usize,
     rule: &'a Rule,
     segments: Vec<Pattern>,
     key: Key,
@@ -193,12 +191,11 @@ struct Children<'a> {
 fn compile(packs: &[TrustedPack]) -> Vec<Compiled<'_>> {
     let mut out = Vec::new();
     for (pack, source) in packs.iter().enumerate() {
-        for (order, loaded) in source.pack.rules.iter().enumerate() {
+        for loaded in &source.pack.rules {
             let rule = &loaded.rule;
             let mut compiled = Compiled {
                 id: out.len(),
                 pack,
-                order,
                 rule,
                 segments: rule.filter.then.segments.iter().map(|s| Pattern::of(&s.value)).collect(),
                 key: Key::Universal,
@@ -560,10 +557,11 @@ struct Clock {
     now: SystemTime,
 }
 
-/// Highest confidence, then the later-resolved pack, then the earlier rule in
-/// that pack (`docs/lang.md`); the trust cap is applied to the winner only, so
-/// an untrusted pack's downgraded rule cannot lose to a weaker one and change
-/// which rule a human is shown.
+/// One node claimed by rules of two packs has no winner (`docs/lang.md`,
+/// "Conflicts"): every rule matches its own tool's signature, so one of them
+/// is wrong, and the node stays unjudged — kept. Within one pack the earlier
+/// rule wins. The trust cap is applied to the winner only, so a cap never
+/// changes which rule a human is shown.
 ///
 /// Every winner is an exclusive claim (`docs/lang.md`, "Ownership"). A claim
 /// inside another pack's claim is dropped; inside its own pack's claim it is
@@ -578,22 +576,34 @@ fn resolve(
     hits: Vec<Hit>,
     clock: &Clock,
 ) -> (Vec<(NodeId, Verdict)>, Ownership) {
-    let mut best: HashMap<NodeId, Hit> = HashMap::new();
-    // Every rule that lost the conflict on some node, as (node, rule).
-    let mut outranked: Vec<(NodeId, usize)> = Vec::new();
+    let mut by_target: HashMap<NodeId, Vec<Hit>> = HashMap::new();
     for hit in hits {
-        match best.get(&hit.target) {
-            Some(current) if !outranks(&rules[hit.rule], &rules[current.rule]) => {
-                outranked.push((hit.target, hit.rule));
-            }
-            _ => {
-                if let Some(old) = best.insert(hit.target, hit) {
-                    outranked.push((old.target, old.rule));
-                }
-            }
-        }
+        by_target.entry(hit.target).or_default().push(hit);
     }
-    let mut winners: Vec<Hit> = best.into_values().collect();
+    // Every rule that lost to an earlier rule of its pack, as (node, rule).
+    let mut outranked: Vec<(NodeId, usize)> = Vec::new();
+    // Every rule on a node another pack also claimed, as (node, rule, the
+    // first rule of another pack there).
+    let mut contested: Vec<(NodeId, usize, usize)> = Vec::new();
+    let mut winners: Vec<Hit> = Vec::new();
+    for (target, mut group) in by_target {
+        // Rule ids run pack by pack in rule order, so the lowest id is the
+        // earliest rule.
+        group.sort_unstable_by_key(|hit| hit.rule);
+        group.dedup_by_key(|hit| hit.rule);
+        let pack_of = |hit: &Hit| rules[hit.rule].pack;
+        if group.iter().any(|hit| pack_of(hit) != pack_of(&group[0])) {
+            for hit in &group {
+                let with = group.iter().find(|other| pack_of(other) != pack_of(hit));
+                let with = with.expect("a contested group spans two packs");
+                contested.push((target, hit.rule, with.rule));
+            }
+            continue;
+        }
+        let mut group = group.into_iter();
+        winners.extend(group.next());
+        outranked.extend(group.map(|hit| (target, hit.rule)));
+    }
     winners.sort_unstable_by_key(|hit| hit.target);
 
     let claim_of = |rule: usize| {
@@ -602,11 +612,17 @@ fn resolve(
         Claim {
             class: format!("{}:{}", pack.name, compiled.rule.kind.value),
             provenance: Provenance::new(&pack.name, &compiled.rule.title.value),
-            confidence: compiled.rule.confidence,
             exclusive: true,
         }
     };
-    let mut dropped: Vec<DroppedClaim> = Vec::new();
+    let mut dropped: Vec<DroppedClaim> = contested
+        .into_iter()
+        .map(|(node, rule, with)| DroppedClaim {
+            path: ctx.path(node).display().to_string(),
+            claim: claim_of(rule),
+            reason: DropReason::Contested { with: claim_of(with).provenance },
+        })
+        .collect();
     // In id order: (node, claim, enclosing claim); beside it each claim's pack
     // and the end of its id range.
     let mut claims: Vec<(NodeId, Claim, Option<usize>)> = Vec::new();
@@ -660,7 +676,6 @@ fn resolve(
             Verdict {
                 label: Label::new(&rule.kind.value.name),
                 disposition: disposition_of(capped.disposition),
-                confidence: rule.confidence,
                 reason: render_reason(&rule.description.value, &facts, &vars),
                 provenance: Provenance::new(&source.pack.name, &rule.title.value),
                 capped: capped.explanation(&source.pack.name),
@@ -682,16 +697,6 @@ fn resolve(
         a.path.cmp(&b.path).then_with(|| a.claim.provenance.cmp(&b.claim.provenance))
     });
     (out, Ownership::new(ctx, claims, dropped))
-}
-
-/// On an equal confidence a later pack takes over and a later rule in the
-/// same pack does not, which is why this cannot be one `>=`.
-fn outranks(challenger: &Compiled, holder: &Compiled) -> bool {
-    let (a, b) = (challenger.rule.confidence, holder.rule.confidence);
-    a > b
-        || (a == b
-            && (challenger.pack > holder.pack
-                || (challenger.pack == holder.pack && challenger.order < holder.order)))
 }
 
 fn disposition_of(disposition: AstDisposition) -> Disposition {

@@ -32,11 +32,11 @@ fn diagnostic_of(error: PackError) -> String {
 }
 
 const RUST_MANIFEST: &str = "name = \"rust\"\nversion = \"0.2.0\"\n\n\
-    [kinds.\"toolchain-cache/v1\"]\ndisposition = \"review\"\nconfidence = 0.4\n";
+    [kinds.\"toolchain-cache/v1\"]\ndisposition = \"review\"\n";
 
 /// The whole-directory happy path: manifest fields and declared kinds land,
 /// both `.nom` files are read, and rules come back in a deterministic order.
-/// Rule order is the last conflict tie-break in `docs/lang.md`, so a
+/// Rule order is the tie-break within a pack in `docs/lang.md`, so a
 /// readdir-order-dependent load would make verdicts differ between machines.
 #[test]
 fn a_pack_directory_loads_every_rule_file_in_a_stable_order() {
@@ -57,7 +57,6 @@ fn a_pack_directory_loads_every_rule_file_in_a_stable_order() {
     let titles: Vec<&str> = pack.rules.iter().map(|r| r.rule.title.value.as_str()).collect();
     assert_eq!(titles, ["first", "second"], "sorted by file name, not by readdir order");
     assert_eq!(pack.rules[1].rule.disposition, Disposition::Review, "the declared kind's default");
-    assert_eq!(pack.rules[1].rule.confidence, 0.4);
     assert!(pack.rules[0].file.ends_with("a-first.nom"), "provenance points at the source file");
 }
 
@@ -79,11 +78,25 @@ fn a_rule_using_an_undeclared_kind_refuses_the_pack() {
 fn a_pack_cannot_redefine_a_built_in_kind() {
     let dir = pack_dir(
         "name = \"x\"\nversion = \"0.1.0\"\n[kinds.\"build-output/v2\"]\n\
-         disposition = \"reclaimable\"\nconfidence = 1.0\n",
+         disposition = \"reclaimable\"\n",
         &[],
     );
     let rendered = diagnostic_of(load(dir.path()).expect_err("reserved kind"));
     assert!(rendered.contains("kind `build-output` is built in"), "{rendered}");
+}
+
+/// Catches a `pack.toml` still declaring a kind's `confidence` loading with
+/// the key silently ignored, or failing with a bare serde "unknown field" that
+/// does not say the key was removed.
+#[test]
+fn a_kind_still_declaring_confidence_is_told_it_was_removed() {
+    let dir = pack_dir(
+        "name = \"x\"\nversion = \"0.1.0\"\n[kinds.\"toolchain-cache/v1\"]\n\
+         disposition = \"review\"\nconfidence = 0.4\n",
+        &[],
+    );
+    let rendered = diagnostic_of(load(dir.path()).expect_err("confidence was removed"));
+    assert!(rendered.contains("`confidence` was removed"), "{rendered}");
 }
 
 /// Catches a manifest from the previous format (`labels = [...]`) loading

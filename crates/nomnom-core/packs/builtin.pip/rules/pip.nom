@@ -5,7 +5,6 @@
 [pip cache]
 description = pip's download and wheel cache; pip downloads or rebuilds on the next install
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "cache"
   $c under pip/
@@ -17,7 +16,6 @@ filter {
 [pip cache (XDG layout)]
 description = pip's download and wheel cache; pip downloads or rebuilds on the next install
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "pip"
   $c has http-v2 | http

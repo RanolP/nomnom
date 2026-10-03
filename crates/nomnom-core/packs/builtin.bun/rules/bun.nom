@@ -4,7 +4,6 @@
 [Bun install cache]
 description = Bun's package install cache; Bun re-downloads packages on the next install
 kind = cache/v1
-confidence = 0.7
 filter {
   $c.dir.name == "cache"
   $c under .bun/

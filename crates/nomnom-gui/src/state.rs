@@ -206,6 +206,7 @@ pub fn recognized_rows(catalog: &Catalog, ownership: &Ownership) -> Vec<Recogniz
             provenance: claim.claim.provenance.to_string(),
             why: match &claim.reason {
                 DropReason::Outranked { by } => format!("outranked by {by}"),
+                DropReason::Contested { with } => format!("contested with {with}; neither kept"),
                 DropReason::Inside { owner } => format!("inside {owner}'s exclusive claim"),
             },
         }));
@@ -324,7 +325,6 @@ mod tests {
             verdict: Verdict {
                 label: Label::CACHE,
                 disposition,
-                confidence: 1.0,
                 reason: "test".into(),
                 provenance: Provenance::new("p", rule),
                 capped: None,

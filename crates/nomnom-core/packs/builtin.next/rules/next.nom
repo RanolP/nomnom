@@ -3,7 +3,6 @@
 [Next.js .next/]
 description = regenerable: Next.js build output, rebuilt by `next build` — it holds Next.js's `{$marker}`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $n.dir.name == ".next"
   $n has BUILD_ID | build-manifest.json as $marker

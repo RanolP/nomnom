@@ -7,7 +7,6 @@
 [Chrome HTTP cache]
 description = Chrome's HTTP cache; Chrome downloads pages again as you browse
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "Cache_Data"
   $c under Google/
@@ -19,7 +18,6 @@ filter {
 [Chrome code cache]
 description = Chrome's compiled-script cache; Chrome recompiles scripts as you browse
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "Code Cache"
   $c under Google/

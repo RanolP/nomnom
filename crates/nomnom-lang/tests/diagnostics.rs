@@ -26,15 +26,15 @@ fn rule(keys: &str, line: &str) -> String {
 
 const KIND: &str = "kind = cache/v1";
 
-/// Catches a misspelt key (`confidense = 0.2`) being ignored, which would
-/// leave the kind's default confidence in force with no warning.
+/// Catches a misspelt key (`dispositon = keep`) being ignored, which would
+/// leave the kind's default disposition in force with no warning.
 #[test]
 fn an_unknown_key_is_rejected_instead_of_silently_ignored() {
-    let text = rule(&format!("{KIND}\nconfidense = 0.2"), "$f.is_file");
+    let text = rule(&format!("{KIND}\ndispositon = keep"), "$f.is_file");
     let diagnostic = fail(&text);
-    assert!(diagnostic.message.contains("unknown key `confidense`"), "{}", diagnostic.message);
-    assert_eq!(pointed_at(&text, &diagnostic), "confidense");
-    assert_eq!(diagnostic.help.as_deref(), Some("did you mean `confidence`?"));
+    assert!(diagnostic.message.contains("unknown key `dispositon`"), "{}", diagnostic.message);
+    assert_eq!(pointed_at(&text, &diagnostic), "dispositon");
+    assert_eq!(diagnostic.help.as_deref(), Some("did you mean `disposition`?"));
 }
 
 /// Catches a pack written against a kind (or a kind version) this build does
@@ -96,14 +96,16 @@ fn a_rule_without_a_description_is_rejected_at_its_title() {
     assert_eq!(pointed_at(&text, &diagnostic), "t");
 }
 
-/// Confidence is the first conflict tie-break, so a rule scoring 1.5 would
-/// outrank every honest rule in every pack.
+/// Catches a rule still writing the removed `confidence` key being loaded
+/// with it silently ignored, or refused without saying the key is gone.
 #[test]
-fn confidence_outside_the_unit_interval_is_rejected() {
-    let text = rule(&format!("{KIND}\nconfidence = 1.5"), "$f.is_file");
+fn a_rule_still_writing_confidence_is_told_it_was_removed() {
+    let text = rule(&format!("{KIND}\nconfidence = 0.9"), "$f.is_file");
     let diagnostic = fail(&text);
-    assert!(diagnostic.message.contains("out of range"), "{}", diagnostic.message);
-    assert_eq!(pointed_at(&text, &diagnostic), "1.5");
+    assert!(diagnostic.message.contains("unknown key `confidence`"), "{}", diagnostic.message);
+    assert_eq!(pointed_at(&text, &diagnostic), "confidence");
+    let help = diagnostic.help.as_deref().unwrap_or_default();
+    assert!(help.contains("`confidence` was removed"), "{help}");
 }
 
 /// Catches `delete` (or any other word) being read as some disposition.

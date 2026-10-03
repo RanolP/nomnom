@@ -12,7 +12,6 @@
 //!
 //! [kinds."toolchain-cache/v1"]
 //! disposition = "reclaimable"
-//! confidence = 0.7
 //! ```
 //!
 //! Fetching, caching and the lock file are deliberately not here: this module
@@ -29,7 +28,7 @@ use serde::Deserialize;
 use crate::ast::{Disposition, Rule};
 use crate::diagnostic::{Diagnostic, Source, Span};
 use crate::kind::{Kind, Kinds, RESERVED, split_id};
-use crate::parse::parse;
+use crate::parse::{CONFIDENCE_REMOVED, parse};
 
 /// A loaded pack: its manifest plus every rule in `rules/`.
 #[derive(Debug, Clone)]
@@ -39,8 +38,8 @@ pub struct Pack {
     /// Kinds this pack declares, beyond [`Kinds::builtin`].
     pub kinds: Vec<Kind>,
     /// Rules in load order: `rules/*.nom` sorted by file name, then by
-    /// position within each file. `docs/lang.md` makes rule order the last
-    /// conflict tie-break, so the order has to be a property of the directory
+    /// position within each file. `docs/lang.md` makes rule order the
+    /// tie-break within a pack, so the order has to be a property of the directory
     /// rather than of the filesystem's readdir order.
     pub rules: Vec<LoadedRule>,
     pub dir: PathBuf,
@@ -80,7 +79,10 @@ struct Manifest {
 #[serde(deny_unknown_fields)]
 struct KindDecl {
     disposition: String,
-    confidence: f64,
+    /// Read only to refuse it with [`CONFIDENCE_REMOVED`] rather than serde's
+    /// bare "unknown field".
+    #[serde(default)]
+    confidence: Option<toml::Value>,
 }
 
 /// Read `dir/pack.toml` and every `dir/rules/*.nom`, validating both.
@@ -178,11 +180,12 @@ fn declare(manifest: &Source, id: &str, decl: &KindDecl) -> Result<Kind, Diagnos
         return Err(error(format!("kind `{id}` has an unknown disposition `{}`", decl.disposition))
             .with_label("expected `keep`, `reclaimable` or `review`"));
     };
-    if !(0.0..=1.0).contains(&decl.confidence) {
-        return Err(error(format!("kind `{id}` has confidence {} out of range", decl.confidence))
-            .with_label("expected a number between 0.0 and 1.0"));
+    if decl.confidence.is_some() {
+        return Err(error(format!("kind `{id}` sets `confidence`"))
+            .with_label("no longer a kind key")
+            .with_help(CONFIDENCE_REMOVED));
     }
-    Ok(Kind::new(name, version, disposition, decl.confidence as f32))
+    Ok(Kind::new(name, version, disposition))
 }
 
 fn read(path: &Path) -> Result<String, PackError> {

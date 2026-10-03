@@ -7,7 +7,6 @@
 [npm node_modules/]
 description = regenerable: npm dependency tree, rebuilt by `npm install` — it holds npm's hidden lockfile `.package-lock.json`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $n.dir.name == "node_modules"
   $n has .package-lock.json
@@ -20,7 +19,6 @@ filter {
 [npm download cache]
 description = npm's download cache (`_cacache`); npm re-downloads packages on demand
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "_cacache"
   $c has content-v2
@@ -32,7 +30,6 @@ filter {
 [npx package cache]
 description = packages `npx` installed to run once; npx installs them again on the next run
 kind = cache/v1
-confidence = 0.8
 filter {
   $d has _cacache
   then $d/_npx/

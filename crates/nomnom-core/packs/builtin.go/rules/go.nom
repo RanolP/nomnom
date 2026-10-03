@@ -5,7 +5,6 @@
 [Go build cache]
 description = Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)
 kind = cache/v1
-confidence = 0.85
 filter {
   $c.dir.name == "go-build"
   $c has trim.txt
@@ -21,7 +20,6 @@ filter {
 [Go module download cache]
 description = Go's module download cache; Go re-downloads modules from the module proxy on demand
 kind = cache/v1
-confidence = 0.7
 filter {
   $c.dir.name == "cache"
   $c under mod/

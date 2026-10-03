@@ -7,7 +7,6 @@
 [pnpm node_modules/]
 description = regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `{$marker}`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $n.dir.name == "node_modules"
   $n has .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json as $marker
@@ -22,7 +21,6 @@ filter {
 description = pnpm's content-addressable package store; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again
 kind = cache/v1
 disposition = review
-confidence = 0.7
 filter {
   $s.dir.name == "store"
   $s under pnpm/
@@ -34,7 +32,6 @@ filter {
 description = a pnpm package store kept beside a project; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again
 kind = cache/v1
 disposition = review
-confidence = 0.7
 filter {
   $s.dir.name == ".pnpm-store"
   $s has v3 | v10 | v11
@@ -44,7 +41,6 @@ filter {
 [pnpm metadata cache]
 description = pnpm's registry metadata cache; pnpm fetches the metadata again on the next install
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "pnpm-cache"
   $c has metadata | metadata-v1.3

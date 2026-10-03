@@ -19,10 +19,10 @@ fn pack_dir(root: &Path, name: &str, rule: &str) -> PathBuf {
 }
 
 /// One rule matching a directory named `blobs`.
-fn blobs_rule(rule_name: &str, disposition: &str, confidence: &str, reason: &str) -> String {
+fn blobs_rule(rule_name: &str, disposition: &str, reason: &str) -> String {
     format!(
         "[{rule_name}]\ndescription = {reason}\nkind = cache/v1\n\
-         disposition = {disposition}\nconfidence = {confidence}\n\
+         disposition = {disposition}\n\
          filter {{\n  then $p/blobs/\n}}\n"
     )
 }
@@ -56,7 +56,7 @@ fn an_untrusted_packs_reclaimable_becomes_review_and_says_why() {
     let dir = pack_dir(
         tmp.path(),
         "vendor",
-        &blobs_rule("blob-cache", "reclaimable", "0.99", "a blob cache, refilled on demand"),
+        &blobs_rule("blob-cache", "reclaimable","a blob cache, refilled on demand"),
     );
 
     let verdict = judge_blobs(&tmp, vec![load(&dir, Trust::Untrusted)]);
@@ -76,7 +76,7 @@ fn trusting_the_same_pack_lifts_the_cap() {
     let dir = pack_dir(
         tmp.path(),
         "vendor",
-        &blobs_rule("blob-cache", "reclaimable", "0.99", "a blob cache, refilled on demand"),
+        &blobs_rule("blob-cache", "reclaimable","a blob cache, refilled on demand"),
     );
 
     let verdict = judge_blobs(&tmp, vec![load(&dir, Trust::Trusted)]);
@@ -95,49 +95,13 @@ fn an_untrusted_packs_review_is_not_reported_as_a_downgrade() {
     let dir = pack_dir(
         tmp.path(),
         "vendor",
-        &blobs_rule("blob-cache", "review", "0.99", "a blob cache, refilled on demand"),
+        &blobs_rule("blob-cache", "review","a blob cache, refilled on demand"),
     );
 
     let verdict = judge_blobs(&tmp, vec![load(&dir, Trust::Untrusted)]);
 
     assert_eq!(verdict.disposition, Disposition::Review);
     assert_eq!(verdict.capped, None);
-}
-
-/// `docs/lang.md` resolves a conflict by "1. highest confidence 2. pack
-/// precedence (later-resolved pack wins)". The regression: taking only a
-/// strictly-greater confidence, which hands every tie to the EARLIER pack and
-/// makes a project pack unable to correct a user pack at the same confidence —
-/// the exact thing the resolution order exists to allow.
-#[test]
-fn a_later_pack_wins_a_confidence_tie_against_an_earlier_one() {
-    let tmp = tree();
-    let earlier =
-        pack_dir(tmp.path(), "earlier", &blobs_rule("earlier-rule", "keep", "0.8", "earlier says"));
-    let later =
-        pack_dir(tmp.path(), "later", &blobs_rule("later-rule", "review", "0.8", "later says"));
-
-    let verdict =
-        judge_blobs(&tmp, vec![load(&earlier, Trust::Trusted), load(&later, Trust::Trusted)]);
-
-    assert_eq!(verdict.provenance.pack, "later", "later-resolved pack must win the tie");
-    assert_eq!(verdict.disposition, Disposition::Review);
-}
-
-/// Confidence still outranks pack order, so a later pack does not silently
-/// override a rule that was more certain than it.
-#[test]
-fn a_higher_confidence_earlier_rule_beats_a_later_pack() {
-    let tmp = tree();
-    let earlier =
-        pack_dir(tmp.path(), "earlier", &blobs_rule("earlier-rule", "keep", "0.9", "earlier says"));
-    let later =
-        pack_dir(tmp.path(), "later", &blobs_rule("later-rule", "review", "0.8", "later says"));
-
-    let verdict =
-        judge_blobs(&tmp, vec![load(&earlier, Trust::Trusted), load(&later, Trust::Trusted)]);
-
-    assert_eq!(verdict.provenance.pack, "earlier");
 }
 
 /// The built-in pack is `Trust::Builtin` and is never capped. The regression:

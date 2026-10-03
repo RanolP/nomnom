@@ -107,6 +107,7 @@ fn print_dropped(dropped: &[DroppedClaim], out: &mut dyn Write) -> Result<()> {
     for claim in dropped {
         let why = match &claim.reason {
             DropReason::Outranked { by } => format!("outranked by {by}"),
+            DropReason::Contested { with } => format!("contested with {with}; neither kept"),
             DropReason::Inside { owner } => format!("inside {owner}'s exclusive claim"),
         };
         writeln!(out, "  {}  {} — {why}", claim.path, claim.claim.provenance)?;

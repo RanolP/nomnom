@@ -8,7 +8,6 @@
 [.venv/]
 description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`
 kind = build-output/v1
-confidence = 0.9
 filter {
   $v.dir.name == ".venv"
   $v has pyvenv.cfg
@@ -18,7 +17,6 @@ filter {
 [venv/]
 description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`
 kind = build-output/v1
-confidence = 0.9
 filter {
   $v.dir.name == "venv"
   $v has pyvenv.cfg

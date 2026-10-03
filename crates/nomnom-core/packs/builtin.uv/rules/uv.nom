@@ -5,7 +5,6 @@
 [uv cache]
 description = uv's package cache; uv re-downloads and re-unpacks on the next sync
 kind = cache/v1
-confidence = 0.8
 filter {
   $c has archive-v0
   $c has CACHEDIR.TAG

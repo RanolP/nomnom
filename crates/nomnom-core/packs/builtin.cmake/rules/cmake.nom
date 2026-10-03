@@ -5,7 +5,6 @@
 [CMake build directory]
 description = regenerable: CMake build directory, rebuilt by configuring and building again — it holds CMake's `CMakeCache.txt`
 kind = build-output/v1
-confidence = 0.9
 filter {
   $b has CMakeCache.txt
   $b has CMakeFiles

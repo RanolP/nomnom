@@ -56,7 +56,7 @@ Claims never conflict with suggestions; a claim decides who may speak about a su
 
 Catalog ids are in preorder, so two claims are either disjoint or nested — never partially overlapping. A node's **owner is the innermost claim that contains it**, found by binary search over the claim ranges.
 
-- **Same node, two claims:** higher confidence wins, then the later pack, then the earlier rule — the same order as [Conflicts](#conflicts). The loser is logged.
+- **Same node, two claims:** from two packs, neither is kept and both are logged as contested; from one pack, the earlier rule wins and the later is logged as outranked — see [Conflicts](#conflicts).
 - **Nested inside another pack's exclusive claim:** dropped, and logged. An exclusive claim means "nothing in here belongs to anyone else": once `builtin.steam` claims a game folder, no `cache` or `build-output` rule from another pack can fire on a folder inside the game that happens to look like one.
 - **Nested inside the same pack's exclusive claim:** kept. The default Steam library sits inside the Steam client folder, and WinSxS sits inside the Windows directory; a pack may describe its own structure in layers.
 - **Nested inside an open claim:** kept, and the innermost claim owns the node.
@@ -88,7 +88,6 @@ Most plugins are a cache directory or a build directory with a signature. They s
 [Yarn node_modules/]
 description = regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $nm.dir.name == "node_modules"
   $nm has .yarn-integrity | .yarn-state.yml as $marker
@@ -99,7 +98,6 @@ filter {
 [Cargo target directory]
 description = regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $t has .rustc_info.json
   $t has CACHEDIR.TAG
@@ -116,19 +114,18 @@ From Unit 2, a short-form rule compiles to two things: an **exclusive claim** on
 | key | required | meaning |
 |---|---|---|
 | `description` | yes | the sentence a human reads before approving. A template; see below. |
-| `kind` | yes | what the path is, as `name/vN`. The kind supplies the default disposition and confidence. |
-| `confidence` | no, default the kind's | `0.0`–`1.0` |
+| `kind` | yes | what the path is, as `name/vN`. The kind supplies the default disposition. |
 | `disposition` | no, default the kind's | `keep`, `review` or `reclaimable`, and only ever a downgrade of the kind's default. A `cache/v1` rule may say `review`; a `stale-download/v1` rule may not say `reclaimable`. |
 
-An unknown key is an error, with a "did you mean" when one is close. So is a key set twice, a missing required key, and a `confidence` outside the range.
+An unknown key is an error, with a "did you mean" when one is close. So is a key set twice and a missing required key. `confidence` is no longer a key: it was a hand-picked priority number that only broke ties between rules, and [Conflicts](#conflicts) now needs none, so a rule or a `pack.toml` kind that still writes it is refused with a message saying it was removed.
 
 ### Kinds
 
-| kind | disposition | confidence |
-|---|---|---|
-| `build-output/v1` | `reclaimable` | 0.9 |
-| `cache/v1` | `reclaimable` | 0.6 |
-| `stale-download/v1` | `review` | 0.5 |
+| kind | disposition |
+|---|---|
+| `build-output/v1` | `reclaimable` |
+| `cache/v1` | `reclaimable` |
+| `stale-download/v1` | `review` |
 
 A kind is versioned so its meaning can change without silently changing every rule written against the old one: a `build-output/v2` would be a new row, and rules naming `v1` keep the `v1` defaults. A pack declares kinds of its own in `pack.toml` (see [Packs](#packs)); the built-in names are reserved.
 
@@ -300,7 +297,6 @@ filter {
 | `class` | yes | `name/vN`, declared in `pack.toml` under `[classes."name/vN"]`, where `exclusive = true` makes the claim exclusive. A class with no `exclusive` line is open. |
 | `description` | yes | why this is what the rule says it is; shown beside the claim in "Recognized". |
 | `identity` | no | a template giving a stable identity, such as `steam:app:{$app.appid}`. |
-| `confidence` | no, default 1.0 | the claim tie-break. |
 | `platform` | no | narrows the pack's `platforms` for this rule. |
 
 A classify rule produces a claim and nothing else. It never proposes removal.
@@ -322,7 +318,7 @@ filter {
 
 - `within` names the class this suggestion speaks inside, and the filter binds it in one of two ways: `claim $g is <class>` binds `$g` to the claimed node itself, with every node field plus every fact of the claim, and the target is a path from it; `$f in <class>` binds `$f` to any node strictly inside such a claim, for suggestions that judge files one by one.
 - The target must lie inside that claim, and the claim must belong to this pack. Suggestions arise only inside a classified subtree, and only from the pack that owns it.
-- The keys are the short form's (`description`, `kind`, `confidence`, `disposition`) plus `action` (see [Actions](#actions)). Without `action`, the action is a permanent delete.
+- The keys are the short form's (`description`, `kind`, `disposition`) plus `action` (see [Actions](#actions)). Without `action`, the action is a permanent delete.
 - A suggestion produces a verdict exactly as a short-form rule does: same provenance, same conflicts, same nesting.
 
 ### `lens`
@@ -444,7 +440,6 @@ exclusive = true
 
 [kinds."unplayed-game/v1"]
 disposition = "review"
-confidence = 0.9
 action = "required"
 ```
 
@@ -611,13 +606,14 @@ Cost stays O(nodes) plus seed hits, however many packs are loaded.
 
 ## Conflicts
 
-Several rules can target one node. Resolution is deterministic, in this order:
+Several rules can target one node. Every rule matches only on its own tool's evidence (see [Evidence](#evidence-every-rule-names-its-tool)), so two packs claiming the same node means one of their signatures is wrong. Resolution is deterministic and depends on no number a pack author picks:
 
-1. highest `confidence`
-2. pack precedence (later-resolved pack wins)
-3. rule order within the pack (earlier rule wins)
+1. **Rules from two or more packs on one node: no winner.** Every one of those claims is dropped and logged as contested, naming a rule of another pack it collided with. The node gets no claim and no verdict, so it stays unjudged, and unjudged means keep. `nomnom classify` and the GUI's Recognized view list contested claims with the other dropped claims.
+2. **Rules from one pack on one node: the earlier rule in the pack wins.** The later ones are logged as outranked.
 
-The trust cap (below) applies to the winner, after resolution. Then nesting is resolved: a target inside another target is dropped, whatever its confidence, because the outer verdict already decides it. Claims resolve by the same three steps (see [Ownership](#ownership)).
+The trust cap (below) applies to the winner, after resolution. Then nesting is resolved: a target inside another target is dropped, because the outer verdict already decides it. Claims resolve by the same two steps (see [Ownership](#ownership)).
+
+Pack order no longer breaks a tie: the earlier "later-resolved pack wins" step is gone, so a user or project pack cannot override a built-in rule on the same node by loading after it — the two claims contest and the node is kept. How a pack deliberately overrides another is the open design question of override packs (`extends`, see [Packs](#packs)).
 
 The winning verdict records which pack and rule produced it. With packs coming from the network, "why does nomnom want to delete this" must be answerable down to the rule, so provenance is part of the verdict rather than a debugging aid.
 
@@ -636,12 +632,11 @@ version = "0.2.0"
 
 [kinds."toolchain-cache/v1"]
 disposition = "reclaimable"
-confidence = 0.7
 ```
 
-Rule files load in file-name order, so rule order — the last conflict tie-break — is the same on every machine.
+Rule files load in file-name order, so rule order — the tie-break within a pack — is the same on every machine.
 
-Resolution order, later overriding earlier:
+Resolution order (which packs load; it no longer decides a conflict between them, see [Conflicts](#conflicts)):
 
 1. built-in, compiled into the binary: one pack per tool that creates the files, named `builtin.<tool>`, in alphabetical order — `builtin.ableton`, `builtin.after-effects`, `builtin.bun`, `builtin.cargo`, `builtin.chrome`, `builtin.cmake`, `builtin.cocoapods`, `builtin.cpython`, `builtin.dart`, `builtin.dotnet`, `builtin.downloads`, `builtin.edge`, `builtin.firefox`, `builtin.go`, `builtin.gradle`, `builtin.maven`, `builtin.mypy`, `builtin.next`, `builtin.npm`, `builtin.nuget`, `builtin.pip`, `builtin.pnpm`, `builtin.pytest`, `builtin.ruff`, `builtin.tox`, `builtin.uv`, `builtin.venv`, `builtin.vscode`, `builtin.windows-update` and `builtin.yarn`. There is no catch-all pack: every rule matches only on its tool's evidence (see [Evidence](#evidence-every-rule-names-its-tool)), so the order among built-ins decides nothing
 2. user — `%LOCALAPPDATA%\nomnom\packs\`
@@ -663,7 +658,7 @@ Cached at `%LOCALAPPDATA%\nomnom\packs\<host>\<org>\<repo>@<sha>`.
 
 Packs graduate into the built-in set by pull request, the way Mole keeps one catalog in its own tree.
 
-**Open: override packs.** Suggestions come only from the pack that owns the claim, so a pack that wants to change `builtin.steam`'s 180-day threshold cannot simply add its own `suggest … within steam-game/v1`. The likely shape is an explicit `extends = ["builtin.steam"]` in `pack.toml`, shown at trust time, under which the extending pack may suggest inside the named pack's classes and wins conflicts by ordinary pack precedence. Not decided; do not implement it before it is.
+**Open: override packs.** Suggestions come only from the pack that owns the claim, so a pack that wants to change `builtin.steam`'s 180-day threshold cannot simply add its own `suggest … within steam-game/v1`. The likely shape is an explicit `extends = ["builtin.steam"]` in `pack.toml`, shown at trust time, under which the extending pack may suggest inside the named pack's classes and wins a same-node conflict against it instead of contesting it. Not decided; do not implement it before it is.
 
 ## Trust
 

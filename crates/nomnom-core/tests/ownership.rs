@@ -11,16 +11,16 @@ use nomnom_core::catalog::{Catalog, NodeId};
 use nomnom_core::verdict::{DropReason, Provenance, TrustedPack, assess};
 use tempfile::TempDir;
 
-/// `(title, confidence, then-path)` per rule.
-fn pack(root: &Path, name: &str, rules: &[(&str, &str, &str)]) -> TrustedPack {
+/// `(title, then-path)` per rule.
+fn pack(root: &Path, name: &str, rules: &[(&str, &str)]) -> TrustedPack {
     let dir = root.join("packs").join(name);
     write(dir.join("pack.toml"), format!("name = \"{name}\"\nversion = \"0.1.0\"\n").as_bytes());
     let text: String = rules
         .iter()
-        .map(|(title, confidence, then)| {
+        .map(|(title, then)| {
             format!(
                 "[{title}]\ndescription = test rule {title}\nkind = cache/v1\n\
-                 confidence = {confidence}\nfilter {{\n  then {then}\n}}\n\n"
+                 filter {{\n  then {then}\n}}\n\n"
             )
         })
         .collect();
@@ -45,8 +45,8 @@ fn id(catalog: &Catalog, tmp: &TempDir, rel: &str) -> NodeId {
 
 fn layered_packs(tmp: &TempDir) -> Vec<TrustedPack> {
     vec![
-        pack(tmp.path(), "a", &[("Outer", "0.9", "$p/outer/"), ("Layer", "0.9", "$p/layer/")]),
-        pack(tmp.path(), "b", &[("Inner", "0.99", "$p/inner/")]),
+        pack(tmp.path(), "a", &[("Outer", "$p/outer/"), ("Layer", "$p/layer/")]),
+        pack(tmp.path(), "b", &[("Inner", "$p/inner/")]),
     ]
 }
 
@@ -98,41 +98,64 @@ fn a_claim_inside_its_own_packs_claim_is_kept_and_owns_its_subtree() {
     assert_eq!(suggested, ["Outer"]);
 }
 
-// Catches the claim resolver ordering conflicts differently from verdicts:
-// confidence first, then the later pack, then the earlier rule in a pack.
+// Catches one pack's wrong signature deciding a folder another pack also
+// claims: two packs on one node must leave it unclaimed and unsuggested, with
+// both claims logged as contested against each other.
 #[test]
-fn conflicting_claims_resolve_by_confidence_then_later_pack_then_earlier_rule() {
+fn two_packs_claiming_one_node_leave_it_unclaimed_and_both_contested() {
     let tmp = tree();
     let catalog = catalog_of(&tmp.path().join("tree"));
     let loose = id(&catalog, &tmp, "loose");
-    let winner = |packs: Vec<TrustedPack>| {
-        assess(&catalog, packs).ownership.claim_at(loose).expect("loose claimed").provenance.clone()
-    };
-
-    let strong_first = vec![
-        pack(tmp.path(), "first", &[("Strong", "0.9", "$p/loose/")]),
-        pack(tmp.path(), "second", &[("Weak", "0.5", "$p/loose/")]),
+    let packs = vec![
+        pack(tmp.path(), "early", &[("E", "$p/loose/")]),
+        pack(tmp.path(), "late", &[("L", "$p/loose/")]),
     ];
-    assert_eq!(winner(strong_first), Provenance::new("first", "Strong"));
+    let assessment = assess(&catalog, packs);
 
-    let tied = vec![
-        pack(tmp.path(), "early", &[("E", "0.7", "$p/loose/")]),
-        pack(tmp.path(), "late", &[("L1", "0.7", "$p/loose/"), ("L2", "0.7", "$p/loose/")]),
-    ];
-    let assessment = assess(&catalog, tied);
-    assert_eq!(
-        assessment.ownership.claim_at(loose).unwrap().provenance,
-        Provenance::new("late", "L1")
-    );
-    let mut losers: Vec<String> = assessment
+    assert!(assessment.ownership.claim_at(loose).is_none(), "neither claim may own it");
+    assert!(assessment.ownership.owner(id(&catalog, &tmp, "loose/x.bin")).is_none());
+    assert!(assessment.groups.iter().all(|g| g.entries.is_empty()), "nothing suggested");
+    let mut contested: Vec<(String, DropReason)> = assessment
         .ownership
         .dropped()
         .iter()
-        .filter(|d| d.reason == DropReason::Outranked { by: Provenance::new("late", "L1") })
-        .map(|d| d.claim.provenance.to_string())
+        .map(|d| (d.claim.provenance.to_string(), d.reason.clone()))
         .collect();
-    losers.sort();
-    assert_eq!(losers, ["early [E]", "late [L2]"]);
+    contested.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        contested,
+        [
+            ("early [E]".to_owned(), DropReason::Contested { with: Provenance::new("late", "L") }),
+            ("late [L]".to_owned(), DropReason::Contested { with: Provenance::new("early", "E") }),
+        ]
+    );
+}
+
+// Catches a pack's own later, narrower rule overriding its earlier one on the
+// same node: within a pack the earlier rule wins and the later is outranked,
+// never contested.
+#[test]
+fn within_one_pack_the_earlier_rule_wins_and_the_later_is_outranked() {
+    let tmp = tree();
+    let catalog = catalog_of(&tmp.path().join("tree"));
+    let loose = id(&catalog, &tmp, "loose");
+    let packs = vec![pack(tmp.path(), "one", &[("First", "$p/loose/"), ("Second", "$p/loose/")])];
+    let assessment = assess(&catalog, packs);
+
+    assert_eq!(
+        assessment.ownership.claim_at(loose).expect("loose claimed").provenance,
+        Provenance::new("one", "First")
+    );
+    let dropped: Vec<(String, DropReason)> = assessment
+        .ownership
+        .dropped()
+        .iter()
+        .map(|d| (d.claim.provenance.to_string(), d.reason.clone()))
+        .collect();
+    assert_eq!(
+        dropped,
+        [("one [Second]".to_owned(), DropReason::Outranked { by: Provenance::new("one", "First") })]
+    );
 }
 
 // Catches a suggestion landing in "Other files": nothing a pack has not

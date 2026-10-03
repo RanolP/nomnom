@@ -2,7 +2,6 @@
 [Dart .dart_tool/]
 description = regenerable: Dart tool state, rebuilt by `dart pub get` — it holds pub's `package_config.json`
 kind = build-output/v1
-confidence = 0.9
 filter {
   $d.dir.name == ".dart_tool"
   $d has package_config.json

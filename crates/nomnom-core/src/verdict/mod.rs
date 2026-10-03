@@ -169,8 +169,6 @@ impl fmt::Display for Provenance {
 pub struct Verdict {
     pub label: Label,
     pub disposition: Disposition,
-    /// 0.0..=1.0.
-    pub confidence: f32,
     /// The sentence a human reads before approving a deletion, and the slot a
     /// model fills from milestone 3 on. Never empty, and it names the concrete
     /// evidence rather than restating the label.
@@ -194,7 +192,8 @@ pub struct Verdict {
 /// Every rule verdict over the whole catalog, in id order.
 ///
 /// `packs` in resolution order: built-in first, then user, project and
-/// `--pack`, each overriding the last. A rule target is one decision for its
+/// `--pack`. Two packs claiming one node leave it unjudged (`docs/lang.md`,
+/// "Conflicts"). A rule target is one decision for its
 /// whole subtree, so no verdict lies inside another rule verdict's subtree —
 /// which is what keeps [`Rollup::reclaimable_bytes`] sound.
 pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {

@@ -1,10 +1,10 @@
 //! Every rule in the compiled-in built-in packs, on one fixture tree.
 //!
 //! The regression this catches is the one a rule pack has: a filter whose
-//! ownership signature stopped guarding, a confidence that drifted, or a
+//! ownership signature stopped guarding, a disposition that drifted, or a
 //! description that reads right but is not the sentence the tool actually
 //! prints. So it pins the whole verdict set on exactly the fields a user sees —
-//! label, disposition, confidence and the reason itself — plus the pack the
+//! label, disposition and the reason itself — plus the pack the
 //! verdict is credited to, rather than spot-checking a rule or two.
 //!
 //! The fixture also holds the directories no rule may judge: a `target/`,
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{catalog_of, write};
 use nomnom_core::action::candidates;
-use nomnom_core::verdict::{Disposition, TrustedPack, assess, judge};
+use nomnom_core::verdict::{Disposition, DropReason, TrustedPack, assess, judge};
 use tempfile::TempDir;
 
 /// What a user actually sees about one path.
@@ -28,7 +28,6 @@ struct Row {
     pack: String,
     label: String,
     disposition: Disposition,
-    confidence: f32,
     reason: String,
 }
 
@@ -198,7 +197,6 @@ fn rows(tmp: &TempDir) -> BTreeMap<String, Row> {
                     pack: verdict.provenance.pack.clone(),
                     label: verdict.label.as_str().to_owned(),
                     disposition: verdict.disposition,
-                    confidence: verdict.confidence,
                     reason: verdict.reason,
                 },
             )
@@ -208,69 +206,69 @@ fn rows(tmp: &TempDir) -> BTreeMap<String, Row> {
 
 use Disposition::{Keep, Reclaimable, Review};
 
-/// Path, pack, label, disposition, confidence, reason — in path order.
+/// Path, pack, label, disposition, reason — in path order.
 #[rustfmt::skip]
-const EXPECTED: &[(&str, &str, &str, Disposition, f32, &str)] = &[
-    ("ableton/Documents/Ableton/Live Recordings/Temp Project", "builtin.ableton", "user-content", Keep, 0.91, "an Ableton Live Project — it holds Live's `Ableton Project Info`"),
-    ("ableton/Documents/Ableton/User Library", "builtin.ableton", "user-content", Keep, 0.98, "your Ableton User Library: your own presets, samples, clips and templates"),
-    ("ableton/Live 12 Suite/Program", "builtin.ableton", "application", Keep, 0.96, "the Ableton Live application — it holds `Ableton Live 12 Suite.exe`; uninstall it from Windows Settings"),
-    ("ableton/Live 12 Suite/Resources", "builtin.ableton", "application", Keep, 0.94, "Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`"),
-    ("ableton/Local/Ableton/Cache/Cache/Decoding", "builtin.ableton", "cache", Review, 0.65, "Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)"),
-    ("ableton/Local/Ableton/Live Database", "builtin.ableton", "settings", Keep, 0.88, "Ableton Live's browser database — it holds `Live-files-12300.db`"),
-    ("ableton/Roaming/Live 12.4.6/Preferences", "builtin.ableton", "settings", Keep, 0.92, "Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`"),
-    ("after-effects/Adobe After Effects 2024/Support Files", "builtin.after-effects", "application", Keep, 0.97, "the After Effects application — it holds `AfterFX.exe`; uninstall it through Creative Cloud"),
-    ("after-effects/Roaming/After Effects/24.5", "builtin.after-effects", "settings", Keep, 0.93, "After Effects preferences, presets and scripts for one version — it holds `Adobe After Effects 24.5 Prefs.txt`"),
-    ("after-effects/Roaming/Common/Media Cache Files", "builtin.after-effects", "cache", Review, 0.55, "Adobe's conformed-media cache, shared by After Effects, Premiere Pro and Media Encoder — it holds `clip.cfa`; they conform the media again on the next import (Clean Database & Cache in their preferences does this safely)"),
-    ("bun/.bun/install/cache", "builtin.bun", "cache", Reclaimable, 0.7, "Bun's package install cache; Bun re-downloads packages on the next install"),
-    ("cargo/home/git/checkouts", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build"),
-    ("cargo/home/registry/cache", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them"),
-    ("cargo/home/registry/src", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's unpacked crate sources; Cargo re-extracts them from its download cache on the next build"),
-    ("cargo/proj/target", "builtin.cargo", "build-output", Reclaimable, 0.95, "regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`"),
-    ("chrome/Google/Chrome/User Data/Default/Cache/Cache_Data", "builtin.chrome", "cache", Reclaimable, 0.8, "Chrome's HTTP cache; Chrome downloads pages again as you browse"),
-    ("chrome/Google/Chrome/User Data/Default/Code Cache", "builtin.chrome", "cache", Reclaimable, 0.8, "Chrome's compiled-script cache; Chrome recompiles scripts as you browse"),
-    ("cmake/proj/out", "builtin.cmake", "build-output", Reclaimable, 0.9, "regenerable: CMake build directory, rebuilt by configuring and building again — it holds CMake's `CMakeCache.txt`"),
-    ("cocoapods/Pods", "builtin.cocoapods", "build-output", Reclaimable, 0.9, "regenerable: CocoaPods dependencies, rebuilt by `pod install` — it holds CocoaPods' `Manifest.lock`"),
-    ("cpython/__pycache__", "builtin.cpython", "build-output", Reclaimable, 0.95, "regenerable: Python bytecode cache, rewritten on the next import — it holds `m.cpython-312.pyc`"),
-    ("dart/.dart_tool", "builtin.dart", "build-output", Reclaimable, 0.9, "regenerable: Dart tool state, rebuilt by `dart pub get` — it holds pub's `package_config.json`"),
-    ("dotnet/proj/bin", "builtin.dotnet", "build-output", Reclaimable, 0.85, "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it"),
-    ("dotnet/proj/obj", "builtin.dotnet", "build-output", Reclaimable, 0.9, "regenerable: .NET intermediate build output, rebuilt by `dotnet build` — it holds the SDK's `project.assets.json`"),
-    ("edge/Microsoft/Edge/User Data/Default/Cache/Cache_Data", "builtin.edge", "cache", Reclaimable, 0.8, "Edge's HTTP cache; Edge downloads pages again as you browse"),
-    ("edge/Microsoft/Edge/User Data/Default/Code Cache", "builtin.edge", "cache", Reclaimable, 0.8, "Edge's compiled-script cache; Edge recompiles scripts as you browse"),
-    ("firefox/Firefox/Profiles/p.default/cache2", "builtin.firefox", "cache", Reclaimable, 0.8, "Firefox's HTTP cache; Firefox downloads pages again as you browse"),
-    ("go/go-build", "builtin.go", "cache", Reclaimable, 0.85, "Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)"),
-    ("go/pkg/mod/cache/download", "builtin.go", "cache", Reclaimable, 0.7, "Go's module download cache; Go re-downloads modules from the module proxy on demand"),
-    ("gradle/home/.gradle/caches", "builtin.gradle", "cache", Reclaimable, 0.8, "Gradle's dependency and transform caches; Gradle re-downloads and recomputes on the next build"),
-    ("gradle/home/.gradle/wrapper/dists", "builtin.gradle", "cache", Review, 0.7, "Gradle distributions downloaded by the Gradle wrapper; the wrapper downloads its version again on the next build"),
-    ("gradle/proj/.gradle", "builtin.gradle", "build-output", Reclaimable, 0.95, "regenerable: Gradle project cache, rebuilt on the next Gradle run — it holds Gradle's `buildOutputCleanup`"),
-    ("maven/.m2/repository", "builtin.maven", "cache", Review, 0.6, "Maven's local repository; Maven re-downloads what a build needs, but locally installed artifacts exist nowhere else"),
-    ("next/proj/.next", "builtin.next", "build-output", Reclaimable, 0.95, "regenerable: Next.js build output, rebuilt by `next build` — it holds Next.js's `BUILD_ID`"),
-    ("npm/npm-cache/_cacache", "builtin.npm", "cache", Reclaimable, 0.8, "npm's download cache (`_cacache`); npm re-downloads packages on demand"),
-    ("npm/npm-cache/_npx", "builtin.npm", "cache", Reclaimable, 0.8, "packages `npx` installed to run once; npx installs them again on the next run"),
-    ("npm/proj/node_modules", "builtin.npm", "build-output", Reclaimable, 0.95, "regenerable: npm dependency tree, rebuilt by `npm install` — it holds npm's hidden lockfile `.package-lock.json`"),
-    ("nuget/.nuget/packages", "builtin.nuget", "cache", Review, 0.7, "NuGet's global packages folder; `dotnet restore` re-downloads what is missing, but a package from a feed you no longer reach cannot be fetched again"),
-    ("nuget/NuGet/plugins-cache", "builtin.nuget", "cache", Reclaimable, 0.8, "NuGet's credential-plugin cache; NuGet rebuilds it on the next restore"),
-    ("nuget/NuGet/v3-cache", "builtin.nuget", "cache", Reclaimable, 0.8, "NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore"),
-    ("pip/pip/cache", "builtin.pip", "cache", Reclaimable, 0.8, "pip's download and wheel cache; pip downloads or rebuilds on the next install"),
-    ("pip/xdg/pip", "builtin.pip", "cache", Reclaimable, 0.8, "pip's download and wheel cache; pip downloads or rebuilds on the next install"),
-    ("pnpm/pnpm-cache", "builtin.pnpm", "cache", Reclaimable, 0.8, "pnpm's registry metadata cache; pnpm fetches the metadata again on the next install"),
-    ("pnpm/pnpm/store", "builtin.pnpm", "cache", Review, 0.7, "pnpm's content-addressable package store; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
-    ("pnpm/proj/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.modules.yaml`"),
-    ("pnpm/proj3/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm-workspace-state-v1.json`"),
-    ("pnpm/proj4/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm`"),
-    ("pnpm/proj2/.pnpm-store", "builtin.pnpm", "cache", Review, 0.7, "a pnpm package store kept beside a project; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
-    ("python/.mypy_cache", "builtin.mypy", "build-output", Reclaimable, 0.95, "regenerable: mypy incremental cache, rebuilt on the next type-check — it holds mypy's `CACHEDIR.TAG`"),
-    ("python/.pytest_cache", "builtin.pytest", "build-output", Reclaimable, 0.95, "regenerable: pytest run cache, rewritten on the next test run — it holds pytest's `CACHEDIR.TAG`"),
-    ("python/.ruff_cache", "builtin.ruff", "build-output", Reclaimable, 0.95, "regenerable: Ruff lint cache, rewritten on the next `ruff check` — it holds Ruff's `CACHEDIR.TAG`"),
-    ("python/.tox", "builtin.tox", "build-output", Reclaimable, 0.95, "regenerable: tox environments, rebuilt by `tox` — it holds tox's `CACHEDIR.TAG`"),
-    ("uv/cache", "builtin.uv", "cache", Reclaimable, 0.8, "uv's package cache; uv re-downloads and re-unpacks on the next sync"),
-    ("venv/p1/.venv", "builtin.venv", "build-output", Reclaimable, 0.9, "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
-    ("venv/p2/venv", "builtin.venv", "build-output", Reclaimable, 0.9, "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
-    ("vscode/Code/Cache", "builtin.vscode", "cache", Reclaimable, 0.8, "VS Code's HTTP cache; VS Code downloads again on demand"),
-    ("vscode/Code/CachedData", "builtin.vscode", "cache", Reclaimable, 0.8, "VS Code's V8 code cache, one directory per VS Code build; VS Code rebuilds it on start"),
-    ("vscode/Code/CachedExtensionVSIXs", "builtin.vscode", "cache", Reclaimable, 0.8, "extension packages VS Code downloaded; VS Code downloads them again when an extension is installed or updated"),
-    ("windows/SoftwareDistribution/Download", "builtin.windows-update", "cache", Review, 0.6, "Windows Update's download cache; Windows Update downloads again what it still needs (stop the Windows Update service first)"),
-    ("yarn/berry/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-state.yml`"),
-    ("yarn/classic/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-integrity`"),
+const EXPECTED: &[(&str, &str, &str, Disposition, &str)] = &[
+    ("ableton/Documents/Ableton/Live Recordings/Temp Project", "builtin.ableton", "user-content", Keep,"an Ableton Live Project — it holds Live's `Ableton Project Info`"),
+    ("ableton/Documents/Ableton/User Library", "builtin.ableton", "user-content", Keep,"your Ableton User Library: your own presets, samples, clips and templates"),
+    ("ableton/Live 12 Suite/Program", "builtin.ableton", "application", Keep,"the Ableton Live application — it holds `Ableton Live 12 Suite.exe`; uninstall it from Windows Settings"),
+    ("ableton/Live 12 Suite/Resources", "builtin.ableton", "application", Keep,"Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`"),
+    ("ableton/Local/Ableton/Cache/Cache/Decoding", "builtin.ableton", "cache", Review,"Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)"),
+    ("ableton/Local/Ableton/Live Database", "builtin.ableton", "settings", Keep,"Ableton Live's browser database — it holds `Live-files-12300.db`"),
+    ("ableton/Roaming/Live 12.4.6/Preferences", "builtin.ableton", "settings", Keep,"Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`"),
+    ("after-effects/Adobe After Effects 2024/Support Files", "builtin.after-effects", "application", Keep,"the After Effects application — it holds `AfterFX.exe`; uninstall it through Creative Cloud"),
+    ("after-effects/Roaming/After Effects/24.5", "builtin.after-effects", "settings", Keep,"After Effects preferences, presets and scripts for one version — it holds `Adobe After Effects 24.5 Prefs.txt`"),
+    ("after-effects/Roaming/Common/Media Cache Files", "builtin.after-effects", "cache", Review,"Adobe's conformed-media cache, shared by After Effects, Premiere Pro and Media Encoder — it holds `clip.cfa`; they conform the media again on the next import (Clean Database & Cache in their preferences does this safely)"),
+    ("bun/.bun/install/cache", "builtin.bun", "cache", Reclaimable,"Bun's package install cache; Bun re-downloads packages on the next install"),
+    ("cargo/home/git/checkouts", "builtin.cargo", "cache", Reclaimable,"Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build"),
+    ("cargo/home/registry/cache", "builtin.cargo", "cache", Reclaimable,"Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them"),
+    ("cargo/home/registry/src", "builtin.cargo", "cache", Reclaimable,"Cargo's unpacked crate sources; Cargo re-extracts them from its download cache on the next build"),
+    ("cargo/proj/target", "builtin.cargo", "build-output", Reclaimable,"regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`"),
+    ("chrome/Google/Chrome/User Data/Default/Cache/Cache_Data", "builtin.chrome", "cache", Reclaimable,"Chrome's HTTP cache; Chrome downloads pages again as you browse"),
+    ("chrome/Google/Chrome/User Data/Default/Code Cache", "builtin.chrome", "cache", Reclaimable,"Chrome's compiled-script cache; Chrome recompiles scripts as you browse"),
+    ("cmake/proj/out", "builtin.cmake", "build-output", Reclaimable,"regenerable: CMake build directory, rebuilt by configuring and building again — it holds CMake's `CMakeCache.txt`"),
+    ("cocoapods/Pods", "builtin.cocoapods", "build-output", Reclaimable,"regenerable: CocoaPods dependencies, rebuilt by `pod install` — it holds CocoaPods' `Manifest.lock`"),
+    ("cpython/__pycache__", "builtin.cpython", "build-output", Reclaimable,"regenerable: Python bytecode cache, rewritten on the next import — it holds `m.cpython-312.pyc`"),
+    ("dart/.dart_tool", "builtin.dart", "build-output", Reclaimable,"regenerable: Dart tool state, rebuilt by `dart pub get` — it holds pub's `package_config.json`"),
+    ("dotnet/proj/bin", "builtin.dotnet", "build-output", Reclaimable,"regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it"),
+    ("dotnet/proj/obj", "builtin.dotnet", "build-output", Reclaimable,"regenerable: .NET intermediate build output, rebuilt by `dotnet build` — it holds the SDK's `project.assets.json`"),
+    ("edge/Microsoft/Edge/User Data/Default/Cache/Cache_Data", "builtin.edge", "cache", Reclaimable,"Edge's HTTP cache; Edge downloads pages again as you browse"),
+    ("edge/Microsoft/Edge/User Data/Default/Code Cache", "builtin.edge", "cache", Reclaimable,"Edge's compiled-script cache; Edge recompiles scripts as you browse"),
+    ("firefox/Firefox/Profiles/p.default/cache2", "builtin.firefox", "cache", Reclaimable,"Firefox's HTTP cache; Firefox downloads pages again as you browse"),
+    ("go/go-build", "builtin.go", "cache", Reclaimable,"Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)"),
+    ("go/pkg/mod/cache/download", "builtin.go", "cache", Reclaimable,"Go's module download cache; Go re-downloads modules from the module proxy on demand"),
+    ("gradle/home/.gradle/caches", "builtin.gradle", "cache", Reclaimable,"Gradle's dependency and transform caches; Gradle re-downloads and recomputes on the next build"),
+    ("gradle/home/.gradle/wrapper/dists", "builtin.gradle", "cache", Review,"Gradle distributions downloaded by the Gradle wrapper; the wrapper downloads its version again on the next build"),
+    ("gradle/proj/.gradle", "builtin.gradle", "build-output", Reclaimable,"regenerable: Gradle project cache, rebuilt on the next Gradle run — it holds Gradle's `buildOutputCleanup`"),
+    ("maven/.m2/repository", "builtin.maven", "cache", Review,"Maven's local repository; Maven re-downloads what a build needs, but locally installed artifacts exist nowhere else"),
+    ("next/proj/.next", "builtin.next", "build-output", Reclaimable,"regenerable: Next.js build output, rebuilt by `next build` — it holds Next.js's `BUILD_ID`"),
+    ("npm/npm-cache/_cacache", "builtin.npm", "cache", Reclaimable,"npm's download cache (`_cacache`); npm re-downloads packages on demand"),
+    ("npm/npm-cache/_npx", "builtin.npm", "cache", Reclaimable,"packages `npx` installed to run once; npx installs them again on the next run"),
+    ("npm/proj/node_modules", "builtin.npm", "build-output", Reclaimable,"regenerable: npm dependency tree, rebuilt by `npm install` — it holds npm's hidden lockfile `.package-lock.json`"),
+    ("nuget/.nuget/packages", "builtin.nuget", "cache", Review,"NuGet's global packages folder; `dotnet restore` re-downloads what is missing, but a package from a feed you no longer reach cannot be fetched again"),
+    ("nuget/NuGet/plugins-cache", "builtin.nuget", "cache", Reclaimable,"NuGet's credential-plugin cache; NuGet rebuilds it on the next restore"),
+    ("nuget/NuGet/v3-cache", "builtin.nuget", "cache", Reclaimable,"NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore"),
+    ("pip/pip/cache", "builtin.pip", "cache", Reclaimable,"pip's download and wheel cache; pip downloads or rebuilds on the next install"),
+    ("pip/xdg/pip", "builtin.pip", "cache", Reclaimable,"pip's download and wheel cache; pip downloads or rebuilds on the next install"),
+    ("pnpm/pnpm-cache", "builtin.pnpm", "cache", Reclaimable,"pnpm's registry metadata cache; pnpm fetches the metadata again on the next install"),
+    ("pnpm/pnpm/store", "builtin.pnpm", "cache", Review,"pnpm's content-addressable package store; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
+    ("pnpm/proj/node_modules", "builtin.pnpm", "build-output", Reclaimable,"regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.modules.yaml`"),
+    ("pnpm/proj3/node_modules", "builtin.pnpm", "build-output", Reclaimable,"regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm-workspace-state-v1.json`"),
+    ("pnpm/proj4/node_modules", "builtin.pnpm", "build-output", Reclaimable,"regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm`"),
+    ("pnpm/proj2/.pnpm-store", "builtin.pnpm", "cache", Review,"a pnpm package store kept beside a project; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
+    ("python/.mypy_cache", "builtin.mypy", "build-output", Reclaimable,"regenerable: mypy incremental cache, rebuilt on the next type-check — it holds mypy's `CACHEDIR.TAG`"),
+    ("python/.pytest_cache", "builtin.pytest", "build-output", Reclaimable,"regenerable: pytest run cache, rewritten on the next test run — it holds pytest's `CACHEDIR.TAG`"),
+    ("python/.ruff_cache", "builtin.ruff", "build-output", Reclaimable,"regenerable: Ruff lint cache, rewritten on the next `ruff check` — it holds Ruff's `CACHEDIR.TAG`"),
+    ("python/.tox", "builtin.tox", "build-output", Reclaimable,"regenerable: tox environments, rebuilt by `tox` — it holds tox's `CACHEDIR.TAG`"),
+    ("uv/cache", "builtin.uv", "cache", Reclaimable,"uv's package cache; uv re-downloads and re-unpacks on the next sync"),
+    ("venv/p1/.venv", "builtin.venv", "build-output", Reclaimable,"regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
+    ("venv/p2/venv", "builtin.venv", "build-output", Reclaimable,"regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
+    ("vscode/Code/Cache", "builtin.vscode", "cache", Reclaimable,"VS Code's HTTP cache; VS Code downloads again on demand"),
+    ("vscode/Code/CachedData", "builtin.vscode", "cache", Reclaimable,"VS Code's V8 code cache, one directory per VS Code build; VS Code rebuilds it on start"),
+    ("vscode/Code/CachedExtensionVSIXs", "builtin.vscode", "cache", Reclaimable,"extension packages VS Code downloaded; VS Code downloads them again when an extension is installed or updated"),
+    ("windows/SoftwareDistribution/Download", "builtin.windows-update", "cache", Review,"Windows Update's download cache; Windows Update downloads again what it still needs (stop the Windows Update service first)"),
+    ("yarn/berry/node_modules", "builtin.yarn", "build-output", Reclaimable,"regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-state.yml`"),
+    ("yarn/classic/node_modules", "builtin.yarn", "build-output", Reclaimable,"regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-integrity`"),
 ];
 
 #[test]
@@ -278,12 +276,11 @@ fn the_built_in_packs_judge_the_fixture_exactly_as_written() {
     let tmp = fixture();
     let mut actual = rows(&tmp);
 
-    for (path, pack, label, disposition, confidence, reason) in EXPECTED {
+    for (path, pack, label, disposition, reason) in EXPECTED {
         let want = Row {
             pack: (*pack).into(),
             label: (*label).into(),
             disposition: *disposition,
-            confidence: *confidence,
             reason: (*reason).into(),
         };
         assert_eq!(actual.remove(*path).as_ref(), Some(&want), "{path}");
@@ -337,13 +334,35 @@ fn a_name_without_its_tool_s_signature_is_never_judged() {
     }
 }
 
-/// "Later pack wins" on an equal confidence, so a built-in rule that overlaps
-/// another built-in pack's rule makes verdicts depend on the order of the
-/// `PACKS` list. The regression: a new rule that claims a target another
-/// pack's rule already claims — say a `node_modules` holding both npm's and
-/// pnpm's marker — with the winner decided by list position rather than by
-/// anyone's intent. The crowded tree puts every signature inside and beside
-/// every name a rule targets, which is where such an overlap would surface.
+/// The regression: two built-in packs whose signatures both fire on one
+/// folder of the fixture. Such a folder is contested and left unjudged, so
+/// the overlap would otherwise surface only as a fixture path quietly losing
+/// its verdict — this names the two rules instead.
+#[test]
+fn the_built_in_packs_contest_no_node_of_the_fixture() {
+    let tmp = fixture();
+    let assessment = assess(&catalog_of(tmp.path()), TrustedPack::builtins());
+    let contested: Vec<String> = assessment
+        .ownership
+        .dropped()
+        .iter()
+        .filter_map(|d| match &d.reason {
+            DropReason::Contested { with } => {
+                Some(format!("{}: {} vs {with}", d.path, d.claim.provenance))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(contested.is_empty(), "built-in packs contest: {contested:#?}");
+}
+
+/// Conflicts across packs leave a node unjudged, and within a pack the earlier
+/// rule wins, so no verdict may depend on the order of the `PACKS` list. The
+/// regression: a resolver change that brings back a pack-order tie-break, so
+/// that a `node_modules` holding both npm's and pnpm's marker is decided by
+/// list position rather than by anyone's intent. The crowded tree puts every
+/// signature inside and beside every name a rule targets, which is where such
+/// an overlap would surface.
 #[test]
 fn the_built_in_packs_judge_the_same_in_either_order() {
     let tmp = fixture();

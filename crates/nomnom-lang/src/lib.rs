@@ -39,7 +39,7 @@
 //! ");
 //! let rules = parse(&source, &Kinds::builtin()).expect("valid rule");
 //! assert_eq!(rules[0].title.value, "Cargo target/");
-//! assert_eq!(rules[0].confidence, 0.9, "the kind's default");
+//! assert_eq!(rules[0].disposition.name(), "reclaimable", "the kind's default");
 //! ```
 
 pub mod ast;

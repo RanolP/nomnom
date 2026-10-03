@@ -3,7 +3,6 @@
 [Firefox HTTP cache]
 description = Firefox's HTTP cache; Firefox downloads pages again as you browse
 kind = cache/v1
-confidence = 0.8
 filter {
   $c.dir.name == "cache2"
   $c under Firefox/

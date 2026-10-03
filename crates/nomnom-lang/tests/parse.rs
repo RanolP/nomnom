@@ -26,7 +26,6 @@ const SPEC: &str = "\
 [build/ beside a manifest]
 description = build output, rebuilt by the project's build command — `{$marker}` sits beside it
 kind = build-output/v1
-confidence = 0.9
 filter {
   $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
   then $dir/build/
@@ -60,16 +59,14 @@ fn the_spec_rule_parses_with_every_part_intact() {
     assert!(then.dir, "the trailing `/` requires a directory");
 }
 
-/// Catches a rule that loses its kind's defaults when it omits them: the kind,
-/// not a hard-coded fallback, is where an unset disposition and confidence
-/// come from.
+/// Catches a rule that loses its kind's default when it omits it: the kind,
+/// not a hard-coded fallback, is where an unset disposition comes from.
 #[test]
-fn an_unset_confidence_and_disposition_come_from_the_kind() {
+fn an_unset_disposition_comes_from_the_kind() {
     let rule = one(
         "[s]\ndescription = old\nkind = stale-download/v1\nfilter {\n  $f.is_file\n  then $f\n}\n",
     );
     assert_eq!(rule.disposition, Disposition::Review);
-    assert_eq!(rule.confidence, 0.5);
 }
 
 /// Catches a downgrade being refused along with an upgrade: moving down from
@@ -78,10 +75,9 @@ fn an_unset_confidence_and_disposition_come_from_the_kind() {
 fn a_disposition_below_the_kind_is_accepted() {
     let rule = one(
         "[t]\ndescription = maybe\nkind = build-output/v1\ndisposition = review\n\
-         confidence = 0.35\nfilter {\n  $d lacks Cargo.toml\n  then $d/target/\n}\n",
+         filter {\n  $d lacks Cargo.toml\n  then $d/target/\n}\n",
     );
     assert_eq!(rule.disposition, Disposition::Review);
-    assert_eq!(rule.confidence, 0.35);
 }
 
 /// Catches a glob compared as a literal name (or the reverse), which would

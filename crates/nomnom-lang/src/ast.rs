@@ -2,7 +2,7 @@
 //!
 //! Everything in here is already checked: a [`Rule`] that exists has a
 //! non-empty description whose `{holes}` all resolve, a kind the pack knows, a
-//! confidence inside `0.0..=1.0`, a disposition no stronger than its kind's,
+//! disposition no stronger than its kind's,
 //! and a filter whose every variable is bound and whose every field test is
 //! well-typed against [`crate::vocab`]. An evaluator walking this tree has no
 //! validation left to do and no error case to invent.
@@ -38,8 +38,6 @@ pub struct Rule {
     /// The kind this rule concludes, already resolved against the kinds the
     /// pack may use.
     pub kind: Spanned<Kind>,
-    /// The kind's default unless the rule overrode it.
-    pub confidence: f32,
     /// The kind's default unless the rule downgraded it.
     pub disposition: Disposition,
     pub filter: Filter,

@@ -15,7 +15,6 @@ filter {
 [.NET bin/]
 description = regenerable: .NET build output, rebuilt by `dotnet build` — `{$project}` sits beside it
 kind = build-output/v1
-confidence = 0.85
 filter {
   $p has *.csproj | *.fsproj | *.vbproj as $project
   then $p/bin/

@@ -7,7 +7,6 @@
 [Yarn node_modules/]
 description = regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $n.dir.name == "node_modules"
   $n has .yarn-integrity | .yarn-state.yml as $marker

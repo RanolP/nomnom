@@ -1,8 +1,8 @@
 //! What a rule concludes a path *is*: `build-output/v1`, `cache/v1`, ….
 //!
-//! A kind carries the defaults every rule of that kind starts from — the
-//! disposition and the confidence — so a rule says what it found and the kind
-//! says what that finding is worth. The version is part of the name because a
+//! A kind carries the default disposition every rule of that kind starts
+//! from, so a rule says what it found and the kind says what that finding is
+//! worth. The version is part of the name because a
 //! kind's meaning is a contract with whoever reads the verdict: a pack written
 //! against `cache/v1` must be refused, not silently reinterpreted, once the
 //! only `cache` that exists is `cache/v2`.
@@ -20,12 +20,11 @@ pub struct Kind {
     pub name: String,
     pub version: u32,
     pub disposition: Disposition,
-    pub confidence: f32,
 }
 
 impl Kind {
-    pub fn new(name: &str, version: u32, disposition: Disposition, confidence: f32) -> Kind {
-        Kind { name: name.to_owned(), version, disposition, confidence }
+    pub fn new(name: &str, version: u32, disposition: Disposition) -> Kind {
+        Kind { name: name.to_owned(), version, disposition }
     }
 }
 
@@ -60,9 +59,9 @@ impl Kinds {
     pub fn builtin() -> Kinds {
         Kinds {
             kinds: vec![
-                Kind::new("build-output", 1, Disposition::Reclaimable, 0.9),
-                Kind::new("cache", 1, Disposition::Reclaimable, 0.6),
-                Kind::new("stale-download", 1, Disposition::Review, 0.5),
+                Kind::new("build-output", 1, Disposition::Reclaimable),
+                Kind::new("cache", 1, Disposition::Reclaimable),
+                Kind::new("stale-download", 1, Disposition::Review),
             ],
         }
     }

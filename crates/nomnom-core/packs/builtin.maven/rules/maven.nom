@@ -8,7 +8,6 @@
 description = Maven's local repository; Maven re-downloads what a build needs, but locally installed artifacts exist nowhere else
 kind = cache/v1
 disposition = review
-confidence = 0.6
 filter {
   $m.dir.name == ".m2"
   then $m/repository/

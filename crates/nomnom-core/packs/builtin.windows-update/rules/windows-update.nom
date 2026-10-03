@@ -5,7 +5,6 @@
 description = Windows Update's download cache; Windows Update downloads again what it still needs (stop the Windows Update service first)
 kind = cache/v1
 disposition = review
-confidence = 0.6
 filter {
   $s.dir.name == "SoftwareDistribution"
   $s has DataStore

@@ -8,7 +8,6 @@
 [NuGet HTTP cache]
 description = NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore
 kind = cache/v1
-confidence = 0.8
 filter {
   $n.dir.name == "NuGet"
   then $n/v3-cache/
@@ -17,7 +16,6 @@ filter {
 [NuGet plugins cache]
 description = NuGet's credential-plugin cache; NuGet rebuilds it on the next restore
 kind = cache/v1
-confidence = 0.8
 filter {
   $n.dir.name == "NuGet"
   then $n/plugins-cache/
@@ -29,7 +27,6 @@ filter {
 description = NuGet's global packages folder; `dotnet restore` re-downloads what is missing, but a package from a feed you no longer reach cannot be fetched again
 kind = cache/v1
 disposition = review
-confidence = 0.7
 filter {
   $n.dir.name == ".nuget"
   then $n/packages/

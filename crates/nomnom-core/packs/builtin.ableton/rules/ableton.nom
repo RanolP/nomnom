@@ -4,7 +4,6 @@
 [Ableton Live application]
 description = the Ableton Live application — it holds `{$exe}`; uninstall it from Windows Settings
 kind = application/v1
-confidence = 0.96
 filter {
   $p has "Ableton Live *.exe" as $exe
   $p has "Ableton Live Engine.dll"
@@ -17,7 +16,6 @@ filter {
 [Ableton Live resources]
 description = Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`
 kind = application/v1
-confidence = 0.94
 filter {
   $r has GUI.alp
   $r has "Core Library"
@@ -32,7 +30,6 @@ filter {
 [Ableton Live preferences]
 description = Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`
 kind = settings/v1
-confidence = 0.92
 filter {
   $p has Preferences.cfg
   $p has Library.cfg
@@ -44,7 +41,6 @@ filter {
 [Ableton Live database]
 description = Ableton Live's browser database — it holds `{$db}`
 kind = settings/v1
-confidence = 0.88
 filter {
   $d has "Live-files-*.db" as $db
   then $d/
@@ -59,7 +55,6 @@ filter {
 [Ableton User Library]
 description = your Ableton User Library: your own presets, samples, clips and templates
 kind = user-content/v1
-confidence = 0.98
 filter {
   $u.dir.name == "User Library"
   $u under Ableton/
@@ -73,7 +68,6 @@ filter {
 [Ableton Live Project]
 description = an Ableton Live Project — it holds Live's `Ableton Project Info`
 kind = user-content/v1
-confidence = 0.91
 filter {
   $p has "Ableton Project Info"
   then $p/
@@ -92,7 +86,6 @@ filter {
 description = Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)
 kind = cache/v1
 disposition = review
-confidence = 0.65
 filter {
   $a has "Live Database"
   then $a/Cache/Cache/Decoding/

@@ -2,7 +2,6 @@
 [CocoaPods Pods/]
 description = regenerable: CocoaPods dependencies, rebuilt by `pod install` — it holds CocoaPods' `Manifest.lock`
 kind = build-output/v1
-confidence = 0.9
 filter {
   $p.dir.name == "Pods"
   $p has Manifest.lock

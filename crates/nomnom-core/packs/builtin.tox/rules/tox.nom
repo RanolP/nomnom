@@ -2,7 +2,6 @@
 [.tox/]
 description = regenerable: tox environments, rebuilt by `tox` — it holds tox's `CACHEDIR.TAG`
 kind = build-output/v1
-confidence = 0.95
 filter {
   $t.dir.name == ".tox"
   $t has CACHEDIR.TAG
