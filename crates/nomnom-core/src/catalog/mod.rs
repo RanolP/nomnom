@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -477,6 +478,7 @@ impl Catalog {
     /// hard link's extra names are the same file, not a copy of it, so only
     /// its primary name takes part.
     pub fn duplicate_groups(&self, min_size: u64) -> Vec<Vec<NodeId>> {
+        let started = Instant::now();
         let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
         for node in &self.nodes {
             if node.kind == EntryKind::File && !node.extra_link && node.size >= min_size {
@@ -485,29 +487,71 @@ impl Catalog {
         }
         let candidates: Vec<NodeId> =
             by_size.into_values().filter(|group| group.len() >= 2).flatten().collect();
+        let started = timings::lap("duplicates: size buckets", started);
 
-        let hashed: Vec<(NodeId, [u8; 32])> = candidates
-            .par_iter()
-            .filter_map(|&id| self.content_hash(id).map(|h| (id, *h.as_bytes())))
-            .collect();
+        // Same-size files almost always differ in their first or last bytes,
+        // so a sample of both ends rules most of them out without the full
+        // read. It only narrows: equal contents always sample equal, and the
+        // full hash below still decides every group.
+        let sampled = self.colliding(&candidates, |id| self.sample_hash(id));
+        let survivors: Vec<NodeId> = sampled.into_iter().flatten().collect();
+        let started = timings::lap(
+            &format!(
+                "duplicates: sample {} files -> {} ({} MiB)",
+                candidates.len(),
+                survivors.len(),
+                self.total_size(&survivors) >> 20,
+            ),
+            started,
+        );
 
-        let mut by_hash: HashMap<(u64, [u8; 32]), Vec<NodeId>> = HashMap::new();
-        for (id, hash) in hashed {
-            by_hash.entry((self.nodes[id.index()].size, hash)).or_default().push(id);
+        let mut groups =
+            self.colliding(&survivors, |id| self.content_hash(id).map(|h| *h.as_bytes()));
+        for group in &mut groups {
+            group.sort_unstable();
         }
-
-        let mut groups: Vec<Vec<NodeId>> = by_hash
-            .into_values()
-            .filter(|group| group.len() >= 2)
-            .map(|mut group| {
-                group.sort_unstable();
-                group
-            })
-            .collect();
         groups.sort_unstable();
+        timings::lap("duplicates: full hash", started);
         groups
     }
+
+    /// Groups of 2+ of `ids` with the same size and the same `key`. A file
+    /// `key` cannot read takes no part.
+    fn colliding(
+        &self,
+        ids: &[NodeId],
+        key: impl Fn(NodeId) -> Option<[u8; 32]> + Sync,
+    ) -> Vec<Vec<NodeId>> {
+        let keyed: Vec<(NodeId, [u8; 32])> =
+            ids.par_iter().filter_map(|&id| key(id).map(|k| (id, k))).collect();
+        let mut by_key: HashMap<(u64, [u8; 32]), Vec<NodeId>> = HashMap::new();
+        for (id, k) in keyed {
+            by_key.entry((self.nodes[id.index()].size, k)).or_default().push(id);
+        }
+        by_key.into_values().filter(|group| group.len() >= 2).collect()
+    }
+
+    fn total_size(&self, ids: &[NodeId]) -> u64 {
+        ids.iter().map(|id| self.nodes[id.index()].size).sum()
+    }
+
+    /// blake3 of the file's first and last [`SAMPLE_BYTES`], or of all of it
+    /// when it is shorter than both.
+    fn sample_hash(&self, id: NodeId) -> Option<[u8; 32]> {
+        let mut file = std::fs::File::open(self.path(id)).ok()?;
+        let mut sample = Vec::with_capacity(2 * SAMPLE_BYTES as usize);
+        (&mut file).take(SAMPLE_BYTES).read_to_end(&mut sample).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > 2 * SAMPLE_BYTES {
+            file.seek(SeekFrom::Start(len - SAMPLE_BYTES)).ok()?;
+        }
+        file.take(SAMPLE_BYTES).read_to_end(&mut sample).ok()?;
+        Some(*blake3::hash(&sample).as_bytes())
+    }
 }
+
+/// How much of each end of a file [`Catalog::sample_hash`] reads.
+const SAMPLE_BYTES: u64 = 64 * 1024;
 
 #[cfg(test)]
 mod tests {

@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use serde::Serialize;
 
 use super::{Disposition, DslJudge, Judge, Label, TrustedPack, Verdict, assess_all};
 use crate::catalog::Catalog;
+use crate::timings;
 
 pub struct Assessment {
     /// The catalog root the entries' paths lie under, which is also the fence
@@ -104,7 +106,9 @@ pub fn charges(entries: &[&Entry], shared: &[SharedFile]) -> Vec<u64> {
 /// [`super::resolve_packs`].
 pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
     let judge: &dyn Judge = &DslJudge::with_packs(catalog, packs);
+    let started = Instant::now();
     let verdicts = assess_all(judge, catalog);
+    let started = timings::lap("assess: rule walk", started);
 
     let mut spans: Vec<(u32, u32)> = verdicts
         .iter()
@@ -161,5 +165,6 @@ pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
         .filter(|entry| entry.verdict.disposition == Disposition::Reclaimable)
         .collect();
     let reclaimable_bytes = charges(&reclaimable, &shared).iter().sum();
+    timings::lap("assess: group, sort, shared links", started);
     Assessment { root: catalog.path(catalog.root()), groups, reclaimable_bytes, shared }
 }

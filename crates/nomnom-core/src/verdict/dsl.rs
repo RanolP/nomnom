@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use globset::{GlobBuilder, GlobMatcher};
 use nomnom_lang::ast::{Disposition as AstDisposition, Expr, Literal};
@@ -31,6 +31,7 @@ use super::duplicate::{DuplicateFacts, MIN_DUPLICATE_SIZE};
 use super::{Disposition, Judge, Label, Provenance, Verdict, builtin_pack, name_eq, node_name};
 use crate::catalog::{Catalog, NodeId};
 use crate::scan::EntryKind;
+use crate::timings;
 
 /// A loaded pack plus the trust that decides whether its rules may propose a
 /// deletion.
@@ -87,6 +88,7 @@ impl DslJudge {
         // with no duplicate facts available, which is why `is_duplicate` reads
         // `false` during this pass: a rule cannot make a subtree a unit on the
         // strength of a duplicate, and the alternative is a cycle.
+        let started = Instant::now();
         let mut units = HashSet::new();
         let mut queue = vec![ctx.root()];
         let mut cursor = 0;
@@ -102,7 +104,9 @@ impl DslJudge {
             queue.extend_from_slice(ctx.children(id));
         }
 
+        let started = timings::lap("assess: unit set", started);
         let duplicates = DuplicateFacts::build(ctx, MIN_DUPLICATE_SIZE, &units);
+        timings::lap("assess: duplicate facts total", started);
         Self { packs: probe.packs, globs: probe.globs, units, duplicates }
     }
 
