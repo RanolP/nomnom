@@ -386,7 +386,7 @@ The language used to promise that no rule reads the inside of a file. Tables end
 - It is a regular file and not a reparse point: checked with `symlink_metadata`, and opened with `FILE_FLAG_OPEN_REPARSE_POINT` on Windows.
 - Its catalog size is under the per-file cap before it is opened, and the reader reads at most `cap + 1` bytes, so a file that grew since the scan counts as over the cap.
 
-**Cross-volume reads are allowed.** A read may cross to another volume when its anchor is verified, and verification may itself cross volumes: the Steam client on `C:` reads `libraryfolders.vdf`, and a library folder on `D:` becomes a verified anchor only because the client's own manifest lists it. A folder on `D:` that merely holds `steamapps/` and is not listed is not a library, and Steam's play data in `C:`'s `localconfig.vdf` joins to games on any volume. This is about reading. Removal stays fenced to the scan root, as [Guards](#guards-belong-to-the-engine-not-to-rules) says.
+**Cross-volume reads are allowed.** A read may cross to another volume when its anchor is verified, and verification may itself cross volumes: the Steam client on `C:` reads `libraryfolders.vdf`, and a library folder on `D:` becomes a verified anchor only because the client's own manifest lists it. A folder on `D:` that merely holds `steamapps/` and is not listed is not a library, and Steam's play data in `C:`'s `localconfig.vdf` joins to games on any volume. This is about reading. A permanent delete stays fenced to the scan root and to its volume, as [Guards](#guards-belong-to-the-engine-not-to-rules) says. An `Action::Request` is not fenced the same way: it hands the removal to the owning program and deletes nothing itself, so a request onto a verified anchor — the `D:` library above — is allowed even though that anchor sits outside the scan root. See [Actions](#actions).
 
 **Ceilings.** The engine's are hard: **16 MiB per file; 4,096 files or 64 MiB per pack; 256 MiB per run.** `pack.toml` may only lower them:
 
@@ -416,7 +416,7 @@ A suggestion's `action` names a **handler** from a registry compiled into the bi
 - The registry holds fixed templates with typed parameters. `steam.uninstall(appid: num)` renders `steam://uninstall/<appid>`; `windows.storage-settings` opens Windows' own Storage settings page, which does the cleanup with its own elevation.
 - **Arguments are typed — numbers or enums, never strings** — so nothing can be smuggled into a URI. A pack never defines a scheme or a template. The parser checks the handler name and its argument types against the registry, and the pack must list each handler it uses in `pack.toml`: `handlers = ["steam.uninstall"]`.
 - A kind may declare `action = "required"` in `pack.toml`, so a rule of that kind cannot fall back to a delete. **Steam games are removed only through `steam://uninstall/<appid>`, never by deleting their folder**: Steam owns its library and confirms the removal itself.
-- The plan stores `Action::Request { path, handler, args }`, with **no URI string**. The `path` is the claimed folder, fenced like a delete. Validation re-renders the URI from the handler and its arguments, so a plan loaded from JSON cannot carry a URI.
+- The plan stores `Action::Request { path, handler, args }`, with **no URI string**. The `path` is the claimed folder. Unlike a delete, it may lie outside the scan root and on another volume, when the claim's anchor is a **verified anchor** — a Steam library the client's own `libraryfolders.vdf` lists, for example (see [Reads and caps](#reads-and-caps)). A raw permanent delete keeps the existing guard: refused outside the scan root or on another volume, with no such exception, because a delete unlinks the bytes itself and a request only asks the owning program to. Validation re-renders the URI from the handler and its arguments, so a plan loaded from JSON cannot carry a URI.
 - Before launching, apply checks that the scheme handler is registered on this machine. If it is not, that one record fails and the run continues.
 - The apply log gains a `requested` status, counted separately: "deleted 3.1 GB · requested 48.2 GB from Steam (unconfirmed)". The next scan shows what the owning program actually did.
 
@@ -545,6 +545,7 @@ What this shows:
 - **The never-played suggestion is safe by construction.** `played_found` is false only when every `localconfig.vdf` was read and parsed in full and none lists the game. A cap hit, a parse error or a missing file makes it absent, and `not` of an absent bool is false.
 - **The threshold is fixed at 180 days** in v1. A user who wants another one installs an override pack; how an override pack may speak inside `builtin.steam`'s claims is still open (see [Packs](#packs)).
 - **Removal is a request.** The plan line reads `request  steam.uninstall 1245620  48.2 GB  Elden Ring …  builtin.steam [Steam game not played in 180 days]`, and Steam asks the user to confirm.
+- **The library can sit on another volume.** A library on `D:` while the scan root is `C:` is ordinary: `libraryfolders.vdf` makes it a verified anchor, so the request is allowed to name a game folder there. Nothing is deleted outside the scan root or on another volume — the request only asks Steam to act, and Steam owns that volume's bytes already.
 
 ## Worked example: Downloads
 
@@ -651,6 +652,8 @@ Built-in packs live in `crates/nomnom-core/packs/<pack>/`. Today each one is lis
 
 Git-backed packs are fetched by URL and **pinned to a commit**, never to a branch, and recorded in `.nomnom/packs.lock` with a content checksum. A pack that changes under a fixed reference is a supply-chain event, so the lock is what is loaded and a drifting remote is an error rather than an upgrade.
 
+The trust gate (see [Trust](#trust)) applies only to a pack fetched from outside this machine — the community pack repository and a git-pinned pack. The user-tier, project-tier and `--pack <dir>` packs above are written locally and load without it; built-ins are trusted by construction.
+
 ```
 nomnom pack add github.com/ranolp/nomnom-packs/rust
 nomnom pack add https://git.example/packs.git@a1b2c3d
@@ -676,7 +679,9 @@ The language is total, so the worst a malicious pack can do is misclassify — b
 
 **Status:** Unit 7.
 
-Once packs can read files and request actions, a review cap is no longer enough: a pack that may claim a folder can hide it from every other pack, and a pack that may read can read. So **an untrusted community pack is not loaded at all.** There is no "untrusted but loaded" tier. `nomnom pack trust <name>` is the gate to loading, and built-in packs are trusted.
+Once packs can read files and request actions, a review cap is no longer enough for a pack that came from outside: a pack that may claim a folder can hide it from every other pack, and a pack that may read can read. So **a pack fetched from outside this machine is not loaded at all until it is trusted.** That is the community pack repository and a git-pinned pack (see [Packs](#packs)); there is no "untrusted but loaded" tier for either. `nomnom pack trust <name>` is the gate to loading them.
+
+A pack the user writes locally needs no such gate: the user-tier pack (`%LOCALAPPDATA%\nomnom\packs\`), the project-tier pack (`./.nomnom/packs/`), and a pack passed with `--pack <dir>` all load without trust, because the person who wrote the rule is the person about to run it. Built-in packs are trusted by construction.
 
 - `pack add` and `pack trust` show what the pack will be able to do before the user agrees: the tables it reads (format and file pattern), the handlers it uses, the known folders it anchors to, the classes it claims exclusively.
 - The lock records a digest of those capabilities beside the content checksum. An update that adds a capability needs `pack trust` again; an update that only changes rules within the trusted capabilities does not.
@@ -732,7 +737,7 @@ So a refusal is never a rule. It is applied to every candidate, after evaluation
 - unknown means keep, for every fact, every probe and every read
 - an open database and its `-wal`/`-shm`/`-journal` companions are never candidates
 - reparse points are not descended through, not read, and their targets are not counted in a rolled-up size — NTFS junctions, OneDrive placeholders and pnpm's store links are all reparse points, and `is_symlink` does not cover any of them
-- a removal candidate — a delete or a request — outside the scan root, or on another volume than the scan root, is refused; reads may cross volumes (see [Reads and caps](#reads-and-caps)), removals may not
+- a permanent delete outside the scan root, or on another volume than the scan root, is refused; reads may cross volumes (see [Reads and caps](#reads-and-caps)), and so may an `Action::Request`, but only onto a verified anchor — a request hands the removal to the owning program and deletes nothing itself, so the delete's volume fence does not bind it (see [Actions](#actions))
 - a run that could not verify something reports "I could not verify N items" rather than quietly including or excluding them
 
 The other half of that history is worth stating too: every serious incident there was an unrecoverable one, because deletion was a permanent `unlink`. nomnom deletes permanently as well, with no recycle bin and no undo, so its safety has to come before the deletion rather than after it. Nothing is deleted that the user did not approve: every candidate starts unapproved, a rule or a path is approved one at a time, and an approval lasts one run. Exclusions persist per drive and can only shrink a plan. And the executor's own fences hold whatever the plan says: it refuses a drive root, a path outside the clean root, a path containing `..`, and the clean root itself.
