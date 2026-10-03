@@ -12,7 +12,6 @@ mod palette;
 mod scan;
 mod session;
 mod state;
-mod suggest;
 mod treemap;
 
 use std::process::ExitCode;

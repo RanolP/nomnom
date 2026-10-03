@@ -1,7 +1,7 @@
-//! The files to delete: approve rules, open one to see what it matched and
-//! exclude what must stay, and watch the dry run follow. Reclaim, in the
-//! tree's bottom bar, applies the plan this view holds, behind a confirmation
-//! that names exactly what will move.
+//! The suggestions awaiting review, the panel at the tree's right: approve
+//! rules, open one to see what it matched and exclude what must stay, and
+//! watch the dry run follow. Reclaim, at the panel's foot, applies the plan
+//! this panel holds, behind a confirmation that names exactly what will move.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -13,6 +13,8 @@ use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -23,7 +25,9 @@ use nomnom_core::verdict::{Assessment, Disposition, Provenance, Verdict};
 
 use crate::session::{Assessed, Phase, Session};
 use crate::state::{Preview, Selection, size};
-use crate::suggest::{disposition_tag, label_name, waiting_for_assessment};
+
+/// The panel's fixed width; the tree and treemap take the rest.
+pub const PANEL_WIDTH: f32 = 420.;
 
 /// Three lines per row: a rule's title, pack and tally, or a match's path,
 /// reason and exclusion state.
@@ -36,10 +40,10 @@ struct Outcome {
     failures: Vec<(PathBuf, String)>,
 }
 
-/// Emitted when an apply finishes, so the window can show its outcome.
-pub struct Applied;
+/// Asks the window to select `0` in the tree, opening its ancestors.
+pub struct Reveal(pub PathBuf);
 
-pub struct CleanScreen {
+pub struct SuggestPanel {
     session: Entity<Session>,
     selection: Selection,
     /// How many paths the approved rules plan; kept beside `preview`.
@@ -52,9 +56,9 @@ pub struct CleanScreen {
     exclusion_error: Option<String>,
 }
 
-impl EventEmitter<Applied> for CleanScreen {}
+impl EventEmitter<Reveal> for SuggestPanel {}
 
-impl CleanScreen {
+impl SuggestPanel {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&session, |this, _, _: &Assessed, cx| this.reassessed(cx)).detach();
@@ -129,35 +133,29 @@ impl CleanScreen {
         self.refresh_preview(cx);
     }
 
-    /// What the bottom bar shows: how many paths the approved rules plan, and
-    /// the bytes of that plan — `(0, 0)` until a rule is approved.
-    pub fn plan_summary(&self) -> (usize, u64) {
-        let bytes = match &self.preview {
-            Some(Ok(preview)) => preview.plan.total_bytes(),
-            _ => 0,
-        };
-        (self.checked, bytes)
-    }
-
     /// Whether Reclaim has anything the user checked to apply.
-    pub fn can_apply(&self) -> bool {
+    fn can_apply(&self) -> bool {
         matches!(&self.preview, Some(Ok(preview)) if !preview.plan.is_empty())
     }
 
-    pub fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The dialog lists every action of the dry run, so what the user
+    /// confirms is exactly what will move.
+    fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Ok(preview)) = &self.preview else { return };
         if preview.plan.is_empty() {
             return;
         }
+        let preview = preview.clone();
         let (len, bytes) = (preview.plan.len(), preview.plan.total_bytes());
         let body =
             format!("{len} paths, {} in total, will be moved to the recycle bin.", size(bytes));
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
                 .title("Apply this cleanup?")
                 .child(div().text_sm().child(body.clone()))
+                .child(render_plan(&preview, cx))
                 .button_props(
                     gpui_kit::component::dialog::DialogButtonProps::default()
                         .ok_text("Apply")
@@ -215,7 +213,6 @@ impl CleanScreen {
                 // What was approved is applied; the next plan starts empty.
                 this.selection.clear();
                 this.refresh_preview(cx);
-                cx.emit(Applied);
                 cx.notify();
             });
             // What was applied is gone from disk, so the assessment is stale.
@@ -270,6 +267,71 @@ fn verb(action: &Action) -> &'static str {
     }
 }
 
+/// The dry run's actions, then the paths its guards refused.
+fn render_plan(preview: &Preview, cx: &App) -> AnyElement {
+    v_flex()
+        .id("plan-list")
+        .max_h(px(320.))
+        .overflow_y_scrollbar()
+        .text_xs()
+        .children(preview.plan.actions().iter().map(|entry| {
+            h_flex()
+                .gap_2()
+                .py_0p5()
+                .child(div().w(px(56.)).child(verb(&entry.action)))
+                .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(
+                    match entry.action.destination() {
+                        Some(to) => format!("{} → {}", plain(entry.action.path()), plain(to)),
+                        None => plain(entry.action.path()),
+                    },
+                ))
+                .child(div().child(size(entry.bytes)))
+        }))
+        .children(preview.refused.iter().map(|(path, error)| {
+            div().text_color(cx.theme().warning).child(format!("skipping {}: {error}", plain(path)))
+        }))
+        .into_any_element()
+}
+
+fn disposition_tag(disposition: Disposition) -> Tag {
+    match disposition {
+        Disposition::Reclaimable => Tag::success().small().child("reclaimable"),
+        Disposition::Review => Tag::warning().small().child("review"),
+        Disposition::Keep => Tag::secondary().small().child("keep"),
+    }
+}
+
+/// Labels are open — a pack can introduce its own — so they render as
+/// themselves, hyphens read as spaces.
+fn label_name(label: &nomnom_core::verdict::Label) -> String {
+    label.as_str().replace('-', " ")
+}
+
+/// The panel's body before an assessment exists. Judging starts by itself
+/// when a scan lands, so there is nothing to click here.
+fn waiting_for_assessment(session: &Session, cx: &App) -> Option<AnyElement> {
+    if session.assessment.is_some() {
+        return None;
+    }
+    let muted = cx.theme().muted_foreground;
+    let body = v_flex().gap_3().text_sm();
+    Some(
+        if session.assessing {
+            body.child(
+                h_flex()
+                    .gap_2()
+                    .child(Spinner::new().small())
+                    .child("Analyzing — judging what each path is…"),
+            )
+        } else if let Some(error) = session.assess_error.clone() {
+            body.child(Alert::error("assess-error", error))
+        } else {
+            body.text_color(muted).child("No analysis yet.")
+        }
+        .into_any_element(),
+    )
+}
+
 /// One line of the rule list, owned so the virtualized list can hold it
 /// across frames: a rule, or one of the matches of an expanded rule.
 enum Row {
@@ -294,7 +356,7 @@ enum Row {
     },
 }
 
-fn rows(this: &CleanScreen, assessment: &Assessment) -> Vec<Row> {
+fn rows(this: &SuggestPanel, assessment: &Assessment) -> Vec<Row> {
     let mut rows = Vec::new();
     for group in this.selection.groups(assessment) {
         let excluded_by = |path: &str| {
@@ -326,10 +388,10 @@ fn rows(this: &CleanScreen, assessment: &Assessment) -> Vec<Row> {
 /// never behind a click — with packs coming from the network, "who says so"
 /// is part of what a human approves on.
 fn render_row(
-    this: &CleanScreen,
+    this: &SuggestPanel,
     ix: usize,
     row: &Row,
-    cx: &mut Context<CleanScreen>,
+    cx: &mut Context<SuggestPanel>,
 ) -> AnyElement {
     let muted = cx.theme().muted_foreground;
     match row {
@@ -388,6 +450,7 @@ fn render_row(
         }
         Row::Match { path, bytes, verdict, excluded_by } => {
             let target = PathBuf::from(path);
+            let reveal = target.clone();
             let is_excluded = excluded_by.is_some();
             // Only an exclusion of the match itself is undone here; one on a
             // directory above it covers other paths too.
@@ -415,10 +478,14 @@ fn render_row(
                 )
                 .child(
                     v_flex()
+                        .id(("reveal", ix))
                         .flex_1()
                         .overflow_hidden()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().list_hover))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(Reveal(reveal.clone()))))
                         .when(is_excluded, |col| col.text_color(muted))
-                        .child(div().whitespace_nowrap().child(path.clone()))
+                        .child(div().whitespace_nowrap().text_ellipsis().child(path.clone()))
                         .child(div().whitespace_nowrap().text_xs().text_color(muted).child(state))
                         // A capped verdict looks exactly like one written as
                         // `review`; without this the missing trust grant is
@@ -441,7 +508,7 @@ fn render_row(
 
 /// The drive's persisted exclusions, each with its undo — the one place an
 /// exclusion on a directory, or on a path no rule matches today, can be seen.
-fn render_exclusions(this: &CleanScreen, cx: &mut Context<CleanScreen>) -> Option<AnyElement> {
+fn render_exclusions(this: &SuggestPanel, cx: &mut Context<SuggestPanel>) -> Option<AnyElement> {
     let exclusions = this.selection.exclusions();
     if exclusions.is_empty() && this.exclusion_error.is_none() {
         return None;
@@ -474,128 +541,105 @@ fn render_exclusions(this: &CleanScreen, cx: &mut Context<CleanScreen>) -> Optio
     )
 }
 
-impl Render for CleanScreen {
+impl Render for SuggestPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(waiting) = waiting_for_assessment(&self.session, cx) {
-            return v_flex()
-                .size_full()
-                .children(self.render_outcome(cx))
-                .child(waiting)
-                .into_any_element();
-        }
-        let assessment = self.session.read(cx).assessment.clone().expect("checked above");
+        let muted = cx.theme().muted_foreground;
+        let session = self.session.read(cx);
+        let busy = session.busy.is_some();
+        let waiting = waiting_for_assessment(session, cx);
+        let assessment = session.assessment.clone();
+
+        let panel = v_flex()
+            .size_full()
+            .gap_3()
+            .p_3()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("Suggestions to review"))
+            .children(self.render_outcome(cx));
+        let Some(assessment) = assessment.filter(|_| waiting.is_none()) else {
+            return panel.children(waiting).into_any_element();
+        };
+
         let rows: Rc<Vec<Row>> = Rc::new(rows(self, &assessment));
         let rule_count = rows.iter().filter(|row| matches!(row, Row::Rule { .. })).count();
 
-        let include_review = self.selection.include_review;
         let toggle = Checkbox::new("include-review")
-            .label("Include review — also act on paths the evidence does not carry on its own")
-            .checked(include_review)
+            .label("Include review")
+            .checked(self.selection.include_review)
             .on_change(cx.listener(|this, checked: &bool, _, cx| {
                 this.selection.include_review = *checked;
                 this.refresh_preview(cx);
             }));
 
+        let list = if rows.is_empty() {
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(muted)
+                .child("Nothing matched: no rule suggests anything on this drive.")
+                .into_any_element()
+        } else {
+            let rows = rows.clone();
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    uniform_list(
+                        "suggest-rules",
+                        rows.len(),
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            range.map(|ix| render_row(this, ix, &rows[ix], cx)).collect::<Vec<_>>()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+
         let summary = match &self.preview {
             Some(Ok(preview)) if preview.plan.is_empty() => {
-                "Nothing approved. Approve the rules whose matches should go; open one to \
-                 see its matches and exclude any that must stay."
+                "Nothing approved. Approve the rules whose matches should go; open one to                  see its matches and exclude any that must stay."
                     .to_string()
             }
             Some(Ok(preview)) => format!(
-                "Dry run: {} actions, {} to reclaim. Nothing has been touched.",
+                "{} paths approved. Dry run: {} actions. Nothing has been touched.",
+                self.checked,
                 preview.plan.len(),
-                size(preview.plan.total_bytes())
             ),
             Some(Err(message)) => message.clone(),
             None => String::new(),
         };
-
-        let checklist = {
-            let rows = rows.clone();
-            uniform_list(
-                "clean-rules",
-                rows.len(),
-                cx.processor(move |this, range: Range<usize>, _, cx| {
-                    range.map(|ix| render_row(this, ix, &rows[ix], cx)).collect::<Vec<_>>()
-                }),
-            )
-            .size_full()
+        let bytes = match &self.preview {
+            Some(Ok(preview)) => preview.plan.total_bytes(),
+            _ => 0,
         };
-        let exclusions = render_exclusions(self, cx);
+        let reclaim = Button::new("reclaim")
+            .danger()
+            .label(format!("Reclaim {}", size(bytes)))
+            .disabled(busy || !self.can_apply())
+            .on_click(cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)));
 
-        let plan_list = match &self.preview {
-            Some(Ok(preview)) => {
-                let preview = preview.clone();
-                v_flex()
-                    .id("plan-list")
-                    .size_full()
-                    .overflow_y_scrollbar()
-                    .text_xs()
-                    .children(preview.plan.actions().iter().map(|entry| {
-                        h_flex()
-                            .gap_2()
-                            .py_0p5()
-                            .child(div().w(px(56.)).child(verb(&entry.action)))
-                            .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(
-                                match entry.action.destination() {
-                                    Some(to) => {
-                                        format!("{} → {}", plain(entry.action.path()), plain(to))
-                                    }
-                                    None => plain(entry.action.path()),
-                                },
-                            ))
-                            .child(div().child(size(entry.bytes)))
-                    }))
-                    .children(preview.refused.iter().map(|(path, error)| {
-                        div()
-                            .text_color(cx.theme().warning)
-                            .child(format!("skipping {}: {error}", plain(path)))
-                    }))
-                    .into_any_element()
-            }
-            _ => div().into_any_element(),
-        };
-
-        v_flex()
-            .size_full()
-            .gap_3()
-            .p_4()
-            .children(self.render_outcome(cx))
-            .child(toggle)
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(summary))
-            .children(exclusions)
+        panel
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_4()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("Rules ({rule_count})")),
-                            )
-                            .child(div().flex_1().min_h_0().child(checklist)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Plan preview"),
-                            )
-                            .child(div().flex_1().min_h_0().child(plan_list)),
-                    ),
+                v_flex()
+                    .gap_1()
+                    .child(toggle)
+                    .child(div().text_xs().text_color(muted).child(
+                        "Also list paths the evidence does not carry on its own.",
+                    )),
+            )
+            .child(div().text_xs().text_color(muted).child(format!("Rules ({rule_count})")))
+            .child(list)
+            .children(render_exclusions(self, cx))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(div().text_sm().child(summary))
+                    .child(h_flex().child(div().flex_1()).child(reclaim)),
             )
             .into_any_element()
     }
