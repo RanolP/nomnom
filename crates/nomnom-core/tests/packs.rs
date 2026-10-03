@@ -5,9 +5,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{
-    Disposition, DslJudge, Judge, TrustedPack, Verdict, assess_all, builtin_pack,
-};
+use nomnom_core::verdict::{Disposition, TrustedPack, Verdict, builtin_pack, judge};
 use nomnom_pack::Trust;
 use tempfile::TempDir;
 
@@ -23,12 +21,9 @@ fn pack_dir(root: &Path, name: &str, rule: &str) -> PathBuf {
 /// One rule matching a directory named `blobs`.
 fn blobs_rule(rule_name: &str, disposition: &str, confidence: &str, reason: &str) -> String {
     format!(
-        "rule \"{rule_name}\" {{\n  \
-         when  dir.name == \"blobs\"\n  \
-         then  label       = cache\n        \
-         disposition = {disposition}\n        \
-         confidence  = {confidence}\n        \
-         reason      = \"{reason}\"\n}}\n"
+        "[{rule_name}]\ndescription = {reason}\nkind = cache/v1\n\
+         disposition = {disposition}\nconfidence = {confidence}\n\
+         filter {{\n  then $p/blobs/\n}}\n"
     )
 }
 
@@ -45,8 +40,7 @@ fn tree() -> TempDir {
 
 fn judge_blobs(tmp: &TempDir, packs: Vec<TrustedPack>) -> Verdict {
     let catalog = catalog_of(&tmp.path().join("tree"));
-    let judge = DslJudge::with_packs(&catalog, packs);
-    assess_all(&judge, &catalog)
+    judge(&catalog, &packs)
         .into_iter()
         .find(|(id, _)| catalog.path(*id).ends_with("blobs"))
         .map(|(_, verdict)| verdict)
@@ -157,9 +151,12 @@ fn the_builtin_pack_is_never_capped() {
     write(root.join("node_modules").join("left-pad").join("index.js"), b"1");
 
     let catalog = catalog_of(&root);
-    let judge = DslJudge::with_packs(&catalog, vec![TrustedPack::builtin(builtin_pack().clone())]);
     let id = catalog.find(&root.join("node_modules")).expect("node_modules node");
-    let verdict = judge.assess(&catalog, id).expect("judged");
+    let verdict = judge(&catalog, &[TrustedPack::builtin(builtin_pack().clone())])
+        .into_iter()
+        .find(|(judged, _)| *judged == id)
+        .map(|(_, verdict)| verdict)
+        .expect("judged");
 
     assert_eq!(verdict.disposition, Disposition::Reclaimable);
     assert_eq!(verdict.capped, None);

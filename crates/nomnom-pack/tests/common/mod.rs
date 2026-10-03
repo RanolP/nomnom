@@ -15,9 +15,9 @@ pub fn write_pack(dir: &Path, name: &str, rule: &str) {
 
 pub fn rule(rule_name: &str, disposition: &str) -> String {
     format!(
-        "rule \"{rule_name}\" {{\n  when is_dir and child(\"marker\")\n  \
-         then label       = cache\n       disposition = {disposition}\n       \
-         confidence  = 0.5\n       reason      = \"a `marker` file sits inside it\"\n}}\n"
+        "[{rule_name}]\ndescription = a `marker` file sits inside it\nkind = cache/v1\n\
+         disposition = {disposition}\nconfidence = 0.5\n\
+         filter {{\n  $d has marker\n  then $d/\n}}\n"
     )
 }
 

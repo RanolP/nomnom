@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::{Disposition, DslJudge, Judge, Label, TrustedPack, Verdict, assess_all};
+use super::{Disposition, Label, TrustedPack, Verdict, judge};
 use crate::catalog::Catalog;
 use crate::timings;
 
@@ -98,17 +98,14 @@ pub fn charges(entries: &[&Entry], shared: &[SharedFile]) -> Vec<u64> {
     out
 }
 
-/// One pass of the judge over the catalog. Built once because `DslJudge`
-/// resolves the unit set and hashes every size-colliding file to find
-/// duplicates.
+/// One [`judge`] pass over the catalog, grouped.
 ///
 /// `packs` arrives already in resolution order, built-in first — see
-/// [`super::resolve_packs`].
+/// [`super::resolve_packs`]. Every entry's [`Verdict::provenance`] names the
+/// pack and rule that decided it.
 pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
-    let judge: &dyn Judge = &DslJudge::with_packs(catalog, packs);
+    let verdicts = judge(catalog, &packs);
     let started = Instant::now();
-    let verdicts = assess_all(judge, catalog);
-    let started = timings::lap("assess: rule walk", started);
 
     let mut spans: Vec<(u32, u32)> = verdicts
         .iter()

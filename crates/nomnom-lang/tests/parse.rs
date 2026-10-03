@@ -1,166 +1,173 @@
-//! Parsing: the specification's own example, operator grouping, and units.
+//! What a valid rule file parses to.
 
-use nomnom_lang::ast::{CmpOp, Expr, Literal};
-use nomnom_lang::vocab::{Field, Predicate};
-use nomnom_lang::{Disposition, Source, parse};
+use nomnom_lang::ast::{ChildTest, Constraint, Disposition, Literal, NamePattern};
+use nomnom_lang::vocab::Field;
+use nomnom_lang::{Kinds, Rule, Source, parse};
 
-fn one(text: &str) -> nomnom_lang::Rule {
+fn rules(text: &str) -> Vec<Rule> {
     let source = Source::new("t.nom", text);
-    let mut rules = parse(&source).unwrap_or_else(|d| panic!("expected a parse, got:\n{d}"));
-    assert_eq!(rules.len(), 1, "fixture defines exactly one rule");
-    rules.remove(0)
+    parse(&source, &Kinds::builtin()).unwrap_or_else(|d| panic!("expected a parse, got:\n{d}"))
 }
 
-/// The one expression the `when` of a single-condition fixture reduces to.
-fn when(text: &str) -> Expr {
+fn one(text: &str) -> Rule {
+    let mut parsed = rules(text);
+    assert_eq!(parsed.len(), 1);
+    parsed.remove(0)
+}
+
+/// A rule around one filter line, for tests about that line alone.
+fn with_line(line: &str) -> Rule {
     one(&format!(
-        "rule \"t\" {{ when {text} then label = cache disposition = review \
-         confidence = 0.5 reason = \"evidence\" }}"
+        "[t]\ndescription = evidence\nkind = cache/v1\nfilter {{\n  {line}\n  then $f\n}}\n"
     ))
-    .when
 }
 
-/// Catches the specification and the implementation drifting apart: this is
-/// the `cargo-target` rule copied verbatim out of `docs/lang.md`, and every
-/// field is asserted, so a grammar or default change that the document does
-/// not also make fails here.
+const SPEC: &str = "\
+[build/ beside a manifest]
+description = build output, rebuilt by the project's build command — `{$marker}` sits beside it
+kind = build-output/v1
+confidence = 0.9
+filter {
+  $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
+  then $dir/build/
+}
+";
+
+/// Catches a parser that drops or reorders part of the documented example:
+/// every key, the alternation in written order, the capture and the target.
 #[test]
-fn spec_cargo_target_rule_parses_with_every_field_intact() {
-    let rule = one(r#"rule "cargo-target" {
-  when  dir.name == "target"
-        and sibling("Cargo.toml")
-  then  label       = build-output
-        disposition = reclaimable
-        unit        = true
-        confidence  = 0.95
-        reason      = "regenerable: Cargo build output, rebuilt by `cargo build` — `Cargo.toml` sits beside it"
-}"#);
+fn the_spec_rule_parses_with_every_part_intact() {
+    let rule = one(SPEC);
+    assert_eq!(rule.title.value, "build/ beside a manifest");
+    assert!(rule.description.value.ends_with("`{$marker}` sits beside it"));
+    assert_eq!(rule.kind.value.to_string(), "build-output/v1");
+    assert_eq!(rule.disposition, Disposition::Reclaimable);
+    assert_eq!(rule.filter.var.value, "dir");
 
-    assert_eq!(rule.name.value, "cargo-target");
-
-    let Expr::And { lhs, rhs } = &rule.when else {
-        panic!("top level is `and`, got {:?}", rule.when)
+    let [Constraint::Children(ChildTest { negated, names, capture, .. })] =
+        rule.filter.constraints.as_slice()
+    else {
+        panic!("one `has`, got {:?}", rule.filter.constraints);
     };
-    let Expr::Compare { lhs: field, op, rhs: value } = lhs.as_ref() else {
-        panic!("left side is a comparison, got {lhs:?}")
-    };
-    assert_eq!(field.value, Field::DirName);
-    assert_eq!(op.value, CmpOp::Eq);
-    assert_eq!(value.value, Literal::Str("target".into()));
+    assert!(!negated);
+    let names: Vec<&str> = names.iter().map(|n| n.value.text()).collect();
+    assert_eq!(names, ["package.json", "pyproject.toml", "CMakeLists.txt"]);
+    assert_eq!(capture.as_ref().map(|c| c.value.as_str()), Some("marker"));
 
-    let Expr::Call { predicate, args, .. } = rhs.as_ref() else {
-        panic!("right side is a call, got {rhs:?}")
-    };
-    assert_eq!(predicate.value, Predicate::Sibling);
-    assert_eq!(args.len(), 1);
-    assert_eq!(args[0].value, Literal::Str("Cargo.toml".into()));
+    let then = &rule.filter.then;
+    assert_eq!(then.segments.len(), 1);
+    assert_eq!(then.segments[0].value, NamePattern::Literal("build".into()));
+    assert!(then.dir, "the trailing `/` requires a directory");
+}
 
-    let then = &rule.then;
-    assert_eq!(then.label.value, "build-output");
-    assert_eq!(then.disposition.value, Disposition::Reclaimable);
-    assert!(then.unit.value);
-    assert!(then.unit_written.is_some(), "`unit` was written, not defaulted");
-    assert_eq!(then.confidence.value, 0.95);
-    assert_eq!(
-        then.reason.value,
-        "regenerable: Cargo build output, rebuilt by `cargo build` — `Cargo.toml` sits beside it"
+/// Catches a rule that loses its kind's defaults when it omits them: the kind,
+/// not a hard-coded fallback, is where an unset disposition and confidence
+/// come from.
+#[test]
+fn an_unset_confidence_and_disposition_come_from_the_kind() {
+    let rule = one(
+        "[s]\ndescription = old\nkind = stale-download/v1\nfilter {\n  $f.is_file\n  then $f\n}\n",
     );
+    assert_eq!(rule.disposition, Disposition::Review);
+    assert_eq!(rule.confidence, 0.5);
 }
 
-/// Catches a `unit` default flip. The spec says absent means `false`, and
-/// getting this wrong counts a subtree's bytes once instead of per file — a
-/// wrong total rather than a visible error.
+/// Catches a downgrade being refused along with an upgrade: moving down from
+/// the kind's disposition is the whole point of the key.
 #[test]
-fn unit_defaults_to_false_when_absent() {
-    let rule = one(r#"rule "t" { when is_file then label = cache disposition = review
-           confidence = 0.1 reason = "evidence" }"#);
-    assert!(!rule.then.unit.value);
-    assert!(rule.then.unit_written.is_none());
+fn a_disposition_below_the_kind_is_accepted() {
+    let rule = one(
+        "[t]\ndescription = maybe\nkind = build-output/v1\ndisposition = review\n\
+         confidence = 0.35\nfilter {\n  $d lacks Cargo.toml\n  then $d/target/\n}\n",
+    );
+    assert_eq!(rule.disposition, Disposition::Review);
+    assert_eq!(rule.confidence, 0.35);
 }
 
-/// Catches a precedence bug, which silently changes which paths a rule matches
-/// instead of failing: `and` must bind tighter than `or`.
+/// Catches a glob compared as a literal name (or the reverse), which would
+/// make `*.csproj` match only a file literally named that.
 #[test]
-fn and_binds_tighter_than_or() {
-    let Expr::Or { lhs, rhs } = when("is_dir and is_symlink or is_file") else {
-        panic!("`a and b or c` must be an `or` at the top")
-    };
-    assert!(matches!(*lhs, Expr::And { .. }), "left of `or` is the `and`, got {lhs:?}");
-    assert!(matches!(*rhs, Expr::Field(_)), "right of `or` is the bare field, got {rhs:?}");
+fn a_name_with_glob_characters_is_a_glob_and_any_other_is_literal() {
+    let rule = with_line("$f has *.csproj | App.sln");
+    let Constraint::Children(test) = &rule.filter.constraints[0] else { panic!() };
+    assert_eq!(test.names[0].value, NamePattern::Glob("*.csproj".into()));
+    assert_eq!(test.names[1].value, NamePattern::Literal("App.sln".into()));
 }
 
-/// Same class: `not` must bind tighter than `and`, so `not a and b` is
-/// `(not a) and b` and never `not (a and b)`.
+/// Catches a deep target losing a segment or its directory requirement.
 #[test]
-fn not_binds_tighter_than_and() {
-    let Expr::And { lhs, rhs } = when("not is_dir and is_file") else {
-        panic!("`not a and b` must be an `and` at the top")
-    };
-    assert!(matches!(*lhs, Expr::Not { .. }), "left of `and` is the `not`, got {lhs:?}");
-    assert!(matches!(*rhs, Expr::Field(_)), "right of `and` is the bare field, got {rhs:?}");
+fn a_then_path_keeps_every_segment_and_only_a_trailing_slash_requires_a_directory() {
+    let rule = one(
+        "[n]\ndescription = x\nkind = cache/v1\nfilter {\n  $p has next.config.js\n  \
+         then $p/.next/cache/\n}\n",
+    );
+    let segments: Vec<&str> = rule.filter.then.segments.iter().map(|s| s.value.text()).collect();
+    assert_eq!(segments, [".next", "cache"]);
+    assert!(rule.filter.then.dir);
+    assert!(!with_line("$f.is_file").filter.then.dir, "`then $f` accepts a file");
 }
 
-/// Catches parentheses being dropped, which would make the grouping the author
-/// wrote unreachable.
+/// Catches `not` being attached to the wrong test or dropped.
 #[test]
-fn parentheses_override_precedence() {
-    let Expr::And { lhs, .. } = when("is_dir and (is_symlink or is_file)") else {
-        panic!("`a and (b or c)` must be an `and` at the top")
-    };
-    assert!(matches!(*lhs, Expr::Field(_)));
+fn not_negates_the_field_test_it_precedes() {
+    let rule = with_line("not $f.has_accessed");
+    let Constraint::Field(test) = &rule.filter.constraints[0] else { panic!() };
+    assert!(test.negated);
+    assert_eq!(test.field.value, Field::HasAccessed);
 }
 
-fn size_of(text: &str) -> u64 {
-    let Expr::Compare { rhs, .. } = when(&format!("size > {text}")) else { panic!("comparison") };
-    let Literal::Size(bytes) = rhs.value else { panic!("a size literal, got {:?}", rhs.value) };
-    bytes
+/// Catches `under Downloads/` keeping the slash, which would compare against
+/// a name no directory has.
+#[test]
+fn under_takes_the_name_without_its_trailing_slash() {
+    let rule = with_line("$f under Downloads/");
+    assert!(matches!(&rule.filter.constraints[0], Constraint::Under(name) if name.value == "Downloads"));
 }
 
-fn duration_of(text: &str) -> u64 {
-    let Expr::Call { args, .. } = when(&format!("modified_before({text})")) else { panic!("call") };
-    let Literal::Duration(seconds) = args[0].value else { panic!("a duration literal") };
-    seconds
+fn literal_of(line: &str) -> Literal {
+    let rule = with_line(line);
+    let Constraint::Field(test) = &rule.filter.constraints[0] else { panic!() };
+    test.compare.as_ref().expect("a comparison").1.value.clone()
 }
 
-/// Catches an off-by-1024 in a size threshold: `kb` is decimal and `kib` is
-/// binary, and confusing them makes every size rule wrong by 2.4% and every
-/// gigabyte rule wrong by 7%.
+/// Catches `1kb` being read as 1024 or `1kib` as 1000 — off by 2.4%, silently.
 #[test]
 fn size_literals_keep_decimal_and_binary_apart() {
-    assert_eq!(size_of("1b"), 1);
-    assert_eq!(size_of("1kb"), 1_000);
-    assert_eq!(size_of("1kib"), 1_024);
-    assert_eq!(size_of("100kb"), 100_000);
-    assert_eq!(size_of("10mib"), 10 * 1024 * 1024);
-    assert_eq!(size_of("2gb"), 2_000_000_000);
-    assert_eq!(size_of("1gib"), 1_073_741_824);
-    // Fractional sizes round rather than truncate.
-    assert_eq!(size_of("1.5kb"), 1_500);
-    // Case is not significant in a unit.
-    assert_eq!(size_of("1KiB"), 1_024);
+    assert_eq!(literal_of("$f.size > 1kb"), Literal::Size(1000));
+    assert_eq!(literal_of("$f.size > 1kib"), Literal::Size(1024));
+    assert_eq!(literal_of("$f.size > 1.5gb"), Literal::Size(1_500_000_000));
 }
 
-/// Catches a duration unit drifting: `mo` and `y` are defined as the mean
-/// Gregorian year (365.2425 d) and a twelfth of it, and a rule file compares
-/// against those numbers whether or not anyone wrote them down.
+/// Catches a duration unit with the wrong number of seconds behind it.
 #[test]
 fn duration_literals_normalise_to_seconds() {
-    assert_eq!(duration_of("1s"), 1);
-    assert_eq!(duration_of("12h"), 43_200);
-    assert_eq!(duration_of("30d"), 2_592_000);
-    assert_eq!(duration_of("1w"), 604_800);
-    assert_eq!(duration_of("6mo"), 6 * 2_629_746);
-    assert_eq!(duration_of("1y"), 31_556_952);
+    assert_eq!(literal_of("$f.modified_age >= 90d"), Literal::Duration(90 * 86_400));
+    assert_eq!(literal_of("$f.modified_age >= 1y"), Literal::Duration(31_556_952));
 }
 
-/// Catches `#` comments being lexed as content, which would break every rule
-/// file that disables a rule by commenting it out.
+/// Catches `$f.ext == zip` being refused for want of quotes: a bare word where
+/// a string is expected is that string.
 #[test]
-fn line_comments_are_trivia() {
-    let rule = one(r#"# a leading comment
-           rule "t" { # trailing
-             when is_file   # about the condition
-             then label = cache disposition = review confidence = 0.1 reason = "evidence"
-           }"#);
-    assert_eq!(rule.name.value, "t");
+fn a_bare_word_compared_to_a_string_field_is_a_string() {
+    assert_eq!(literal_of("$f.ext == zip"), Literal::Str("zip".into()));
+    assert_eq!(literal_of("$f.name == \"two words\""), Literal::Str("two words".into()));
+}
+
+/// Catches CRLF checkouts (the Windows default) breaking `}` and key parsing,
+/// and comments being read as constraints.
+#[test]
+fn crlf_line_endings_and_comments_parse_like_lf() {
+    let text = format!("# leading comment\r\n{}", SPEC.replace('\n', "\r\n"))
+        .replace("  then", "  # a comment inside the filter\r\n  then");
+    let rule = one(&text);
+    assert_eq!(rule.title.value, "build/ beside a manifest");
+    assert_eq!(rule.filter.constraints.len(), 1);
+}
+
+/// Catches rules after the first being lost or merged.
+#[test]
+fn several_rules_in_one_file_parse_in_order() {
+    let text = format!("{SPEC}\n{}", SPEC.replace("[build/ beside", "[dist/ beside"));
+    let titles: Vec<String> = rules(&text).into_iter().map(|r| r.title.value).collect();
+    assert_eq!(titles, ["build/ beside a manifest", "dist/ beside a manifest"]);
 }

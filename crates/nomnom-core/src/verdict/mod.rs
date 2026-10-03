@@ -1,42 +1,34 @@
 //! What a path IS, and whether it should go.
 //!
-//! The whole domain is one trait. Milestone 1 answered with hand-written Rust;
-//! milestone 2 answers with [`DslJudge`], which evaluates rule packs written in
-//! the nomnom rule language, and milestone 3 swaps in a reasoning model. Each
-//! implements the same [`Judge`] and fills the same [`Verdict::reason`] slot.
-//! Nothing else in the codebase needs to know which one answered, which is the
-//! point: the ladder costs one trait and one mandatory field.
+//! Rule packs written in the nomnom rule language select targets
+//! ([`select`]), byte-identical copies are found in Rust ([`duplicate`]), and
+//! [`judge`] puts the two together into one verdict per decided node. Every
+//! verdict carries the sentence a human approves it on and the pack and rule
+//! that produced it.
 
 mod assess;
 mod builtin;
-mod dsl;
 mod duplicate;
 mod packs;
+mod select;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::catalog::{Catalog, NodeId};
+use crate::timings;
 
 pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, charges};
 pub use builtin::builtin_pack;
-pub use dsl::{DslJudge, TrustedPack};
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };
-
-/// Answers "what is this path, and should it go?" for one node.
-///
-/// Returning `None` means "no opinion" — the common case. A judge is expected
-/// to stay silent rather than guess, because every verdict costs a human a
-/// read.
-pub trait Judge {
-    fn assess(&self, ctx: &Catalog, node: NodeId) -> Option<Verdict>;
-}
+pub use select::TrustedPack;
 
 /// What the path IS — an open, interned name rather than a closed enum.
 ///
@@ -156,11 +148,14 @@ pub enum Disposition {
 /// of the verdict rather than a debugging aid." It therefore travels inside the
 /// verdict, into the plan and into the apply report, and is not reconstructible
 /// after the fact from anything else.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// It is also the rule's identity: unique across one run's packs, so a
+/// consumer can group entries by it and act on every entry one rule produced.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Provenance {
     /// The pack's `name` from its `pack.toml`.
     pub pack: String,
-    /// The rule's name, unique within that pack.
+    /// The rule's `[Title]`, unique within that pack.
     pub rule: String,
 }
 
@@ -172,7 +167,7 @@ impl Provenance {
 
 impl fmt::Display for Provenance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.pack, self.rule)
+        write!(f, "{} [{}]", self.pack, self.rule)
     }
 }
 
@@ -186,11 +181,6 @@ pub struct Verdict {
     /// model fills from milestone 3 on. Never empty, and it names the concrete
     /// evidence rather than restating the label.
     pub reason: String,
-    /// This verdict speaks for the whole subtree: the directory is one
-    /// decision, not one per file inside it. Straight from the rule's `unit`
-    /// field, never inferred from the label — a pack chooses its own labels, so
-    /// a label cannot carry this meaning.
-    pub unit: bool,
     pub provenance: Provenance,
     /// Why this verdict is weaker than the rule that produced it asked for.
     ///
@@ -207,38 +197,39 @@ pub struct Verdict {
     pub capped: Option<String>,
 }
 
-/// Run `judge` over the whole catalog.
+/// Every verdict over the whole catalog, in id order.
 ///
-/// Breadth-first from the root, and a node whose verdict is a
-/// [`unit`](Verdict::unit) ends the descent there: the directory as a whole is
-/// the verdict, so its children never produce their own. That is what keeps
-/// [`Rollup::reclaimable_bytes`] sound — a child verdict inside an already
-/// counted `subtree_size` would add the same bytes a second time.
-pub fn assess_all(judge: &dyn Judge, ctx: &Catalog) -> Vec<(NodeId, Verdict)> {
-    let mut out = Vec::new();
-    let mut queue = vec![ctx.root()];
-    let mut cursor = 0;
-    while cursor < queue.len() {
-        let id = queue[cursor];
-        cursor += 1;
-        let mut prune = false;
-        if let Some(verdict) = judge.assess(ctx, id) {
-            prune = verdict.unit;
-            out.push((id, verdict));
-        }
-        if !prune {
-            queue.extend_from_slice(ctx.children(id));
+/// `packs` in resolution order: built-in first, then user, project and
+/// `--pack`, each overriding the last. A rule target is one decision for its
+/// whole subtree, so no verdict lies inside another rule verdict's subtree —
+/// which is what keeps [`Rollup::reclaimable_bytes`] sound. A duplicate
+/// verdict wins on its own node, because byte-identical content is stronger
+/// evidence than any rule that could also fire on a file.
+pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
+    let mut verdicts = select::select(ctx, packs);
+    let started = Instant::now();
+    // The targets have to exist before the duplicate pass, which drops any
+    // copy sitting inside one: it disappears with its directory.
+    let units: HashSet<NodeId> = verdicts.iter().map(|(id, _)| *id).collect();
+    let mut duplicates =
+        duplicate::DuplicateFacts::build(ctx, duplicate::MIN_DUPLICATE_SIZE, &units);
+    timings::lap("assess: duplicate facts total", started);
+    for (id, verdict) in &mut verdicts {
+        if let Some(duplicate) = duplicates.take(*id) {
+            *verdict = duplicate;
         }
     }
-    out
+    verdicts.extend(duplicates.into_verdicts());
+    verdicts.sort_unstable_by_key(|(id, _)| *id);
+    verdicts
 }
 
 /// What the CLI prints after an assessment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rollup {
     /// Sum of `subtree_size` over every [`Disposition::Reclaimable`] verdict.
-    /// Sound only because [`assess_all`] never judges inside a subtree it
-    /// already judged as a unit.
+    /// Sound only because [`judge`] never puts a verdict inside a rule
+    /// target's subtree.
     pub reclaimable_bytes: u64,
     pub by_label: BTreeMap<Label, Vec<NodeId>>,
 }
@@ -273,11 +264,7 @@ fn name_eq(a: &str, b: &str) -> bool {
     a == b
 }
 
-/// Whether any ancestor of `id` is judged as a whole unit.
-///
-/// `units` is the set [`DslJudge`] resolves in one top-down pass before
-/// anything else runs. Re-deriving it per ancestor would mean re-evaluating
-/// every rule once per level of every path in the catalog.
+/// Whether any strict ancestor of `id` is a rule target.
 fn under_unit(ctx: &Catalog, id: NodeId, units: &HashSet<NodeId>) -> bool {
     let mut cursor = ctx.node(id).parent;
     while let Some(current) = cursor {

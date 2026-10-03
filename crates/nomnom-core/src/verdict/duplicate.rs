@@ -36,12 +36,6 @@ const RULE_ORIGINAL: &str = "duplicate-original";
 const RULE_COPY: &str = "duplicate-copy";
 
 impl DuplicateFacts {
-    /// No duplicates known. Used while the unit set is still being resolved,
-    /// before a duplicate pass is even possible.
-    pub(super) fn empty() -> Self {
-        Self { by_node: HashMap::new() }
-    }
-
     pub(super) fn build(ctx: &Catalog, min_size: u64, units: &HashSet<NodeId>) -> Self {
         let mut by_node = HashMap::new();
         for group in ctx.duplicate_groups(min_size) {
@@ -81,7 +75,6 @@ impl DuplicateFacts {
                         "oldest of {count} blake3-identical copies ({size} bytes each); kept as \
                          the original"
                     ),
-                    unit: false,
                     provenance: Provenance::new(PACK, RULE_ORIGINAL),
                     capped: None,
                 },
@@ -98,7 +91,6 @@ impl DuplicateFacts {
                             "{count} files, {size} bytes each, identical blake3 content; the \
                              oldest copy is kept at {kept}"
                         ),
-                        unit: false,
                         provenance: Provenance::new(PACK, RULE_COPY),
                         capped: None,
                     },
@@ -108,13 +100,11 @@ impl DuplicateFacts {
         Self { by_node }
     }
 
-    pub(super) fn verdict(&self, id: NodeId) -> Option<Verdict> {
-        self.by_node.get(&id).cloned()
+    pub(super) fn take(&mut self, id: NodeId) -> Option<Verdict> {
+        self.by_node.remove(&id)
     }
 
-    /// Whether this node participates in a duplicate group, which is what the
-    /// language's `is_duplicate` field reads.
-    pub(super) fn contains(&self, id: NodeId) -> bool {
-        self.by_node.contains_key(&id)
+    pub(super) fn into_verdicts(self) -> impl Iterator<Item = (NodeId, Verdict)> {
+        self.by_node.into_iter()
     }
 }

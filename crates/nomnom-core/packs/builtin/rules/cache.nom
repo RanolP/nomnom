@@ -1,37 +1,31 @@
 # Cache directories: refillable, but not free to lose.
 #
-# Lower confidence than build output, because "cache" is a word an application
-# also uses for state it cannot rebuild. `unit = true` stops the descent at the
-# cache root, so a nested `cache/cache` is never counted twice.
+# `cache/v1` carries a lower confidence than build output, because "cache" is a
+# word an application also uses for state it cannot rebuild. A target is one
+# decision for its subtree, so a nested `cache/cache` is never counted twice.
 #
-# One rule per name rather than one rule matching all three: the reason quotes
-# the directory name back, and a literal is the only way to say it. That also
-# makes the quoted name the canonical spelling — a `CACHE` on NTFS still reads
-# as `cache` in the sentence, which is what the Rust this replaces did.
+# One rule per name rather than one rule matching all three: the description
+# quotes the directory name back as a literal, which makes the quoted name the
+# canonical spelling — a `CACHE` on NTFS still reads as `cache` in the
+# sentence.
 
-rule "dot-cache-dir" {
-  when  dir.name == ".cache"
-  then  label       = cache
-        disposition = reclaimable
-        unit        = true
-        confidence  = 0.6
-        reason      = "cache directory `.cache`: {subtree_size} bytes across {file_count} files, refilled on next use"
+[.cache/]
+description = cache directory `.cache`: {subtree_size} bytes across {file_count} files, refilled on next use
+kind = cache/v1
+filter {
+  then $p/.cache/
 }
 
-rule "cache-dir" {
-  when  dir.name == "cache"
-  then  label       = cache
-        disposition = reclaimable
-        unit        = true
-        confidence  = 0.6
-        reason      = "cache directory `cache`: {subtree_size} bytes across {file_count} files, refilled on next use"
+[cache/]
+description = cache directory `cache`: {subtree_size} bytes across {file_count} files, refilled on next use
+kind = cache/v1
+filter {
+  then $p/cache/
 }
 
-rule "caches-dir" {
-  when  dir.name == "caches"
-  then  label       = cache
-        disposition = reclaimable
-        unit        = true
-        confidence  = 0.6
-        reason      = "cache directory `caches`: {subtree_size} bytes across {file_count} files, refilled on next use"
+[caches/]
+description = cache directory `caches`: {subtree_size} bytes across {file_count} files, refilled on next use
+kind = cache/v1
+filter {
+  then $p/caches/
 }

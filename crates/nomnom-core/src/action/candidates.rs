@@ -86,7 +86,6 @@ mod tests {
                 disposition,
                 confidence: 1.0,
                 reason: "test".into(),
-                unit: true,
                 provenance: Provenance::new("p", "r"),
                 capped: None,
             },

@@ -1,42 +1,35 @@
-//! A validated [`Expr`] plus one node's facts to a yes or no.
+//! A validated field test plus one node's facts to a yes or no, and a
+//! description template plus those facts to a sentence.
 //!
 //! The evaluator learns nothing by itself. Every fact arrives through the
 //! [`Facts`] trait, which the caller implements over whatever it already has —
 //! a `nomnom-core` node, a test fixture, a row out of a cache. That is what
 //! keeps this crate free of a dependency on `nomnom-core` while still being the
-//! place the language's meaning is defined: the rule semantics live here, the
-//! filesystem lives on the other side of the trait, and a rule can be exercised
-//! with nothing but a string and a hand-written `Facts`.
+//! place a field test's meaning is defined. The structural half of a filter —
+//! `has`, `lacks`, `under`, the `then` path — is a question about a tree, so it
+//! is answered by whoever owns the tree.
 //!
 //! # Absence
 //!
 //! A node cannot always supply a fact: a file with no recorded access time has
 //! no `accessed_age`, and [`Facts::field`] answers [`Value::Absent`]. An
 //! `Absent` value makes **every** comparison false, and a bare `Absent` bool
-//! field false.
-//!
-//! `not` therefore turns an unknown fact into `true`, and that is deliberate:
-//! `accessed_before(90d)` asks "known to be stale", so `not
-//! accessed_before(90d)` asks "not known to be stale", which is exactly the
+//! field false. `not` applies after that, so `not $f.accessed_age >= 90d` holds
+//! when the age is unknown — "not known to be stale" — which is the
 //! conservative reading a deletion proposal wants. A rule that needs the fact
-//! to exist says so — `has_accessed and not accessed_before(90d)`.
+//! to exist says so with `$f.has_accessed`.
 //!
 //! # Types
 //!
 //! The parser type-checks every comparison against [`crate::vocab`], so a
-//! [`Expr::Compare`] whose [`Value`] and [`Literal`] disagree is unreachable.
-//! It answers `false` rather than panicking, because a panic in a rule engine
-//! walking a million paths is a worse outcome than a rule that does not fire.
-//! Ordering comparisons on strings and bools are likewise unparseable, so only
-//! `==` and `!=` ever reach those arms.
-//!
-//! `Num` is `f64`; `Size` is bytes and `Duration` is seconds, both `u64`,
-//! matching what the lexer already normalised the literals to.
+//! [`Value`] and [`Literal`] that disagree is unreachable. It answers `false`
+//! rather than panicking, because a panic in a rule engine walking a million
+//! paths is a worse outcome than a rule that does not fire.
 
 use std::cmp::Ordering;
 
-use crate::ast::{CmpOp, Expr, Literal};
-use crate::vocab::{Field, Predicate};
+use crate::ast::{CmpOp, FieldTest, Literal};
+use crate::vocab::Field;
 
 /// A fact's value, or `Absent` when the node cannot supply it.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,23 +45,16 @@ pub enum Value {
 /// Everything the evaluator can learn about one node.
 pub trait Facts {
     fn field(&self, field: Field) -> Value;
-    fn predicate(&self, predicate: Predicate, args: &[Literal]) -> bool;
 }
 
-/// Does this rule's `when` hold for this node?
-pub fn eval(expr: &Expr, facts: &dyn Facts) -> bool {
-    match expr {
-        Expr::Bool(value) => value.value,
-        Expr::Field(field) => matches!(facts.field(field.value), Value::Bool(true)),
-        Expr::Compare { lhs, op, rhs } => compare(&facts.field(lhs.value), op.value, &rhs.value),
-        Expr::Call { predicate, args, .. } => {
-            let args: Vec<Literal> = args.iter().map(|arg| arg.value.clone()).collect();
-            facts.predicate(predicate.value, &args)
-        }
-        Expr::Not { operand, .. } => !eval(operand, facts),
-        Expr::And { lhs, rhs } => eval(lhs, facts) && eval(rhs, facts),
-        Expr::Or { lhs, rhs } => eval(lhs, facts) || eval(rhs, facts),
-    }
+/// Does this field test hold for this node?
+pub fn check(test: &FieldTest, facts: &dyn Facts) -> bool {
+    let value = facts.field(test.field.value);
+    let holds = match &test.compare {
+        None => matches!(value, Value::Bool(true)),
+        Some((op, literal)) => compare(&value, op.value, &literal.value),
+    };
+    holds != test.negated
 }
 
 fn compare(value: &Value, op: CmpOp, literal: &Literal) -> bool {
@@ -119,22 +105,24 @@ fn str_eq(a: &str, b: &str) -> bool {
     a == b
 }
 
-// -- reason templates ------------------------------------------------------
+// -- description templates -------------------------------------------------
 
-/// Fill a rule's `reason` with this node's facts.
+/// Fill a rule's `description` with the target's facts and the filter's
+/// bindings.
 ///
-/// `{field_name}` interpolates a vocabulary field and `{{` / `}}` are literal
-/// braces; nothing else is substitutable, so a reason cannot compute. Values
-/// render as the rule text expects to read them: a `Size` is a bare byte count
-/// and a `Duration` a bare whole-day count, because the sentence around them
-/// already supplies the words "bytes" and "days". An absent fact renders as
-/// `unknown` rather than as nothing, so the gap is visible to the human
-/// approving the deletion.
+/// `{field_name}` interpolates a vocabulary field of the target node,
+/// `{$var}` the on-disk name a filter variable bound, and `{{` / `}}` are
+/// literal braces; nothing else is substitutable, so a description cannot
+/// compute. Values render as the sentence expects to read them: a `Size` is a
+/// bare byte count and a `Duration` a bare whole-day count, because the words
+/// around them already say "bytes" and "days". An absent fact or an unbound
+/// variable renders as `unknown` rather than as nothing, so the gap is visible
+/// to the human approving the deletion.
 ///
 /// A malformed template cannot get here — [`crate::parse`] rejects one — so
 /// this is total: a template that does not validate is returned verbatim
 /// rather than panicking.
-pub fn render_reason(template: &str, facts: &dyn Facts) -> String {
+pub fn render_reason(template: &str, facts: &dyn Facts, vars: &[(&str, &str)]) -> String {
     let Ok(pieces) = template_pieces(template) else {
         return template.to_owned();
     };
@@ -143,6 +131,9 @@ pub fn render_reason(template: &str, facts: &dyn Facts) -> String {
         match piece {
             Piece::Text(text) => out.push_str(text),
             Piece::Field(field) => out.push_str(&render_value(&facts.field(field))),
+            Piece::Var(name) => out.push_str(
+                vars.iter().find(|(var, _)| *var == name).map_or("unknown", |(_, value)| value),
+            ),
         }
     }
     out
@@ -161,13 +152,17 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-/// One resolved span of a reason template.
+/// One resolved span of a description template.
 pub(crate) enum Piece<'a> {
     Text(&'a str),
     Field(Field),
+    /// `{$name}`, without the `$`. Whether it is bound is the parser's check,
+    /// because only the parser knows the filter.
+    Var(&'a str),
 }
 
-/// Why a reason template is not a template. Offsets are into the template.
+/// Why a description template is not a template. Offsets are into the
+/// template.
 pub(crate) enum TemplateError<'a> {
     /// `{` naming something that is not a field. `len` covers `{name}`.
     UnknownField { name: &'a str, at: usize, len: usize },
@@ -175,8 +170,8 @@ pub(crate) enum TemplateError<'a> {
     Unclosed { at: usize },
 }
 
-/// Split a reason template, shared by the parser's check and the renderer so
-/// that what validates and what renders cannot drift apart.
+/// Split a description template, shared by the parser's check and the
+/// renderer so that what validates and what renders cannot drift apart.
 pub(crate) fn template_pieces(template: &str) -> Result<Vec<Piece<'_>>, TemplateError<'_>> {
     let bytes = template.as_bytes();
     let mut pieces = Vec::new();
@@ -202,10 +197,14 @@ pub(crate) fn template_pieces(template: &str) -> Result<Vec<Piece<'_>>, Template
                     return Err(TemplateError::Unclosed { at: i });
                 };
                 let name = &template[i + 1..i + 1 + offset];
-                let Some(field) = Field::lookup(name) else {
-                    return Err(TemplateError::UnknownField { name, at: i, len: offset + 2 });
-                };
-                pieces.push(Piece::Field(field));
+                if let Some(var) = name.strip_prefix('$') {
+                    pieces.push(Piece::Var(var));
+                } else {
+                    let Some(field) = Field::lookup(name) else {
+                        return Err(TemplateError::UnknownField { name, at: i, len: offset + 2 });
+                    };
+                    pieces.push(Piece::Field(field));
+                }
                 i += offset + 2;
                 text_start = i;
             }

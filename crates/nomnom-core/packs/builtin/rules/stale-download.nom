@@ -1,30 +1,30 @@
 # Downloads nobody has touched in months.
 #
-# Always `review`, never reclaimable: a stale download is routinely the only
-# copy of something that cannot be downloaded again.
+# `stale-download/v1` is always `review`, never reclaimable: a stale download is
+# routinely the only copy of something that cannot be downloaded again.
 #
 # Two rules rather than one because the sentence has to say which clock it
 # read. Windows disables last-access updates by default, so `accessed_age` is
 # usually absent and the mtime rule is the one that fires there.
 
-rule "stale-download-by-access" {
-  when  is_file
-        and ancestor("Downloads")
-        and has_accessed
-        and accessed_age >= 90d
-  then  label       = stale-download
-        disposition = review
-        confidence  = 0.5
-        reason      = "in Downloads, last opened {accessed_age} days ago, {size} bytes; may still be the only copy"
+[Stale download by access]
+description = in Downloads, last opened {accessed_age} days ago, {size} bytes; may still be the only copy
+kind = stale-download/v1
+filter {
+  $f.is_file
+  $f under Downloads/
+  $f.has_accessed
+  $f.accessed_age >= 90d
+  then $f
 }
 
-rule "stale-download-by-mtime" {
-  when  is_file
-        and ancestor("Downloads")
-        and not has_accessed
-        and modified_age >= 90d
-  then  label       = stale-download
-        disposition = review
-        confidence  = 0.5
-        reason      = "in Downloads, last modified {modified_age} days ago, {size} bytes; may still be the only copy"
+[Stale download by mtime]
+description = in Downloads, last modified {modified_age} days ago, {size} bytes; may still be the only copy
+kind = stale-download/v1
+filter {
+  $f.is_file
+  $f under Downloads/
+  not $f.has_accessed
+  $f.modified_age >= 90d
+  then $f
 }

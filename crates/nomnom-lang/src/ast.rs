@@ -1,16 +1,18 @@
 //! The shape a valid rule file has after parsing.
 //!
-//! Everything in here is already checked: a [`Conclusion`] that exists has a
-//! non-empty reason, a confidence inside `0.0..=1.0` and a known disposition,
-//! and every [`Expr`] is well-typed against [`crate::vocab`]. An evaluator
-//! walking this tree has no validation left to do and no error case to
-//! invent — the only thing it can fail at is reading the filesystem.
+//! Everything in here is already checked: a [`Rule`] that exists has a
+//! non-empty description whose `{holes}` all resolve, a kind the pack knows, a
+//! confidence inside `0.0..=1.0`, a disposition no stronger than its kind's,
+//! and a filter whose every variable is bound and whose every field test is
+//! well-typed against [`crate::vocab`]. An evaluator walking this tree has no
+//! validation left to do and no error case to invent.
 //!
-//! These types deliberately do not reference `nomnom-core`. The mapping from
-//! [`Conclusion`] to a `Verdict` belongs to whoever owns both.
+//! These types deliberately do not reference `nomnom-core`. The mapping from a
+//! [`Rule`] to a `Verdict` belongs to whoever owns both.
 
 use crate::diagnostic::Span;
-use crate::vocab::{Field, Predicate, Ty};
+use crate::kind::Kind;
+use crate::vocab::{Field, Ty};
 
 /// A value paired with where it was written, so a later error about it can
 /// still point at the source.
@@ -26,13 +28,108 @@ impl<T> Spanned<T> {
     }
 }
 
-/// One `rule "name" { when ... then ... }`.
+/// One `[Title]` section.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
-    pub name: Spanned<String>,
-    pub when: Expr,
-    pub then: Conclusion,
-    /// From the `rule` keyword to the closing brace.
+    /// What a verdict cites as the rule that produced it.
+    pub title: Spanned<String>,
+    /// The sentence template a human approves a deletion on.
+    pub description: Spanned<String>,
+    /// The kind this rule concludes, already resolved against the kinds the
+    /// pack may use.
+    pub kind: Spanned<Kind>,
+    /// The kind's default unless the rule overrode it.
+    pub confidence: f32,
+    /// The kind's default unless the rule downgraded it.
+    pub disposition: Disposition,
+    pub filter: Filter,
+    /// From the `[` of the title to the `}` closing the filter.
+    pub span: Span,
+}
+
+/// `filter { ... }`: every constraint holds of [`Filter::var`], and `then`
+/// names the node the verdict lands on, relative to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Filter {
+    /// The node variable `then` starts from, without its `$`.
+    pub var: Spanned<String>,
+    /// In written order. The evaluator reorders by cost; the meaning is the
+    /// conjunction, so order carries none.
+    pub constraints: Vec<Constraint>,
+    pub then: Target,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Constraint {
+    /// `$v has a | b as $m` and `$v lacks a | b`.
+    Children(ChildTest),
+    /// `$v under Name/`: some strict ancestor of `$v` has this name.
+    Under(Spanned<String>),
+    /// `$v.field`, `not $v.field`, `$v.field op literal`.
+    Field(FieldTest),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildTest {
+    /// `false` for `has`, `true` for `lacks`.
+    pub negated: bool,
+    /// The alternatives, in written order. The first one some child matches is
+    /// the one a capture reports.
+    pub names: Vec<Spanned<NamePattern>>,
+    /// `as $m`, without the `$`. Only `has` can capture.
+    pub capture: Option<Spanned<String>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldTest {
+    pub field: Spanned<Field>,
+    /// `None` for a bare bool field.
+    pub compare: Option<(Spanned<CmpOp>, Spanned<Literal>)>,
+    /// A leading `not`.
+    pub negated: bool,
+    pub span: Span,
+}
+
+/// One file-name component as written: compared by the platform's name
+/// equality when literal, by a glob when it holds `*`, `?`, `[` or `{`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NamePattern {
+    Literal(String),
+    Glob(String),
+}
+
+impl NamePattern {
+    pub fn of(text: &str) -> NamePattern {
+        if text.contains(['*', '?', '[', '{']) {
+            NamePattern::Glob(text.to_owned())
+        } else {
+            NamePattern::Literal(text.to_owned())
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            NamePattern::Literal(text) | NamePattern::Glob(text) => text,
+        }
+    }
+
+    pub fn literal(&self) -> Option<&str> {
+        match self {
+            NamePattern::Literal(text) => Some(text),
+            NamePattern::Glob(_) => None,
+        }
+    }
+}
+
+/// `then $v/a/b/`: the path from the variable down to the verdict's node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    /// Empty for `then $v` and `then $v/`, where the variable's own node is
+    /// the target.
+    pub segments: Vec<Spanned<NamePattern>>,
+    /// A trailing `/`: the target must be a directory.
+    pub dir: bool,
     pub span: Span,
 }
 
@@ -70,6 +167,8 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
+    pub const ALL: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Gt, CmpOp::Le, CmpOp::Ge];
+
     pub fn symbol(self) -> &'static str {
         match self {
             CmpOp::Eq => "==",
@@ -81,53 +180,13 @@ impl CmpOp {
         }
     }
 
+    pub fn lookup(symbol: &str) -> Option<CmpOp> {
+        CmpOp::ALL.into_iter().find(|op| op.symbol() == symbol)
+    }
+
     /// `==` and `!=` work for every type; the rest need an ordering.
     pub fn needs_order(self) -> bool {
         !matches!(self, CmpOp::Eq | CmpOp::Ne)
-    }
-}
-
-/// The `when` predicate over one node. Total by construction: no calls a user
-/// can define, no loops, no recursion.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
-    Bool(Spanned<bool>),
-    /// A bool-typed field used on its own, as in `is_dir and not is_symlink`.
-    Field(Spanned<Field>),
-    Compare {
-        lhs: Spanned<Field>,
-        op: Spanned<CmpOp>,
-        rhs: Spanned<Literal>,
-    },
-    Call {
-        predicate: Spanned<Predicate>,
-        args: Vec<Spanned<Literal>>,
-        span: Span,
-    },
-    Not {
-        operand: Box<Expr>,
-        span: Span,
-    },
-    And {
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    Or {
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-}
-
-impl Expr {
-    pub fn span(&self) -> Span {
-        match self {
-            Expr::Bool(it) => it.span,
-            Expr::Field(it) => it.span,
-            Expr::Compare { lhs, rhs, .. } => lhs.span.to(rhs.span),
-            Expr::Call { span, .. } => *span,
-            Expr::Not { span, .. } => *span,
-            Expr::And { lhs, rhs } | Expr::Or { lhs, rhs } => lhs.span().to(rhs.span()),
-        }
     }
 }
 
@@ -157,24 +216,14 @@ impl Disposition {
     pub fn lookup(name: &str) -> Option<Disposition> {
         Disposition::ALL.into_iter().find(|d| d.name() == name)
     }
-}
 
-/// What to conclude when the `when` expression holds.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Conclusion {
-    /// What the path is. An identifier; a pack may introduce its own, which is
-    /// why this is a `String` and not an enum.
-    pub label: Spanned<String>,
-    pub disposition: Spanned<Disposition>,
-    /// Never empty: checked at parse time, because a reason is what a human
-    /// approves a deletion on.
-    pub reason: Spanned<String>,
-    /// Inside `0.0..=1.0`, checked at parse time.
-    pub confidence: Spanned<f32>,
-    /// Whether this verdict speaks for the whole subtree. Absent means
-    /// `false`, and then there is no span to point at.
-    pub unit: Spanned<bool>,
-    /// The span of `unit` when it was written, `None` when defaulted.
-    pub unit_written: Option<Span>,
-    pub span: Span,
+    /// How close to a deletion this disposition is. A rule may move its kind's
+    /// disposition down this scale and never up it.
+    pub fn strength(self) -> u8 {
+        match self {
+            Disposition::Keep => 0,
+            Disposition::Review => 1,
+            Disposition::Reclaimable => 2,
+        }
+    }
 }

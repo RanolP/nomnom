@@ -1,22 +1,18 @@
 //! Every rule in the compiled-in built-in pack, on one fixture tree.
 //!
-//! The regression this catches is the one a rule pack has: a `when` whose
+//! The regression this catches is the one a rule pack has: a filter whose
 //! corroboration guard stopped guarding, a confidence that drifted, or a
-//! `reason` that reads right but is not the sentence the tool actually prints.
-//! So it pins the whole verdict set on exactly the fields a user sees — label,
-//! disposition, confidence and the reason itself — rather than spot-checking a
-//! rule or two.
+//! description that reads right but is not the sentence the tool actually
+//! prints. So it pins the whole verdict set on exactly the fields a user sees —
+//! label, disposition, confidence and the reason itself — rather than
+//! spot-checking a rule or two.
 //!
 //! This table was first proven equal, path for path, to the hand-written Rust
-//! judge the pack replaced. Two wordings were allowed to differ, both because
-//! the language has a literal where the Rust had a match:
-//!
-//! 1. `bin`/`obj` corroborate with `sibling_matches("*.csproj")`, and a reason
-//!    can interpolate a field but not the name of whatever the glob matched, so
-//!    the sentence names the pattern where the Rust named the file.
-//! 2. The `cache` reason quoted the matched constant; one rule per cache name
-//!    puts the same literal in the sentence, so this one turned out to be no
-//!    difference at all.
+//! judge the pack replaced, and again to the `when`/`then` pack that came
+//! between. One wording differs on purpose from that pack: `bin`/`obj` name the
+//! project file that sits beside them (`App.csproj`) where the old language
+//! could only name the glob (`*.csproj`), because `has *.csproj | *.sln as
+//! $marker` captures the match. That is what the hand-written Rust printed.
 
 mod common;
 
@@ -24,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, DslJudge, Label, assess_all};
+use nomnom_core::verdict::{Disposition, Label, TrustedPack, builtin_pack, judge};
 use tempfile::TempDir;
 
 /// What a user actually sees about one path.
@@ -55,6 +51,11 @@ fn fixture() -> TempDir {
     ] {
         write(root.join("unambiguous").join(name).join("payload.bin"), b"x");
     }
+    // A corroborated `target` nested inside `node_modules`: the outer verdict
+    // has to swallow it rather than report it a second time.
+    let nested = root.join("unambiguous").join("node_modules").join("crate");
+    write(nested.join("Cargo.toml"), b"[package]");
+    write(nested.join("target").join("out.bin"), b"built");
 
     // Generic names, corroborated: one directory per (name, sibling) pair, each
     // in its own parent so the corroborating files cannot cross over.
@@ -113,8 +114,7 @@ fn fixture() -> TempDir {
 
 fn rows(tmp: &TempDir) -> BTreeMap<PathBuf, Row> {
     let catalog = catalog_of(tmp.path());
-    let judge = DslJudge::new(&catalog);
-    assess_all(&judge, &catalog)
+    judge(&catalog, &[TrustedPack::builtin(builtin_pack().clone())])
         .into_iter()
         // Duplicates are still decided in Rust, not by a rule, and this fixture
         // has no duplicate pair to decide about.
@@ -217,7 +217,7 @@ const EXPECTED: &[(&str, &str, Disposition, f32, &str)] = &[
         "build-output",
         Disposition::Reclaimable,
         0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `*.sln` sits beside it",
+        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.sln` sits beside it",
     ),
     (
         "corroborated/p2/build",
@@ -259,21 +259,21 @@ const EXPECTED: &[(&str, &str, Disposition, f32, &str)] = &[
         "build-output",
         Disposition::Reclaimable,
         0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `*.csproj` sits beside it",
+        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it",
     ),
     (
         "corroborated/p8/bin",
         "build-output",
         Disposition::Reclaimable,
         0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `*.sln` sits beside it",
+        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.sln` sits beside it",
     ),
     (
         "corroborated/p9/obj",
         "build-output",
         Disposition::Reclaimable,
         0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `*.csproj` sits beside it",
+        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it",
     ),
     (
         "unambiguous/.gradle",

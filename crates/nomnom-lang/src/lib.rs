@@ -7,50 +7,57 @@
 //!
 //! The phases, each its own module:
 //! - [`diagnostic`] — spans, and the rendered error a human fixes a rule from
-//! - [`lex`] — text to tokens, with sizes normalised to bytes and durations to
-//!   seconds
-//! - [`vocab`] — the one table of fields and predicates, read by the parser
-//!   and by any evaluator
+//! - [`lex`] — one filter line to words, with sizes normalised to bytes and
+//!   durations to seconds
+//! - [`vocab`] — the one table of fields, read by the parser and by any
+//!   evaluator
+//! - [`kind`] — what a rule concludes a path is, and that kind's defaults
 //! - [`ast`] — the validated shape
-//! - [`parse`] — recursive descent, doing every check that needs no filesystem
-//! - [`eval`] — a validated [`Expr`] and one node's facts to a yes or no, plus
-//!   the `reason` template rendering that turns a verdict into a sentence
+//! - [`parse`] — the line-oriented parser, doing every check that needs no
+//!   filesystem
+//! - [`eval`] — a field test and one node's facts to a yes or no, plus the
+//!   `description` rendering that turns a verdict into a sentence
 //! - [`pack`] — a directory on disk to a validated [`pack::Pack`]
 //!
-//! [`eval`] defines what a rule *means* without knowing what a node *is*:
-//! every fact reaches it through the [`eval::Facts`] trait, which the caller
-//! implements over whatever it already has. So there is still no dependency on
-//! `nomnom-core` anywhere in this crate, and a rule stays exercisable with
-//! nothing but a string and a hand-written `Facts`.
+//! [`eval`] defines what a field test *means* without knowing what a node
+//! *is*: every fact reaches it through the [`eval::Facts`] trait, which the
+//! caller implements over whatever it already has. So there is no dependency
+//! on `nomnom-core` anywhere in this crate, and a rule stays parseable and
+//! checkable with nothing but a string.
 //!
 //! ```
-//! use nomnom_lang::{Source, parse};
+//! use nomnom_lang::{Kinds, Source, parse};
 //!
-//! let source = Source::new("example.nom", r#"
-//!     rule "cargo-target" {
-//!       when  dir.name == "target" and sibling("Cargo.toml")
-//!       then  label       = build-output
-//!             disposition = reclaimable
-//!             unit        = true
-//!             confidence  = 0.95
-//!             reason      = "`Cargo.toml` sits beside it"
-//!     }
-//! "#);
-//! let rules = parse(&source).expect("valid rule");
-//! assert_eq!(rules[0].name.value, "cargo-target");
+//! let source = Source::new("example.nom", "\
+//! [Cargo target/]
+//! description = Cargo build output, rebuilt by `cargo build`
+//! kind = build-output/v1
+//! filter {
+//!   $dir has Cargo.toml
+//!   then $dir/target/
+//! }
+//! ");
+//! let rules = parse(&source, &Kinds::builtin()).expect("valid rule");
+//! assert_eq!(rules[0].title.value, "Cargo target/");
+//! assert_eq!(rules[0].confidence, 0.9, "the kind's default");
 //! ```
 
 pub mod ast;
 pub mod diagnostic;
 pub mod eval;
+pub mod kind;
 pub mod lex;
 pub mod pack;
 pub mod parse;
 pub mod vocab;
 
-pub use ast::{CmpOp, Conclusion, Disposition, Expr, Literal, Rule, Spanned};
+pub use ast::{
+    ChildTest, CmpOp, Constraint, Disposition, FieldTest, Filter, Literal, NamePattern, Rule,
+    Spanned, Target,
+};
 pub use diagnostic::{Diagnostic, Source, Span};
-pub use eval::{Facts, Value, eval, render_reason};
+pub use eval::{Facts, Value, check, render_reason};
+pub use kind::{Kind, Kinds};
 pub use pack::{Pack, PackError, load};
 pub use parse::parse;
-pub use vocab::{Field, Predicate, Ty};
+pub use vocab::{Field, Ty};

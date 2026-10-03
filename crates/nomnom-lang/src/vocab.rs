@@ -1,13 +1,16 @@
 //! The one table of everything a rule may say.
 //!
-//! Fields and predicates are declared **once**, in the [`vocabulary!`]
-//! invocation at the bottom of this file. Adding `owner == "root"` or
-//! `created_before(1y)` is one line there and nothing else: the macro derives
-//! the enum variant, the name lookup the parser uses, the parameter types the
-//! type checker uses, and the `&'static` tables anyone (an evaluator, a docs
-//! generator, a completion list) can iterate. The evaluator matches on the
-//! generated enum, so a new entry shows up as a non-exhaustive-match error
-//! there rather than as a silent no-op at runtime.
+//! Fields are declared **once**, in the [`vocabulary!`] invocation at the
+//! bottom of this file. Adding `$f.owner == "root"` is one line there and
+//! nothing else: the macro derives the enum variant, the name lookup the parser
+//! uses, the type the type checker uses, and the `&'static` table anyone (an
+//! evaluator, a docs generator, a completion list) can iterate. The evaluator
+//! matches on the generated enum, so a new entry shows up as a
+//! non-exhaustive-match error there rather than as a silent no-op at runtime.
+//!
+//! Questions about a node's surroundings are not fields: `has`, `lacks` and
+//! `under` are filter syntax, because an engine can index a name it can see in
+//! the grammar and cannot index one hidden inside a function call.
 
 use std::fmt;
 
@@ -70,25 +73,9 @@ pub struct FieldDef {
     pub doc: &'static str,
 }
 
-/// One row of the predicate table.
-#[derive(Debug, Clone, Copy)]
-pub struct PredicateDef {
-    pub predicate: Predicate,
-    pub name: &'static str,
-    pub params: &'static [Ty],
-    pub doc: &'static str,
-}
-
-impl PredicateDef {
-    pub fn arity(&self) -> usize {
-        self.params.len()
-    }
-}
-
 macro_rules! vocabulary {
     (
         fields { $($fvar:ident $fname:literal : $fty:ident , $fdoc:literal ;)* }
-        predicates { $($pvar:ident $pname:literal ( $($pty:ident),* ) , $pdoc:literal ;)* }
     ) => {
         /// A fact about the node under judgement.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,32 +94,6 @@ macro_rules! vocabulary {
             pub fn ty(self) -> Ty { self.def().ty }
             pub fn lookup(name: &str) -> Option<Field> {
                 FIELDS.iter().find(|d| d.name == name).map(|d| d.field)
-            }
-        }
-
-        /// A question asked about the node's surroundings.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum Predicate { $($pvar),* }
-
-        /// Every predicate, in declaration order.
-        pub static PREDICATES: &[PredicateDef] = &[
-            $(PredicateDef {
-                predicate: Predicate::$pvar,
-                name: $pname,
-                params: &[$(Ty::$pty),*],
-                doc: $pdoc,
-            }),*
-        ];
-
-        impl Predicate {
-            pub fn def(self) -> &'static PredicateDef {
-                PREDICATES.iter().find(|d| d.predicate == self).expect("every variant has a row")
-            }
-            pub fn name(self) -> &'static str { self.def().name }
-            pub fn params(self) -> &'static [Ty] { self.def().params }
-            pub fn arity(self) -> usize { self.def().params.len() }
-            pub fn lookup(name: &str) -> Option<Predicate> {
-                PREDICATES.iter().find(|d| d.name == name).map(|d| d.predicate)
             }
         }
     };
@@ -161,16 +122,6 @@ vocabulary! {
         MaxDescendantAge "max_descendant_age" : Duration,
             "how long ago the most recently modified node in the subtree was modified";
         HasAccessed "has_accessed" : Bool, "the filesystem reported a last-access time";
-    }
-    predicates {
-        Sibling        "sibling"         (Str),      "the parent has a child by this name";
-        Child          "child"           (Str),      "this directory has a child by this name";
-        Ancestor       "ancestor"        (Str),      "some ancestor is named this";
-        Matches        "matches"         (Str),      "glob against the name";
-        ModifiedBefore "modified_before" (Duration), "mtime is older than this";
-        AccessedBefore "accessed_before" (Duration), "atime is older than this; false with no atime";
-        SiblingMatches "sibling_matches" (Str),
-            "the parent has a child whose name matches this glob";
     }
 }
 

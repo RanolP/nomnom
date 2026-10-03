@@ -4,16 +4,18 @@
 //! `cargo run -p nomnom-lang --example explain -- path/to/rules.nom`
 //! With no argument it parses a deliberately broken rule built in below.
 
-use nomnom_lang::{Source, parse};
+use nomnom_lang::{Kinds, Source, parse};
 
-const BROKEN: &str = r#"rule "stale-downloads" {
-  when  ancestor("Downloads")
-        and size > "big"
-  then  label       = stale-download
-        disposition = reclaimable
-        confidence  = 0.7
+const BROKEN: &str = "\
+[Stale download]
+description = in Downloads, last modified {modified_age} days ago
+kind = stale-download/v1
+filter {
+  $f under Downloads/
+  $f.size > \"big\"
+  then $f
 }
-"#;
+";
 
 fn main() {
     let source = match std::env::args().nth(1) {
@@ -23,7 +25,7 @@ fn main() {
         }
         None => Source::new("rules/downloads.nom", BROKEN),
     };
-    match parse(&source) {
+    match parse(&source, &Kinds::builtin()) {
         Ok(rules) => println!("ok: {} rule(s)", rules.len()),
         Err(diagnostic) => print!("{diagnostic}"),
     }

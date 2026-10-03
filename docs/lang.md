@@ -4,58 +4,105 @@ A small, total language for saying what a file or directory **is**. It is not a 
 
 ## Why a language at all
 
-The judgement layer is a trait, `Judge`. Milestone 1 answered it with hand-written Rust. That works exactly until someone who is not us wants to teach nomnom about a toolchain we have never heard of — and then it fails completely, because the only way to add a rule is to recompile the tool.
+Milestone 1 answered "what is this path" with hand-written Rust. That works exactly until someone who is not us wants to teach nomnom about a toolchain we have never heard of — and then it fails completely, because the only way to add a rule is to recompile the tool.
 
-So the rules move out of Rust and into data, and the data becomes distributable. Everything below follows from that one goal.
+So the rules move out of Rust and into data, and the data becomes distributable. The language has two jobs at once: writing a rule should be easy, and the engine should be able to see enough of a rule's shape to run every rule in a pack without visiting every node once per rule. Everything below follows from those two goals.
 
 ## A rule
 
 ```
-rule "cargo-target" {
-  when  dir.name == "target"
-        and sibling("Cargo.toml")
-  then  label       = build-output
-        disposition = reclaimable
-        unit        = true
-        confidence  = 0.95
-        reason      = "regenerable: Cargo build output, rebuilt by `cargo build` — `Cargo.toml` sits beside it"
+[build/ beside a manifest]
+description = regenerable: build output, rebuilt by the project's build command — `{$marker}` sits beside it
+kind = build-output/v1
+filter {
+  $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
+  then $dir/build/
+}
+
+[Stale download by access]
+description = in Downloads, last opened {accessed_age} days ago, {size} bytes; may still be the only copy
+kind = stale-download/v1
+filter {
+  $f.is_file
+  $f under Downloads/
+  $f.has_accessed
+  $f.accessed_age >= 90d
+  then $f
 }
 ```
 
-`when` is a predicate over one node. `then` is what to conclude when it holds.
+A rule opens with a `[Title]` line. The title is the rule's name: the CLI and the GUI show it beside every verdict the rule produces, as `pack [Title]`, and a pack name plus a title is the stable identity a verdict carries. Keys follow as `key = value`, one per line, and the rule ends with exactly one `filter { ... }` block. `#` starts a comment line.
 
-### `then` fields
+### Keys
 
-| field | required | meaning |
+| key | required | meaning |
 |---|---|---|
-| `label` | yes | what the path is. An identifier; packs may introduce their own. |
-| `disposition` | yes | `keep`, `reclaimable`, or `review` |
-| `reason` | yes | the sentence a human reads before approving. See below. |
-| `confidence` | yes | `0.0`–`1.0` |
-| `unit` | no, default `false` | this verdict speaks for the whole subtree |
+| `description` | yes | the sentence a human reads before approving. A template; see below. |
+| `kind` | yes | what the path is, as `name/vN`. The kind supplies the default disposition and confidence. |
+| `confidence` | no, default the kind's | `0.0`–`1.0` |
+| `disposition` | no, default the kind's | `keep`, `review` or `reclaimable`, and only ever a downgrade of the kind's default. A `cache/v1` rule may say `review`; a `stale-download/v1` rule may not say `reclaimable`. |
 
-`reason` is required and must be non-empty. It is the single load-bearing field in the product: it is what a human approves a deletion on, and from milestone 3 it is what a model writes. A rule whose reason restates its label (`"this is build output"`) is a broken rule — the reason names the evidence (`` "`Cargo.toml` sits beside it" ``).
+An unknown key is an error, with a "did you mean" when one is close. So is a key set twice, a missing required key, and a `confidence` outside the range.
 
-A reason is a template. `{field}` interpolates any vocabulary field, and `{{` and `}}` are literal braces; nothing else is substitutable, so a reason cannot compute and cannot smuggle in a second expression language. A `size` renders as a bare byte count and a duration as a bare whole-day count, leaving the rule to supply the word:
+### Kinds
+
+| kind | disposition | confidence |
+|---|---|---|
+| `build-output/v1` | `reclaimable` | 0.9 |
+| `cache/v1` | `reclaimable` | 0.6 |
+| `stale-download/v1` | `review` | 0.5 |
+
+A kind is versioned so its meaning can change without silently changing every rule written against the old one: a `build-output/v2` would be a new row, and rules naming `v1` keep the `v1` defaults. A pack declares kinds of its own in `pack.toml` (see [Packs](#packs)); the built-in names are reserved.
+
+### `description`
+
+`description` is required and must be non-empty. It is the single load-bearing field in the product: it is what a human approves a deletion on, and from milestone 3 it is what a model writes. A rule whose description restates its kind (`this is build output`) is a broken rule — the description names the evidence (`` `Cargo.toml` sits beside it ``).
+
+A description is a template, and two kinds of hole are substitutable:
+
+- `{field}` interpolates any vocabulary field, read from the node the verdict lands on. A `size` renders as a bare byte count and a duration as a bare whole-day count, leaving the rule to supply the word.
+- `{$name}` interpolates a name the filter bound: the filter's own variable renders the name of the node it matched, and a capture (`has … as $marker`) renders the child that satisfied it, in its on-disk spelling.
+
+`{{` and `}}` are literal braces. Nothing else is substitutable, so a description cannot compute and cannot smuggle in a second expression language. An unknown field or an unbound `$name` inside braces is a parse error, not an empty substitution — a description with a hole in it is shown to a human about to delete something.
+
+## Filters
+
+A filter is a list of constraints, one per line, on one node — the variable every constraint names — followed by one `then` line that says which node the verdict lands on, relative to it. All constraints must hold; there is no `or` between lines.
 
 ```
-reason = "cache directory `cache`: {subtree_size} bytes across {file_count} files, refilled on next use"
+$v has A | B as $m     some child of $v is named A or B; $m names the one found
+$v lacks A | B         no child of $v is named A or B
+$v under Name/         some strict ancestor of $v is named Name
+$v.field               a bool field holds
+not $v.field           a bool field does not hold
+$v.field >= 90d        a field compared with a literal: == != < > <= >=
+then $v/a/b/           the verdict lands on $v's child a, then its child b
 ```
 
-An unknown name inside braces is a parse error, not an empty substitution — a reason with a hole in it is shown to a human about to delete something.
+A name in `has`, `lacks` or a `then` path is one file-name component. It is compared literally when it is a plain name and as a glob when it holds `*`, `?`, `[` or `{` — `has *.csproj | *.sln as $marker`. When several children satisfy a capturing `has`, the capture reports one that matches the first alternative written, and among those the smallest name, so a description is the same on every run.
 
-`unit = true` means the directory is **one** decision, not one per file inside it. `node_modules` is the motivating case: 40,000 files, one verdict. Evaluation stops descending at a unit node, and the reclaimable total counts its `subtree_size` once. Setting this wrongly is the one authoring mistake that corrupts a total rather than merely adding a bad row, so it is explicit and validated, never inferred.
+`then $v` targets the variable's own node; `then $v/target/` targets its child `target`. A trailing `/` means the target must be a directory. The scan root is never a target: it is the fence the whole plan sits inside.
+
+### Each target is one decision
+
+A target is **one** decision for its whole subtree, not one per file inside it. `node_modules` is the motivating case: 40,000 files, one verdict, and the reclaimable total counts its rolled-up size once. Nothing inside a target is judged again by a rule: when one rule's target sits inside another's, the outer target swallows the inner one.
+
+### Shapes this makes reachable
+
+Because the target is a path from the matched node rather than the matched node itself, three shapes that the first version of this language could not express are now ordinary rules:
+
+- **Match `X`, target a descendant of it.** `$p has .next / then $p/.next/cache/` takes `.next/cache` and leaves the rest of `.next` alone.
+- **Match `X`, target a sibling.** `$p has .dart_tool / then $p/build/` takes the `build/` that a `.dart_tool` beside it vouches for.
+- **Match `X`, spare named children.** `then $p/.cargo/registry/cache/` takes the registry's download cache and never touches `src`, `index` or `git`, which are its siblings.
 
 ## Vocabulary
 
 Purely structural. No rule reads the inside of a file, which keeps evaluation as cheap as the scan and means a pack cannot exfiltrate file contents.
 
-**Fields**
+**Fields**, written `$v.field`:
 
 ```
 name          file-name component
-dir.name      same, but the rule only matches directories
-file.name     same, but only files
 ext           extension without the dot
 path          full path
 size          own size in bytes
@@ -72,19 +119,7 @@ has_accessed        whether the filesystem reported an atime at all
 max_descendant_age  how long ago the newest file anywhere in the subtree was modified
 ```
 
-`max_descendant_age` exists because a directory's own mtime reflects only its entry list. `node_modules` whose contents are compiled against daily still has a months-old mtime the moment nothing is added or removed from its top level, so `modified_before(90d)` on a directory measures almost nothing. The rolled-up figure is what "nobody is using this project" actually means, and it costs nothing — it rolls up in the same bottom-up pass as `subtree_size`.
-
-**Predicates**
-
-```
-sibling("Cargo.toml")     the parent has a child by this name
-sibling_matches("*.sln")  the parent has a child whose name matches this glob
-child("pyvenv.cfg")       this directory has a child by this name
-ancestor("Downloads")     some ancestor is named this
-matches("*.log")          glob against the name
-modified_before(90d)
-accessed_before(1y)       false when the platform reports no atime
-```
+`max_descendant_age` exists because a directory's own mtime reflects only its entry list. `node_modules` whose contents are compiled against daily still has a months-old mtime the moment nothing is added or removed from its top level, so `$d.modified_age >= 90d` on a directory measures almost nothing. The rolled-up figure is what "nobody is using this project" actually means, and it costs nothing — it rolls up in the same bottom-up pass as `subtree_size`.
 
 Name comparison follows the platform: case-insensitive on Windows, case-sensitive elsewhere. This mirrors what the filesystem itself does — `Node_Modules` is the same directory on NTFS and a different one on ext4.
 
@@ -97,21 +132,33 @@ Name comparison follows the platform: case-insensitive on Windows, case-sensitiv
 30d  6mo  1y  12h        durations
 ```
 
-**Operators** — `and` `or` `not`, parentheses, and `== != < > <= >=`. That is the whole grammar. There is no assignment, no loop, no function definition, no recursion: every rule terminates, and its cost is bounded before it runs.
+A comparison is type-checked when the rule is parsed: `$f.size >= 90d` is an error, and so is ordering a string or a bool. There is no assignment, no loop, no function definition, no recursion: every rule terminates, and its cost is bounded before it runs.
 
 ### Absent facts
 
-Some facts a node simply cannot supply: `dir.name` on a file, `accessed_age` where Windows has last-access updates turned off, `max_descendant_age` where the walk was truncated by a permission error. The fact is **absent**, and every comparison against an absent fact is false.
+Some facts a node simply cannot supply: `accessed_age` where Windows has last-access updates turned off, `max_descendant_age` where the walk was truncated by a permission error. The fact is **absent**, and every comparison against an absent fact is false.
 
-That makes `not` the way to ask about absence, and it makes the safe direction the default one. `accessed_before(1y)` is false when the atime is unknown, so a rule that deletes on staleness stays silent rather than firing on a file it knows nothing about. The general invariant, which the engine holds and rules cannot opt out of: **unknown means keep.** Every fail-open probe in the tool we studied this design against became a data-loss incident.
+That makes `not $f.has_accessed` the way to ask about absence, and it makes the safe direction the default one. `$f.accessed_age >= 1y` is false when the atime is unknown, so a rule that deletes on staleness stays silent rather than firing on a file it knows nothing about. The general invariant, which the engine holds and rules cannot opt out of: **unknown means keep.** Every fail-open probe in the tool we studied this design against became a data-loss incident.
+
+## How the engine runs a pack
+
+A rule's shape tells the engine where it can match, so no rule is run against every node. This is the same trick a browser uses for CSS selectors: match from the right, starting at the most specific name.
+
+1. **Key.** Each rule gets a key from its shape — the deepest literal name in its `then` path (`node_modules`), or failing that, a literal `has` name (the anchor must hold that child), or failing that, its `under` name. One pass over the catalog collects the nodes carrying any key name, and a rule is tried only at those nodes.
+2. **Climb, then check.** From a keyed node the engine climbs back up the `then` path to the anchor and tests the constraints there, cheapest first: `under` (a binary search over the subtree ranges of every node with that name), then bool and numeric fields, then one pass over the anchor's children that answers every `has` and `lacks` at once, then string fields.
+3. **Universal rules.** A rule with no literal name anywhere has no key and is checked at every node. That is allowed, and it is timed on its own line under `NOMNOM_TIMINGS=1`, so a pack that makes a scan slow says which rules did it.
 
 ## Conflicts
 
-Several rules can match one node. Resolution is deterministic, in this order:
+Several rules can target one node. Resolution is deterministic, in this order:
 
 1. highest `confidence`
 2. pack precedence (later-resolved pack wins)
-3. rule order within the pack
+3. rule order within the pack (earlier rule wins)
+
+The trust cap (below) applies to the winner, after resolution. Then nesting is resolved: a target inside another target is dropped, whatever its confidence, because the outer verdict already decides it.
+
+Duplicate detection is not a rule and stays in Rust. A file that belongs to a duplicate group gets the duplicate verdict on its own node, over any rule verdict there.
 
 The winning verdict records which pack and rule produced it. With packs coming from the network, "why does nomnom want to delete this" must be answerable down to the rule, so provenance is part of the verdict rather than a debugging aid.
 
@@ -119,9 +166,20 @@ The winning verdict records which pack and rule produced it. With packs coming f
 
 ```
 mypack/
-  pack.toml       name, version, the labels it introduces
+  pack.toml       name, version, the kinds it declares
   rules/*.nom
 ```
+
+```toml
+name = "rust"
+version = "0.2.0"
+
+[kinds."toolchain-cache/v1"]
+disposition = "reclaimable"
+confidence = 0.7
+```
+
+Rule files load in file-name order, so rule order — the last conflict tie-break — is the same on every machine.
 
 Resolution order, later overriding earlier:
 
@@ -161,7 +219,7 @@ The other half of that history is worth stating too: every serious incident ther
 
 ## What the language does not do
 
-Catalog-wide analysis stays in Rust. Duplicate detection needs a whole-catalog size-then-hash pass, so the language gets `is_duplicate` as a fact rather than the means to express the algorithm. The same will hold for anything else requiring a global view: the language sees one node at a time, and Rust supplies the facts that a single node cannot know about itself.
+Catalog-wide analysis stays in Rust. Duplicate detection needs a whole-catalog size-then-hash pass, so the language gets `is_duplicate` as a fact rather than the means to express the algorithm. The same will hold for anything else requiring a global view: a rule sees one node and its immediate neighbourhood, and Rust supplies the facts that a single node cannot know about itself.
 
 ### Facts the vocabulary still needs
 
@@ -170,14 +228,13 @@ Named here rather than in an issue tracker, because the vocabulary is a table an
 | fact | shape | what supplies it |
 |---|---|---|
 | `vcs_tracked` | field, bool | nearest ancestor holding `.git`, one cached `git ls-files` per repo root. Unresolvable means tracked, means keep. The generic names — `build`, `dist`, `obj`, `out` — have no other defence, and a committed `dist/` is indistinguishable from a generated one by name alone. |
-| `subtree_contains("*.pyc")` | predicate | any descendant name matching the glob. A `__pycache__` holding bytecode is build output; one holding anything else is somebody's oddly-named directory. This is the general shape of positive corroboration. |
-| `child_matches("*.csproj")` | predicate | the `child` counterpart of `sibling_matches`. |
+| `contains *.pyc` | constraint | any descendant name matching the glob, not only a direct child as `has` checks. A `__pycache__` holding bytecode is build output; one holding anything else is somebody's oddly-named directory. This is the general shape of positive corroboration. |
 | `is_reparse_point` | field, bool | `FILE_ATTRIBUTE_REPARSE_POINT` from the scan. Needed by the engine refusal above, not by rules. |
 | `child_file_size("offline.bnk")` | field-like | size of a named child, expressing "this cache is big enough to be worth naming" without reading bytes. |
-| `owner_installed("Slack")` | predicate | the host's installed-product set: uninstall registry keys, `%ProgramFiles%`, `WindowsApps`. Unresolvable means installed, means keep. Orphaned application data is worth `review` even with this, never `reclaimable`. |
+| `owner_installed("Slack")` | constraint | the host's installed-product set: uninstall registry keys, `%ProgramFiles%`, `WindowsApps`. Unresolvable means installed, means keep. Orphaned application data is worth `review` even with this, never `reclaimable`. |
 | `in_use` | field, tri-state | Windows RestartManager. Unknown means in use, means keep. Until it exists, partial downloads and database files are engine refusals rather than rules. |
-| `sibling_rank("app-*", version)` and `is_pinned` | needs a peer set | keep-newest-N across version-suffixed siblings, which is how every Squirrel/Electron application accumulates gigabytes. This is the first predicate that reads a set of peers rather than one node, so it changes the matcher's shape; worth knowing before it is needed. `is_pinned` is inseparable from it, because updaters stage the next version before flipping the pointer at it. |
+| `sibling_rank("app-*", version)` and `is_pinned` | needs a peer set | keep-newest-N across version-suffixed siblings, which is how every Squirrel/Electron application accumulates gigabytes. This is the first constraint that reads a set of peers rather than one node, so it changes the matcher's shape; worth knowing before it is needed. `is_pinned` is inseparable from it, because updaters stage the next version before flipping the pointer at it. |
 
-Three **rule shapes** are missing as well, and no predicate substitutes for them: match `X` but target a descendant of it (`.next/cache/*`, not `.next`); match `X` and also target a sibling (`.dart_tool` implies the `build/` beside it); match `X` but spare a named set of children (`.cargo/registry/cache` but not `src`, `index`, `git`). Without them such a rule must either delete too much or match nothing.
+The three **rule shapes** this section used to list as missing — target a descendant, target a sibling, spare named children — are solved by `then` paths; see [Shapes this makes reachable](#shapes-this-makes-reachable).
 
 Deliberately excluded: parsing manifests — plists, JSON, version files. That is real content reading, it is format-specific, and everything it would buy is reachable through `sibling_rank` and `owner_installed`.

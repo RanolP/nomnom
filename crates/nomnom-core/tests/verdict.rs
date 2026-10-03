@@ -7,17 +7,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, DslJudge, Judge, Label, Verdict, assess_all, rollup};
+use nomnom_core::catalog::{Catalog, NodeId};
+use nomnom_core::verdict::{
+    Disposition, Label, TrustedPack, Verdict, builtin_pack, judge, rollup,
+};
 use tempfile::TempDir;
 
 /// Verdicts keyed by the path they were rendered about.
 fn judged(root: &Path) -> Vec<(PathBuf, Verdict)> {
     let catalog = catalog_of(root);
-    let judge = DslJudge::new(&catalog);
-    assess_all(&judge, &catalog)
+    builtin_verdicts(&catalog)
         .into_iter()
         .map(|(id, verdict)| (catalog.path(id), verdict))
         .collect()
+}
+
+fn builtin_verdicts(catalog: &Catalog) -> Vec<(NodeId, Verdict)> {
+    judge(catalog, &[TrustedPack::builtin(builtin_pack().clone())])
 }
 
 fn verdict_for(judged: &[(PathBuf, Verdict)], suffix: impl AsRef<Path>) -> Option<&Verdict> {
@@ -73,8 +79,7 @@ fn files_inside_a_flagged_directory_produce_no_verdicts() {
     assert!(inside.is_empty(), "verdicts leaked inside node_modules: {inside:?}");
 
     let catalog = catalog_of(root);
-    let judge = DslJudge::new(&catalog);
-    let verdicts = assess_all(&judge, &catalog);
+    let verdicts = builtin_verdicts(&catalog);
     let total = rollup(&catalog, &verdicts).reclaimable_bytes;
     assert_eq!(
         total,
@@ -190,8 +195,7 @@ fn a_duplicate_group_with_identical_mtimes_keeps_the_lowest_path_not_the_lowest_
     }
 
     let catalog = catalog_of(root);
-    let judge = DslJudge::new(&catalog);
-    let dups: Vec<(nomnom_core::catalog::NodeId, Verdict)> = assess_all(&judge, &catalog)
+    let dups: Vec<(NodeId, Verdict)> = builtin_verdicts(&catalog)
         .into_iter()
         .filter(|(_, verdict)| verdict.label == Label::DUPLICATE)
         .collect();
@@ -206,19 +210,4 @@ fn a_duplicate_group_with_identical_mtimes_keeps_the_lowest_path_not_the_lowest_
         "kept {}, but the lowest path in the group is a/copy.bin",
         catalog.path(*kept_id).display()
     );
-}
-
-/// The trait is the seam milestone 2 swaps a model into; a per-node `assess`
-/// must stay callable without going through `assess_all`.
-#[test]
-fn judge_is_usable_per_node() {
-    let tmp = TempDir::new().expect("tempdir");
-    write(tmp.path().join("package.json"), b"{}");
-    write(tmp.path().join("node_modules/pkg/index.js"), b"1");
-
-    let catalog = catalog_of(tmp.path());
-    let judge = DslJudge::new(&catalog);
-    let id = catalog.find(&tmp.path().join("node_modules")).expect("node_modules node");
-    let verdict = judge.assess(&catalog, id).expect("judged");
-    assert!(verdict.unit, "node_modules speaks for its whole subtree");
 }
