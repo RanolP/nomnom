@@ -112,6 +112,11 @@ impl NomnomApp {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let session = self.session.read(cx);
         let busy = session.busy;
+        let duplicates = session
+            .duplicates
+            .as_ref()
+            .filter(|_| busy.is_none())
+            .map(|progress| progress.status());
         let root =
             session.root.as_deref().map_or_else(|| "No drive scanned yet".to_string(), plain);
 
@@ -142,6 +147,10 @@ impl NomnomApp {
                 row.child(Spinner::new().small()).child(
                     div().text_sm().text_color(cx.theme().muted_foreground).child(phase.label()),
                 )
+            })
+            .when_some(duplicates, |row, status| {
+                row.child(Spinner::new().small())
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(status))
             })
             .child(
                 Button::new("packs")

@@ -38,9 +38,8 @@ const FILES: &[(&str, &str)] = &[
 pub fn builtin_pack() -> &'static Pack {
     static PACK: OnceLock<Pack> = OnceLock::new();
     PACK.get_or_init(|| {
-        let rules = FILES
-            .iter()
-            .map(|(name, text)| (Source::new(*name, *text), PathBuf::from(*name)));
+        let rules =
+            FILES.iter().map(|(name, text)| (Source::new(*name, *text), PathBuf::from(*name)));
         from_sources(&Source::new("pack.toml", MANIFEST), rules, PathBuf::from("<built-in>"))
             .unwrap_or_else(|error| panic!("the built-in pack is compiled in and valid:\n{error}"))
     })

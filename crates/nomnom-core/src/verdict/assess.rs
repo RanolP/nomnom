@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use super::duplicate::Duplicates;
 use super::{Disposition, Label, TrustedPack, Verdict, judge};
 use crate::catalog::Catalog;
 use crate::timings;
@@ -35,14 +36,14 @@ pub struct SharedFile {
     pub complete: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Group {
     pub label: Label,
     pub bytes: u64,
     pub entries: Vec<Entry>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Entry {
     pub path: String,
     pub bytes: u64,
@@ -51,6 +52,11 @@ pub struct Entry {
     /// which is charged its `bytes`.
     #[serde(skip)]
     pub reach: Option<Reach>,
+    /// For a likely copy, the kept original it was matched to by sample. A
+    /// plan carries it so the two are compared byte for byte before anything
+    /// is trashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_of: Option<String>,
 }
 
 /// An entry's subtree as the catalog's id range, and the bytes it adds to its
@@ -98,22 +104,70 @@ pub fn charges(entries: &[&Entry], shared: &[SharedFile]) -> Vec<u64> {
     out
 }
 
-/// One [`judge`] pass over the catalog, grouped.
+/// One [`judge`] pass over the catalog, grouped: the rules only.
 ///
 /// `packs` arrives already in resolution order, built-in first — see
 /// [`super::resolve_packs`]. Every entry's [`Verdict::provenance`] names the
-/// pack and rule that decided it.
+/// pack and rule that decided it. Duplicates come after, from
+/// [`super::find_duplicates`], merged by [`Assessment::with_duplicates`], so
+/// the rules' answer is on screen while the slower duplicate pass runs.
 pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
     let verdicts = judge(catalog, &packs);
     let started = Instant::now();
-
-    let mut spans: Vec<(u32, u32)> = verdicts
-        .iter()
-        .map(|(id, _)| {
-            let range = catalog.subtree(*id);
-            (range.start, range.end)
+    let entries = verdicts
+        .into_iter()
+        .map(|(id, verdict)| {
+            let node = catalog.node(id);
+            let range = catalog.subtree(id);
+            Entry {
+                path: catalog.path(id).display().to_string(),
+                bytes: node.subtree_size,
+                verdict,
+                reach: Some(Reach {
+                    start: range.start,
+                    end: range.end,
+                    rolled: node.rolled_size(),
+                }),
+                copy_of: None,
+            }
         })
         .collect();
+    let assessment = build(catalog, entries);
+    timings::lap("assess: group, sort, shared links", started);
+    assessment
+}
+
+impl Assessment {
+    /// This assessment with `duplicates` merged in: every rule entry as it
+    /// was, plus the duplicate group.
+    ///
+    /// The rule entries are carried over untouched, so whatever a user
+    /// already approved or excluded against them names the same entries
+    /// afterwards.
+    pub fn with_duplicates(&self, catalog: &Catalog, duplicates: &Duplicates) -> Assessment {
+        let entries = self
+            .groups
+            .iter()
+            .filter(|group| group.label != Label::DUPLICATE)
+            .flat_map(|group| group.entries.iter().cloned())
+            .chain(duplicates.entries.iter().cloned())
+            .collect();
+        build(catalog, entries)
+    }
+
+    /// Every likely copy the assessment holds, the duplicate pass having run.
+    pub fn duplicate_copies(&self) -> impl Iterator<Item = &Entry> {
+        self.groups
+            .iter()
+            .filter(|group| group.label == Label::DUPLICATE)
+            .flat_map(|group| &group.entries)
+            .filter(|entry| entry.copy_of.is_some())
+    }
+}
+
+fn build(catalog: &Catalog, entries: Vec<Entry>) -> Assessment {
+    let mut spans: Vec<(u32, u32)> =
+        entries.iter().filter_map(|entry| entry.reach.map(|r| (r.start, r.end))).collect();
     spans.sort_unstable();
     let mut outer: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -137,15 +191,8 @@ pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
         .collect();
 
     let mut by_label: BTreeMap<Label, Vec<Entry>> = BTreeMap::new();
-    for (id, verdict) in verdicts {
-        let node = catalog.node(id);
-        let range = catalog.subtree(id);
-        by_label.entry(verdict.label.clone()).or_default().push(Entry {
-            path: catalog.path(id).display().to_string(),
-            bytes: node.subtree_size,
-            verdict,
-            reach: Some(Reach { start: range.start, end: range.end, rolled: node.rolled_size() }),
-        });
+    for entry in entries {
+        by_label.entry(entry.verdict.label.clone()).or_default().push(entry);
     }
     let mut groups: Vec<Group> = by_label
         .into_iter()
@@ -162,6 +209,5 @@ pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
         .filter(|entry| entry.verdict.disposition == Disposition::Reclaimable)
         .collect();
     let reclaimable_bytes = charges(&reclaimable, &shared).iter().sum();
-    timings::lap("assess: group, sort, shared links", started);
     Assessment { root: catalog.path(catalog.root()), groups, reclaimable_bytes, shared }
 }

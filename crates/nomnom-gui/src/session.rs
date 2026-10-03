@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter};
-use nomnom_core::catalog::{Catalog, NodeId};
+use nomnom_core::catalog::{Catalog, DuplicateProgress, NodeId};
 use nomnom_core::scan::{self, ScanFailure, Volume, VolumeRoot};
 use nomnom_core::timings;
-use nomnom_core::verdict::{Assessment, assess, resolve_packs};
+use nomnom_core::verdict::{Assessment, assess, find_duplicates, resolve_packs};
 
 use crate::palette::Palette;
 
@@ -129,6 +129,11 @@ fn subtree_allocated(catalog: &Catalog) -> Option<Vec<u64>> {
 /// state (the Clean selection) can reset it.
 pub struct Assessed;
 
+/// Emitted when the duplicate pass merges its likely copies into the current
+/// assessment. Distinct from [`Assessed`] because nothing the user decided is
+/// invalidated: every rule entry is carried over unchanged.
+pub struct DuplicatesMerged;
+
 pub struct Session {
     /// The drive open, as `Volume.root`; the GUI scans whole drives only.
     pub root: Option<PathBuf>,
@@ -142,6 +147,9 @@ pub struct Session {
     pub assessment: Option<Arc<Assessment>>,
     /// Set while the judging of the current catalog runs in the background.
     pub assessing: bool,
+    /// Set while the duplicate pass over the current assessment runs; the
+    /// rules' answer is already on screen by then.
+    pub duplicates: Option<Arc<DuplicateProgress>>,
     /// Bumped by every scan and every judging run, so a result that lands
     /// after a newer one started is dropped rather than shown.
     assess_generation: u64,
@@ -154,6 +162,7 @@ pub struct Session {
 }
 
 impl EventEmitter<Assessed> for Session {}
+impl EventEmitter<DuplicatesMerged> for Session {}
 
 impl Session {
     pub fn new() -> Self {
@@ -165,6 +174,7 @@ impl Session {
             progress: None,
             assessment: None,
             assessing: false,
+            duplicates: None,
             assess_generation: 0,
             busy: None,
             scan_error: None,
@@ -208,8 +218,10 @@ impl Session {
         self.scan = None;
         self.assessment = None;
         self.assessing = false;
-        // Any judging still running is for the catalog this scan replaces.
+        // Any judging or duplicate pass still running is for the catalog this
+        // scan replaces.
         self.assess_generation += 1;
+        self.cancel_duplicates();
         self.scan_error = None;
         self.scan_notice = None;
         self.assess_error = None;
@@ -299,6 +311,7 @@ impl Session {
             return;
         };
         self.assess_generation += 1;
+        self.cancel_duplicates();
         let generation = self.assess_generation;
         self.assessing = true;
         self.assess_error = None;
@@ -325,8 +338,9 @@ impl Session {
                 this.assessing = false;
                 match judged {
                     Ok(assessment) => {
-                        this.assessment = Some(assessment);
+                        this.assessment = Some(assessment.clone());
                         cx.emit(Assessed);
+                        this.find_duplicates(generation, assessment, cx);
                     }
                     Err(error) => {
                         let message =
@@ -334,6 +348,63 @@ impl Session {
                         eprintln!("nomnom-gui: {message}");
                         this.assess_error = Some(message);
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Stops the duplicate pass in flight, if any; its result is dropped.
+    fn cancel_duplicates(&mut self) {
+        if let Some(progress) = self.duplicates.take() {
+            progress.cancel();
+        }
+    }
+
+    /// The second phase: find likely copies outside the rules' targets and
+    /// merge them into `rules`, which is already on screen.
+    fn find_duplicates(&mut self, generation: u64, rules: Arc<Assessment>, cx: &mut Context<Self>) {
+        let Some(catalog) = self.scan.as_ref().map(|scan| scan.catalog.clone()) else { return };
+        let progress = Arc::new(DuplicateProgress::default());
+        self.duplicates = Some(progress.clone());
+        cx.notify();
+
+        let running = progress.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                let ticking = this.update(cx, |this, cx| {
+                    cx.notify();
+                    this.duplicates.as_ref().is_some_and(|it| Arc::ptr_eq(it, &running))
+                });
+                if !matches!(ticking, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let worker = progress.clone();
+            let merged = cx
+                .background_executor()
+                .spawn(async move {
+                    let found = find_duplicates(&catalog, &rules, &worker)?;
+                    Some(Arc::new(rules.with_duplicates(&catalog, &found)))
+                })
+                .await;
+            timings::record("gui duplicates", started.elapsed());
+            let _ = this.update(cx, |this, cx| {
+                let current = this.duplicates.as_ref().is_some_and(|it| Arc::ptr_eq(it, &progress));
+                if this.assess_generation != generation || !current {
+                    return;
+                }
+                this.duplicates = None;
+                if let Some(merged) = merged {
+                    this.assessment = Some(merged);
+                    cx.emit(DuplicatesMerged);
                 }
                 cx.notify();
             });

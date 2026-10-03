@@ -40,55 +40,67 @@ fn render(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let Assessment { groups, reclaimable_bytes: reclaimable, .. } = assess(catalog, packs);
+    // Two phases, as in the GUI: the rules' answer is printed as soon as it
+    // exists, and the slower duplicate pass follows.
+    let rules = assess(catalog, packs);
 
     if json {
+        let Assessment { groups, reclaimable_bytes, .. } = input::with_duplicates(catalog, &rules);
         let report = Output {
             root: catalog.path(catalog.root()).display().to_string(),
-            reclaimable_bytes: reclaimable,
+            reclaimable_bytes,
             groups: &groups,
         };
         writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
         return Ok(());
     }
 
-    if groups.is_empty() {
+    for group in &rules.groups {
+        print_group(out, &label_name(&group.label), group)?;
+    }
+    out.flush()?;
+
+    let merged = input::with_duplicates(catalog, &rules);
+    if merged.groups.is_empty() {
         writeln!(out, "Nothing to suggest under {}.", catalog.path(catalog.root()).display())?;
         return Ok(());
     }
+    for group in merged.groups.iter().filter(|group| group.label == Label::DUPLICATE) {
+        print_group(out, "likely duplicates", group)?;
+    }
+    writeln!(out, "Reclaimable: {}", format_size(merged.reclaimable_bytes, BINARY))?;
+    Ok(())
+}
 
-    for group in &groups {
+fn print_group(out: &mut dyn Write, heading: &str, group: &Group) -> Result<()> {
+    writeln!(
+        out,
+        "{heading} — {} across {} {}",
+        format_size(group.bytes, BINARY),
+        group.entries.len(),
+        if group.entries.len() == 1 { "path" } else { "paths" }
+    )?;
+    for entry in &group.entries {
         writeln!(
             out,
-            "{} — {} across {} {}",
-            label_name(&group.label),
-            format_size(group.bytes, BINARY),
-            group.entries.len(),
-            if group.entries.len() == 1 { "path" } else { "paths" }
+            "  [{}] {}  {}",
+            disposition_name(entry.verdict.disposition),
+            entry.path,
+            format_size(entry.bytes, BINARY)
         )?;
-        for entry in &group.entries {
-            writeln!(
-                out,
-                "  [{}] {}  {}",
-                disposition_name(entry.verdict.disposition),
-                entry.path,
-                format_size(entry.bytes, BINARY)
-            )?;
-            writeln!(out, "      {}", entry.verdict.reason)?;
-            // The rule is printed beside its sentence, not hidden behind a
-            // debug flag: with packs coming from the network, "who says so" is
-            // part of what a human approves on.
-            writeln!(out, "      — {}", entry.verdict.provenance)?;
-            // A downgraded verdict looks exactly like one the rule wrote as
-            // `review`, so without this line the cap is invisible and the user
-            // has no way to know a trust grant is what is missing.
-            if let Some(capped) = &entry.verdict.capped {
-                writeln!(out, "      ! {capped}")?;
-            }
+        writeln!(out, "      {}", entry.verdict.reason)?;
+        // The rule is printed beside its sentence, not hidden behind a
+        // debug flag: with packs coming from the network, "who says so" is
+        // part of what a human approves on.
+        writeln!(out, "      — {}", entry.verdict.provenance)?;
+        // A downgraded verdict looks exactly like one the rule wrote as
+        // `review`, so without this line the cap is invisible and the user
+        // has no way to know a trust grant is what is missing.
+        if let Some(capped) = &entry.verdict.capped {
+            writeln!(out, "      ! {capped}")?;
         }
-        writeln!(out)?;
     }
-    writeln!(out, "Reclaimable: {}", format_size(reclaimable, BINARY))?;
+    writeln!(out)?;
     Ok(())
 }
 

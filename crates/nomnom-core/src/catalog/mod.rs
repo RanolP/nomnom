@@ -19,6 +19,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use rayon::prelude::*;
@@ -459,25 +460,25 @@ impl Catalog {
         })
     }
 
-    /// blake3 of the file's contents. Computed on demand, never during
-    /// [`Catalog::build`]. `None` for directories and unreadable files.
-    pub fn content_hash(&self, id: NodeId) -> Option<blake3::Hash> {
-        if self.nodes[id.index()].kind != EntryKind::File {
-            return None;
-        }
-        let file = std::fs::File::open(self.path(id)).ok()?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(file).ok()?;
-        Some(hasher.finalize())
-    }
-
-    /// Groups of 2+ nodes with identical size AND identical content hash.
+    /// Groups of 2+ files that are likely copies of one another: the same
+    /// size, and the same bytes at the head, middle and tail.
     ///
-    /// Size is the cheap discriminator: only files whose size already collides
-    /// with another file's get hashed, so the whole tree is never read. A
-    /// hard link's extra names are the same file, not a copy of it, so only
-    /// its primary name takes part.
-    pub fn duplicate_groups(&self, min_size: u64) -> Vec<Vec<NodeId>> {
+    /// Likely, not certain: this never reads a whole file, which is what keeps
+    /// it to seconds on a drive where a full hash of every same-size file reads
+    /// hundreds of gigabytes. The full hash is paid only for the copies a user
+    /// approves, at plan time
+    /// ([`Plan::verify_copies`](crate::action::Plan::verify_copies)), and
+    /// apply refuses any copy that was not verified.
+    ///
+    /// Size is the cheap discriminator: only files whose size collides with
+    /// another file's get sampled. A hard link's extra names are the same
+    /// file, not a copy of it, so only its primary name takes part. `None`
+    /// when `progress` was cancelled before the pass finished.
+    pub fn likely_duplicate_groups(
+        &self,
+        min_size: u64,
+        progress: &DuplicateProgress,
+    ) -> Option<Vec<Vec<NodeId>>> {
         let started = Instant::now();
         let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
         for node in &self.nodes {
@@ -487,71 +488,102 @@ impl Catalog {
         }
         let candidates: Vec<NodeId> =
             by_size.into_values().filter(|group| group.len() >= 2).flatten().collect();
+        progress.total.store(candidates.len() as u64, Ordering::Relaxed);
         let started = timings::lap("duplicates: size buckets", started);
 
-        // Same-size files almost always differ in their first or last bytes,
-        // so a sample of both ends rules most of them out without the full
-        // read. It only narrows: equal contents always sample equal, and the
-        // full hash below still decides every group.
-        let sampled = self.colliding(&candidates, |id| self.sample_hash(id));
-        let survivors: Vec<NodeId> = sampled.into_iter().flatten().collect();
-        let started = timings::lap(
-            &format!(
-                "duplicates: sample {} files -> {} ({} MiB)",
-                candidates.len(),
-                survivors.len(),
-                self.total_size(&survivors) >> 20,
-            ),
-            started,
-        );
-
-        let mut groups =
-            self.colliding(&survivors, |id| self.content_hash(id).map(|h| *h.as_bytes()));
+        let keyed: Vec<(NodeId, [u8; 32])> = candidates
+            .par_iter()
+            .filter_map(|&id| {
+                if progress.is_cancelled() {
+                    return None;
+                }
+                let key = self.sample_hash(id);
+                progress.done.fetch_add(1, Ordering::Relaxed);
+                key.map(|key| (id, key))
+            })
+            .collect();
+        if progress.is_cancelled() {
+            return None;
+        }
+        let mut by_key: HashMap<(u64, [u8; 32]), Vec<NodeId>> = HashMap::new();
+        for (id, key) in keyed {
+            by_key.entry((self.nodes[id.index()].size, key)).or_default().push(id);
+        }
+        let mut groups: Vec<Vec<NodeId>> =
+            by_key.into_values().filter(|group| group.len() >= 2).collect();
         for group in &mut groups {
             group.sort_unstable();
         }
         groups.sort_unstable();
-        timings::lap("duplicates: full hash", started);
-        groups
+        let survivors: u64 = groups.iter().map(|group| group.len() as u64).sum();
+        let bytes: u64 = groups.iter().flatten().map(|id| self.nodes[id.index()].size).sum();
+        timings::lap(
+            &format!(
+                "duplicates: sample {} files -> {survivors} ({} MiB)",
+                candidates.len(),
+                bytes >> 20
+            ),
+            started,
+        );
+        Some(groups)
     }
 
-    /// Groups of 2+ of `ids` with the same size and the same `key`. A file
-    /// `key` cannot read takes no part.
-    fn colliding(
-        &self,
-        ids: &[NodeId],
-        key: impl Fn(NodeId) -> Option<[u8; 32]> + Sync,
-    ) -> Vec<Vec<NodeId>> {
-        let keyed: Vec<(NodeId, [u8; 32])> =
-            ids.par_iter().filter_map(|&id| key(id).map(|k| (id, k))).collect();
-        let mut by_key: HashMap<(u64, [u8; 32]), Vec<NodeId>> = HashMap::new();
-        for (id, k) in keyed {
-            by_key.entry((self.nodes[id.index()].size, k)).or_default().push(id);
-        }
-        by_key.into_values().filter(|group| group.len() >= 2).collect()
-    }
-
-    fn total_size(&self, ids: &[NodeId]) -> u64 {
-        ids.iter().map(|id| self.nodes[id.index()].size).sum()
-    }
-
-    /// blake3 of the file's first and last [`SAMPLE_BYTES`], or of all of it
-    /// when it is shorter than both.
+    /// blake3 of [`SAMPLE_BYTES`] at the file's head, middle and tail.
+    ///
+    /// Equal contents always sample equal, so this only ever rules files out.
+    /// The middle chunk is what separates the common false match: a format
+    /// whose header and trailer are fixed while the payload differs (disk
+    /// images, archives, media containers, game packs).
     fn sample_hash(&self, id: NodeId) -> Option<[u8; 32]> {
         let mut file = std::fs::File::open(self.path(id)).ok()?;
-        let mut sample = Vec::with_capacity(2 * SAMPLE_BYTES as usize);
-        (&mut file).take(SAMPLE_BYTES).read_to_end(&mut sample).ok()?;
         let len = file.metadata().ok()?.len();
-        if len > 2 * SAMPLE_BYTES {
-            file.seek(SeekFrom::Start(len - SAMPLE_BYTES)).ok()?;
+        let mut sample = Vec::with_capacity(3 * SAMPLE_BYTES as usize);
+        let middle = (len / 2).saturating_sub(SAMPLE_BYTES / 2);
+        for offset in [0, middle, len.saturating_sub(SAMPLE_BYTES)] {
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            (&mut file).take(SAMPLE_BYTES).read_to_end(&mut sample).ok()?;
         }
-        file.take(SAMPLE_BYTES).read_to_end(&mut sample).ok()?;
         Some(*blake3::hash(&sample).as_bytes())
     }
 }
 
-/// How much of each end of a file [`Catalog::sample_hash`] reads.
-const SAMPLE_BYTES: u64 = 64 * 1024;
+/// How much of each of the three places [`Catalog::sample_hash`] reads.
+const SAMPLE_BYTES: u64 = 4 * 1024;
+
+/// How far a [`Catalog::likely_duplicate_groups`] pass has got, and the
+/// switch that stops it. Shared between the pass and whatever shows it.
+#[derive(Debug, Default)]
+pub struct DuplicateProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+    cancelled: AtomicBool,
+}
+
+impl DuplicateProgress {
+    /// Files sampled so far.
+    pub fn done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    /// Files the pass will sample: 0 until the size buckets are built.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Stops the pass at its next file; it then returns `None`.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// The status line both front-ends show while the pass runs.
+    pub fn status(&self) -> String {
+        format!("Finding duplicates… {} / {} files", self.done(), self.total())
+    }
+}
 
 #[cfg(test)]
 mod tests {

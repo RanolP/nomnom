@@ -1,10 +1,10 @@
 //! What a path IS, and whether it should go.
 //!
-//! Rule packs written in the nomnom rule language select targets
-//! ([`select`]), byte-identical copies are found in Rust ([`duplicate`]), and
-//! [`judge`] puts the two together into one verdict per decided node. Every
-//! verdict carries the sentence a human approves it on and the pack and rule
-//! that produced it.
+//! Two phases. Rule packs written in the nomnom rule language select targets
+//! ([`select`], via [`judge`] and [`assess`]), which is fast and shown at
+//! once; likely copies are then found in Rust ([`find_duplicates`]) and merged
+//! in. Every verdict carries the sentence a human approves it on and the pack
+//! and rule that produced it.
 
 mod assess;
 mod builtin;
@@ -16,15 +16,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::catalog::{Catalog, NodeId};
-use crate::timings;
 
 pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, charges};
 pub use builtin::builtin_pack;
+pub use duplicate::{Duplicates, MIN_DUPLICATE_SIZE, duplicate_copy_rule, find_duplicates};
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };
@@ -197,31 +196,16 @@ pub struct Verdict {
     pub capped: Option<String>,
 }
 
-/// Every verdict over the whole catalog, in id order.
+/// Every rule verdict over the whole catalog, in id order.
 ///
 /// `packs` in resolution order: built-in first, then user, project and
 /// `--pack`, each overriding the last. A rule target is one decision for its
 /// whole subtree, so no verdict lies inside another rule verdict's subtree —
-/// which is what keeps [`Rollup::reclaimable_bytes`] sound. A duplicate
-/// verdict wins on its own node, because byte-identical content is stronger
-/// evidence than any rule that could also fire on a file.
+/// which is what keeps [`Rollup::reclaimable_bytes`] sound. Duplicates are a
+/// second phase ([`find_duplicates`]) that never touches a rule target or
+/// anything inside one.
 pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
-    let mut verdicts = select::select(ctx, packs);
-    let started = Instant::now();
-    // The targets have to exist before the duplicate pass, which drops any
-    // copy sitting inside one: it disappears with its directory.
-    let units: HashSet<NodeId> = verdicts.iter().map(|(id, _)| *id).collect();
-    let mut duplicates =
-        duplicate::DuplicateFacts::build(ctx, duplicate::MIN_DUPLICATE_SIZE, &units);
-    timings::lap("assess: duplicate facts total", started);
-    for (id, verdict) in &mut verdicts {
-        if let Some(duplicate) = duplicates.take(*id) {
-            *verdict = duplicate;
-        }
-    }
-    verdicts.extend(duplicates.into_verdicts());
-    verdicts.sort_unstable_by_key(|(id, _)| *id);
-    verdicts
+    select::select(ctx, packs)
 }
 
 /// What the CLI prints after an assessment.

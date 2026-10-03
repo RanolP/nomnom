@@ -63,10 +63,9 @@ impl TrustedPack {
 /// Every target some rule selects, each with the one rule that won it, with
 /// targets inside another target already dropped. In id order.
 ///
-/// `is_duplicate` reads `false` throughout, and that is exact rather than an
-/// approximation: only a file can be a duplicate, a file anchor's only possible
-/// target is itself, and a duplicate verdict always wins on its own node — so
-/// no rule verdict that reading `true` could change ever survives.
+/// `is_duplicate` reads `false` throughout: the rules are decided before the
+/// duplicate pass runs, so that the rules' answer can be shown while it does,
+/// and the duplicate pass then leaves every rule target alone.
 pub(super) fn select(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
     let started = Instant::now();
     let rules = compile(packs);
@@ -121,7 +120,10 @@ struct Compiled<'a> {
 
 enum Key {
     /// Seeded from nodes named this (folded); `depth` is the segment's index.
-    Name { name: String, depth: usize },
+    Name {
+        name: String,
+        depth: usize,
+    },
     /// Seeded from the parents of nodes named any of these (folded).
     Has(Vec<String>),
     /// Seeded from every node strictly inside a subtree named this (folded).
@@ -558,8 +560,10 @@ fn resolve(
 /// same pack does not, which is why this cannot be one `>=`.
 fn outranks(challenger: &Compiled, holder: &Compiled) -> bool {
     let (a, b) = (challenger.rule.confidence, holder.rule.confidence);
-    a > b || (a == b && (challenger.pack > holder.pack
-        || (challenger.pack == holder.pack && challenger.order < holder.order)))
+    a > b
+        || (a == b
+            && (challenger.pack > holder.pack
+                || (challenger.pack == holder.pack && challenger.order < holder.order)))
 }
 
 fn disposition_of(disposition: AstDisposition) -> Disposition {

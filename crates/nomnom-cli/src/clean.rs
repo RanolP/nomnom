@@ -200,29 +200,52 @@ fn execute(
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
     mode.check()?;
-    let assessment = assess(catalog, packs);
+    // Two phases, as in the GUI: the rules' candidates first, then the likely
+    // duplicates once the slower pass has found them.
+    let rules = assess(catalog, packs);
+    if !mode.picks() {
+        if mode.json {
+            let merged = input::with_duplicates(catalog, &rules);
+            let groups = by_rule(&candidates(&merged, mode.include_review));
+            return report_candidates_json(&merged.root, &groups, exclusions, out);
+        }
+        let groups = by_rule(&candidates(&rules, mode.include_review));
+        report_candidates(&rules.root, &groups, exclusions, out)?;
+        out.flush()?;
+        let merged = input::with_duplicates(catalog, &rules);
+        let duplicates: Vec<&Entry> = candidates(&merged, mode.include_review)
+            .into_iter()
+            .filter(|entry| entry.copy_of.is_some())
+            .collect();
+        report_duplicates(&by_rule(&duplicates), exclusions, out)?;
+        return report_hints(groups.is_empty() && duplicates.is_empty(), exclusions, mode, out);
+    }
+    // The duplicate pass runs only when a pick needs it: a rule or path the
+    // rules alone do not offer.
+    let unresolved = {
+        let widened = candidates(&rules, true);
+        let groups = by_rule(&widened);
+        mode.rules.iter().any(|text| find_rule(&groups, text).is_err())
+            || mode.paths.iter().any(|path| find(&widened, path).is_none())
+    };
+    let assessment = if unresolved { input::with_duplicates(catalog, &rules) } else { rules };
     let offered = candidates(&assessment, mode.include_review);
     let groups = by_rule(&offered);
-    if !mode.picks() {
-        return report_candidates(
-            &assessment.root,
-            &groups,
-            exclusions,
-            mode.include_review,
-            mode.json,
-            out,
-        );
-    }
     let approval = Approval {
         rules: approve_rules(&groups, &by_rule(&candidates(&assessment, true)), mode.rules)?,
         paths: select(&offered, &candidates(&assessment, true), exclusions, mode.paths)?,
     };
-    let (plan, refused) = plan_from(&assessment, &approval, exclusions, mode.include_review)
+    let (mut plan, refused) = plan_from(&assessment, &approval, exclusions, mode.include_review)
         .with_context(|| format!("cannot anchor a plan at {}", assessment.root.display()))?;
     // A guard refusal is information, not a stop: the other actions are still
     // sound, and the user can act on the named path.
     for (path, error) in refused {
         eprintln!("skipping {}: {error}", path.display());
+    }
+    // A likely copy stays in the plan only once a full hash proves it equal
+    // to the copy that is kept; apply refuses any copy that was not.
+    for (path, reason) in plan.verify_copies() {
+        eprintln!("skipping {}: {reason}", path.display());
     }
 
     if mode.apply {
@@ -329,78 +352,120 @@ fn find<'a>(entries: &[&'a Entry], path: &Path) -> Option<&'a Entry> {
         .copied()
 }
 
+fn report_candidates_json(
+    root: &Path,
+    groups: &[RuleGroup<'_>],
+    exclusions: &Exclusions,
+    out: &mut dyn Write,
+) -> Result<ExitCode> {
+    let excluded_by = |entry: &Entry| exclusions.covering(Path::new(&entry.path)).map(plain);
+    let rules: Vec<RuleOutput<'_>> = groups
+        .iter()
+        .map(|group| RuleOutput {
+            rule: group.provenance.to_string(),
+            pack: &group.provenance.pack,
+            title: &group.provenance.rule,
+            bytes: group.bytes,
+            matches: group
+                .entries
+                .iter()
+                .map(|entry| MatchOutput {
+                    path: &entry.path,
+                    bytes: entry.bytes,
+                    verdict: &entry.verdict,
+                    excluded_by: excluded_by(entry),
+                })
+                .collect(),
+        })
+        .collect();
+    let report = CandidatesOutput {
+        root: plain(root),
+        applied: false,
+        total_bytes: 0,
+        entries: &[],
+        rules,
+        exclusions: exclusions.paths().map(plain).collect(),
+    };
+    writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The first phase: the rules' candidates.
 fn report_candidates(
     root: &Path,
     groups: &[RuleGroup<'_>],
     exclusions: &Exclusions,
-    include_review: bool,
-    json: bool,
     out: &mut dyn Write,
-) -> Result<ExitCode> {
-    let excluded_by = |entry: &Entry| exclusions.covering(Path::new(&entry.path)).map(plain);
-    if json {
-        let rules: Vec<RuleOutput<'_>> = groups
-            .iter()
-            .map(|group| RuleOutput {
-                rule: group.provenance.to_string(),
-                pack: &group.provenance.pack,
-                title: &group.provenance.rule,
-                bytes: group.bytes,
-                matches: group
-                    .entries
-                    .iter()
-                    .map(|entry| MatchOutput {
-                        path: &entry.path,
-                        bytes: entry.bytes,
-                        verdict: &entry.verdict,
-                        excluded_by: excluded_by(entry),
-                    })
-                    .collect(),
-            })
-            .collect();
-        let report = CandidatesOutput {
-            root: plain(root),
-            applied: false,
-            total_bytes: 0,
-            entries: &[],
-            rules,
-            exclusions: exclusions.paths().map(plain).collect(),
-        };
-        writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
-        return Ok(ExitCode::SUCCESS);
-    }
-
+) -> Result<()> {
     writeln!(out, "Dry run — no rule is approved and nothing has been touched.")?;
     writeln!(out, "Root: {}", plain(root))?;
     if groups.is_empty() {
-        writeln!(out, "No candidates.")?;
-    } else {
-        writeln!(out)?;
-        writeln!(out, "Rules with candidates ({}):", groups.len())?;
-        for group in groups {
-            let excluded =
-                group.entries.iter().filter(|entry| excluded_by(entry).is_some()).count();
-            let tally = if excluded > 0 {
-                format!("{} matches, {excluded} excluded", group.entries.len())
-            } else {
-                format!("{} matches", group.entries.len())
+        writeln!(out, "No rule has candidates.")?;
+        return Ok(());
+    }
+    writeln!(out)?;
+    writeln!(out, "Rules with candidates ({}):", groups.len())?;
+    write_groups(groups, exclusions, out)
+}
+
+/// The second phase: the likely copies, approved as one rule.
+fn report_duplicates(
+    groups: &[RuleGroup<'_>],
+    exclusions: &Exclusions,
+    out: &mut dyn Write,
+) -> Result<()> {
+    writeln!(out)?;
+    if groups.is_empty() {
+        writeln!(out, "No likely duplicates.")?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "Likely duplicates (same size and sampled contents; each copy is compared in full with \
+         the kept original before anything is trashed):"
+    )?;
+    write_groups(groups, exclusions, out)
+}
+
+fn write_groups(
+    groups: &[RuleGroup<'_>],
+    exclusions: &Exclusions,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let excluded_by = |entry: &Entry| exclusions.covering(Path::new(&entry.path)).map(plain);
+    for group in groups {
+        let excluded = group.entries.iter().filter(|entry| excluded_by(entry).is_some()).count();
+        let tally = if excluded > 0 {
+            format!("{} matches, {excluded} excluded", group.entries.len())
+        } else {
+            format!("{} matches", group.entries.len())
+        };
+        writeln!(out, "  {}  {tally}  {}", group.provenance, format_size(group.bytes, BINARY))?;
+        for entry in &group.entries {
+            let tag = match excluded_by(entry) {
+                Some(_) => "excluded",
+                None => disposition_name(entry.verdict.disposition),
             };
-            writeln!(out, "  {}  {tally}  {}", group.provenance, format_size(group.bytes, BINARY))?;
-            for entry in &group.entries {
-                let tag = match excluded_by(entry) {
-                    Some(_) => "excluded",
-                    None => disposition_name(entry.verdict.disposition),
-                };
-                writeln!(out, "    [{tag}] {}  {}", entry.path, format_size(entry.bytes, BINARY))?;
-                writeln!(out, "        {}", entry.verdict.reason)?;
-                if let Some(by) = excluded_by(entry) {
-                    writeln!(out, "        kept out of every plan by the exclusion {by}")?;
-                }
-                if let Some(capped) = &entry.verdict.capped {
-                    writeln!(out, "        ! {capped}")?;
-                }
+            writeln!(out, "    [{tag}] {}  {}", entry.path, format_size(entry.bytes, BINARY))?;
+            writeln!(out, "        {}", entry.verdict.reason)?;
+            if let Some(by) = excluded_by(entry) {
+                writeln!(out, "        kept out of every plan by the exclusion {by}")?;
+            }
+            if let Some(capped) = &entry.verdict.capped {
+                writeln!(out, "        ! {capped}")?;
             }
         }
+    }
+    Ok(())
+}
+
+fn report_hints(
+    nothing: bool,
+    exclusions: &Exclusions,
+    mode: Mode<'_>,
+    out: &mut dyn Write,
+) -> Result<ExitCode> {
+    if !nothing {
         writeln!(out)?;
         writeln!(out, "Approve a rule: nomnom clean <DRIVE> --rule \"<Title>\" [--apply]")?;
         writeln!(out, "Keep a path out of every plan: nomnom clean <DRIVE> --exclude <PATH>")?;
@@ -412,7 +477,7 @@ fn report_candidates(
             exclusions.paths().len()
         )?;
     }
-    if !include_review {
+    if !mode.include_review {
         writeln!(out, "(--include-review would also offer paths the evidence does not carry.)")?;
     }
     Ok(ExitCode::SUCCESS)
@@ -458,6 +523,9 @@ fn report_plan(
             writeln!(out, "      -> {}", plain(destination))?;
         }
         writeln!(out, "      {}", entry.reason)?;
+        if let Some(original) = entry.copy_of.as_deref().filter(|_| entry.is_confirmed_copy()) {
+            writeln!(out, "      byte-identical to {}, compared in full", plain(original))?;
+        }
     }
     writeln!(out)?;
     writeln!(out, "{} actions, {} reclaimed", plan.len(), format_size(plan.total_bytes(), BINARY))?;
@@ -725,6 +793,44 @@ mod tests {
         let edits = Edits { exclude: &[], unexclude: &[root.join("beta")], list: false };
         edit_exclusions(root, &edits, &mode, &mut Vec::new()).unwrap();
         assert!(Exclusions::load(root).unwrap().is_empty());
+    }
+
+    /// The regressions: the CLI losing parity with the GUI's second phase, so
+    /// likely duplicates are never listed or cannot be approved by their rule;
+    /// and a dry run planning a copy whose sampled ends match but whose bytes
+    /// differ from the kept original.
+    #[test]
+    fn duplicates_follow_the_rules_and_only_verified_copies_are_planned() {
+        let dir = node_fixture();
+        let root = dir.path();
+        let blob = vec![b'k'; 2 * 1024 * 1024];
+        let mut different = blob.clone();
+        different[blob.len() / 4] = b'!';
+        let now = std::time::SystemTime::now();
+        for (age, name, contents) in
+            [(3, "kept.bin", &blob), (2, "copy.bin", &blob), (1, "near.bin", &different)]
+        {
+            write(root.join("dups").join(name), contents);
+            std::fs::File::options()
+                .write(true)
+                .open(root.join("dups").join(name))
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(86_400 * age))
+                .unwrap();
+        }
+
+        let (_, listing) = dry_run(root);
+        let rules_at = listing.find("Rules with candidates").expect(&listing);
+        let duplicates_at = listing.find("Likely duplicates").expect(&listing);
+        assert!(rules_at < duplicates_at, "the rules come first:\n{listing}");
+        assert!(listing.contains("duplicate-copy"), "{listing}");
+
+        let (_, plan) =
+            clean_with(root, &[], &["duplicate-copy".into()], false).expect("clean runs");
+        assert!(plan.contains("1 actions"), "{plan}");
+        assert!(plan.contains("copy.bin"), "{plan}");
+        assert!(!plan.contains("near.bin"), "a copy that differs was planned:\n{plan}");
+        assert!(plan.contains("byte-identical"), "{plan}");
     }
 
     /// A dry run that is not dry is the single worst bug this tool could

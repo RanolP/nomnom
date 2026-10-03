@@ -163,7 +163,9 @@ fn duplicate_groups_require_matching_contents_not_just_size() {
     assert_eq!(b"identical contents".len(), b"DIFFERENT contentz".len());
 
     let catalog = Catalog::build(report_of(root));
-    let groups = catalog.duplicate_groups(1);
+    let groups = catalog
+        .likely_duplicate_groups(1, &nomnom_core::catalog::DuplicateProgress::default())
+        .expect("not cancelled");
 
     assert_eq!(groups.len(), 1, "expected exactly one duplicate group, got {groups:?}");
     let mut paths: Vec<PathBuf> = groups[0].iter().map(|&id| catalog.path(id)).collect();

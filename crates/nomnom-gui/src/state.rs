@@ -230,6 +230,7 @@ mod tests {
                 capped: None,
             },
             reach: None,
+            copy_of: None,
         }
     }
 

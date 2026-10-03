@@ -9,9 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use nomnom_core::catalog::Catalog;
+use nomnom_core::catalog::{Catalog, DuplicateProgress};
 use nomnom_core::scan::{BackendUsed, ScanProgress, VolumeRoot, scan_drive, volumes};
 use nomnom_core::timings;
+use nomnom_core::verdict::{Assessment, find_duplicates};
 
 /// Scans through core's [`scan_drive`], the GUI's scan too: MFT behind one UAC
 /// prompt when needed, the walk when that is declined, which [`warn_backend`]
@@ -75,6 +76,33 @@ impl Meter {
             let _ = thread.join();
         }
     }
+}
+
+/// The second phase, after the rules' answer is already printed: core's
+/// [`find_duplicates`], merged into `rules`. A terminal gets the same
+/// "Finding duplicates…" line, files done of total, that the GUI shows.
+pub fn with_duplicates(catalog: &Catalog, rules: &Assessment) -> Assessment {
+    let progress = Arc::new(DuplicateProgress::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let meter = std::io::stderr().is_terminal().then(|| {
+        let (progress, done) = (Arc::clone(&progress), Arc::clone(&done));
+        thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let line = progress.status();
+                eprint!("\r{line:<width$}", width = Meter::WIDTH);
+                let _ = std::io::stderr().flush();
+                thread::sleep(Duration::from_millis(200));
+            }
+            eprint!("\r{:width$}\r", "", width = Meter::WIDTH);
+        })
+    });
+    let found = find_duplicates(catalog, rules, &progress);
+    done.store(true, Ordering::Relaxed);
+    if let Some(meter) = meter {
+        let _ = meter.join();
+    }
+    let found = found.expect("the CLI never cancels the duplicate pass");
+    rules.with_duplicates(catalog, &found)
 }
 
 /// A user who does not know the MFT path needs Administrator just experiences

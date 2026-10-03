@@ -21,7 +21,7 @@ use gpui_kit::*;
 use nomnom_core::action::{Action, RecordStatus, apply, plain};
 use nomnom_core::verdict::{Assessment, Disposition, Provenance, Verdict};
 
-use crate::session::{Assessed, Phase, Session};
+use crate::session::{Assessed, DuplicatesMerged, Phase, Session};
 use crate::state::{Preview, Selection, size};
 use crate::suggest::{disposition_tag, label_name, waiting_for_assessment};
 
@@ -58,6 +58,10 @@ impl CleanScreen {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&session, |this, _, _: &Assessed, cx| this.reassessed(cx)).detach();
+        // The merge carries every rule entry over unchanged, so what the user
+        // already approved still means the same thing; only the preview grows.
+        cx.subscribe(&session, |this, _, _: &DuplicatesMerged, cx| this.refresh_preview(cx))
+            .detach();
         let mut this = Self {
             session,
             selection: Selection::default(),
@@ -178,17 +182,20 @@ impl CleanScreen {
             return;
         }
         self.outcome = None;
-        let plan = preview.plan.clone();
+        let mut plan = preview.plan.clone();
         cx.spawn(async move |this, cx| {
             let applied = cx
                 .background_executor()
                 .spawn(async move {
-                    apply(&plan).map_err(|error| {
+                    // Likely copies are compared in full only now, for exactly
+                    // the ones approved; apply refuses any that was not.
+                    let skipped = plan.verify_copies();
+                    apply(&plan).map(|report| (report, skipped)).map_err(|error| {
                         format!("apply under {} failed: {error}", plain(plan.root()))
                     })
                 })
                 .await;
-            let outcome = applied.map(|report| Outcome {
+            let outcome = applied.map(|(report, skipped)| Outcome {
                 bytes_reclaimed: report.bytes_reclaimed(),
                 succeeded: report.records().iter().filter(|r| r.succeeded()).count(),
                 failures: report
@@ -200,6 +207,7 @@ impl CleanScreen {
                         };
                         (record.source.clone(), message)
                     })
+                    .chain(skipped)
                     .collect(),
             });
             match &outcome {

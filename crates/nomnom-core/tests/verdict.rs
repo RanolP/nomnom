@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use common::{catalog_of, write};
-use nomnom_core::catalog::{Catalog, NodeId};
+use nomnom_core::action::{Approval, Exclusions, plan_from};
+use nomnom_core::catalog::{Catalog, DuplicateProgress, NodeId};
 use nomnom_core::verdict::{
-    Disposition, Label, TrustedPack, Verdict, builtin_pack, judge, rollup,
+    Assessment, Disposition, Label, TrustedPack, Verdict, assess, builtin_pack, find_duplicates,
+    rollup,
 };
 use tempfile::TempDir;
 
@@ -22,8 +24,105 @@ fn judged(root: &Path) -> Vec<(PathBuf, Verdict)> {
         .collect()
 }
 
+/// Both phases, as every front-end runs them: the rules, then the duplicates
+/// merged in.
 fn builtin_verdicts(catalog: &Catalog) -> Vec<(NodeId, Verdict)> {
-    judge(catalog, &[TrustedPack::builtin(builtin_pack().clone())])
+    let assessment = full_assessment(catalog);
+    let mut verdicts: Vec<(NodeId, Verdict)> = assessment
+        .groups
+        .into_iter()
+        .flat_map(|group| group.entries)
+        .map(|entry| (NodeId(entry.reach.expect("catalog entry").start), entry.verdict))
+        .collect();
+    verdicts.sort_by_key(|(id, _)| *id);
+    verdicts
+}
+
+fn full_assessment(catalog: &Catalog) -> Assessment {
+    let rules = rules_only(catalog);
+    let duplicates =
+        find_duplicates(catalog, &rules, &DuplicateProgress::default()).expect("not cancelled");
+    rules.with_duplicates(catalog, &duplicates)
+}
+
+fn rules_only(catalog: &Catalog) -> Assessment {
+    assess(catalog, vec![TrustedPack::builtin(builtin_pack().clone())])
+}
+
+/// The regression: a rescan that cannot stop the old duplicate pass, which
+/// then lands its stale result over the new assessment. Cancelled, the pass
+/// returns nothing at all.
+#[test]
+fn a_cancelled_duplicate_search_returns_nothing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let blob = vec![b'c'; 1024 * 1024 + 1];
+    write(tmp.path().join("a.bin"), &blob);
+    write(tmp.path().join("b.bin"), &blob);
+    let catalog = catalog_of(tmp.path());
+    let rules = rules_only(&catalog);
+
+    let progress = DuplicateProgress::default();
+    progress.cancel();
+    assert!(find_duplicates(&catalog, &rules, &progress).is_none());
+
+    let found = find_duplicates(&catalog, &rules, &DuplicateProgress::default());
+    assert_eq!(
+        found.expect("not cancelled").entries.len(),
+        2,
+        "the uncancelled pass finds the pair"
+    );
+}
+
+/// The regression: the duplicate result arriving as a fresh assessment, which
+/// a front-end answers by clearing what the user approved while the pass ran.
+/// Merged, every rule entry is unchanged, so an approval made against the
+/// rules alone plans exactly the same paths afterwards.
+#[test]
+fn merging_duplicates_keeps_every_rule_entry_and_what_an_approval_plans() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    write(root.join("package.json"), b"{}");
+    write(root.join("node_modules/pkg/index.js"), b"1");
+    let blob = vec![b'm'; 1024 * 1024 + 9];
+    write(root.join("dups/a.bin"), &blob);
+    write(root.join("dups/b.bin"), &blob);
+    let catalog = catalog_of(root);
+
+    let rules = rules_only(&catalog);
+    let duplicates =
+        find_duplicates(&catalog, &rules, &DuplicateProgress::default()).expect("not cancelled");
+    let merged = rules.with_duplicates(&catalog, &duplicates);
+
+    let rule_paths = |assessment: &Assessment| -> Vec<String> {
+        let mut paths: Vec<String> = assessment
+            .groups
+            .iter()
+            .filter(|group| group.label != Label::DUPLICATE)
+            .flat_map(|group| group.entries.iter().map(|entry| entry.path.clone()))
+            .collect();
+        paths.sort();
+        paths
+    };
+    assert_eq!(rule_paths(&rules), rule_paths(&merged));
+    assert!(merged.groups.iter().any(|group| group.label == Label::DUPLICATE));
+
+    let node_modules = rules
+        .groups
+        .iter()
+        .flat_map(|group| &group.entries)
+        .find(|entry| entry.path.ends_with("node_modules"))
+        .expect("node_modules is a rule entry");
+    let approval = Approval {
+        rules: [node_modules.verdict.provenance.clone()].into(),
+        paths: Default::default(),
+    };
+    let planned = |assessment: &Assessment| -> Vec<PathBuf> {
+        let (plan, refused) =
+            plan_from(assessment, &approval, &Exclusions::default(), false).expect("plan");
+        assert!(refused.is_empty(), "{refused:?}");
+        plan.actions().iter().map(|entry| entry.action.path().to_path_buf()).collect()
+    };
+    assert_eq!(planned(&rules), planned(&merged));
 }
 
 fn verdict_for(judged: &[(PathBuf, Verdict)], suffix: impl AsRef<Path>) -> Option<&Verdict> {
