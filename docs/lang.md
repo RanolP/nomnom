@@ -28,7 +28,7 @@ This document describes the language as it is and as it is being migrated, unit 
 | implemented | the short form (`[[rule]]` tables in `rules/*.toml`, with a `filter = '''… then …'''`), kinds, the filter grammar and vocabulary, packs and their resolution order, conflicts and nesting, git-pinned packs with a lock, the trust cap, engine guards, permanent deletion with opt-in approval |
 | Unit 2, ownership | every short-form target becomes an exclusive claim; the claimed/arbitrary byte split; the GUI "Recognized" and "Other files" views; `nomnom classify` and `--view`; downloads stops suggesting |
 | Unit 3, long form | `[[classify]]`, `[[suggest]]` with `within`, `claim $g is`, `[[lens]]`, `at ~known/`, `in ~known`, `in class/vN`, `before`/`after … ago`, `exists`, `platforms`, `pack lint`, golden `fixtures/*.tree`, the `build.rs` pack enumeration; `builtin.downloads` ported to a lens |
-| Unit 4, inspect | `table` (bounded manifest reads in vdf, json, toml, ini, plist), read caps, the read log, `suggest --reads`, the GUI "Files read" view |
+| Unit 4, inspect | `table` (bounded manifest reads in vdf, json, toml, ini, plist), `projection` (bounded SQL-like views over tables), read caps, the read log, `suggest --reads`, the GUI "Files read" view |
 | Unit 5 | `builtin.steam`, classify only: client, library and game claims with facts |
 | Unit 6, actions | the handler registry, `action =`, `Action::Request`, the two Steam suggestions, `windows.storage-settings` |
 | Unit 7, trust | `builtin.epic`; the community pack repository; trust becomes the gate to loading a pack at all |
@@ -256,7 +256,7 @@ Some facts a node simply cannot supply: `accessed_age` where Windows has last-ac
 
 That makes `not $f.has_accessed` the way to ask about absence, and it makes the safe direction the default one. `$f.accessed_age >= 1y` is false when the atime is unknown, so a rule that deletes on staleness stays silent rather than firing on a file it knows nothing about. The general invariant, which the engine holds and rules cannot opt out of: **unknown means keep.** Every fail-open probe in the tool we studied this design against became a data-loss incident.
 
-`not` of an absent bool must be **false** too. Today's evaluator negates the result of the test, so `not $f.b` on an absent `b` is true; no implemented field can be absent and bool at once, so nothing fires wrongly yet. Unit 4 introduces the first absent bools (`played_found` below) and must change the evaluator, with a test, before any pack uses them.
+`not` of an absent bool must be **false** too. Today's evaluator negates the result of the test, so `not $f.b` on an absent `b` is true; no implemented field can be absent and bool at once, so nothing fires wrongly yet. Unit 4 introduces the first absent bools (`played_by_app_found` below) and must change the evaluator, with a test, before any pack uses them.
 
 ## Known folders
 
@@ -373,13 +373,36 @@ installdir = { type = "name", key = "installdir" }
 - `[table.<name>]` opens the table, and `format` picks the parser. A table is keyed by name rather than written as an array, because filters refer to it by that name and no two tables compete for precedence. `file` is an ordinary filter, a literal string like every filter, whose target is the file to read; its segments must spell a literal stem or extension, and `pack lint` rejects a bare `*`.
 - `row` says where rows sit in the parsed document; `*` iterates the children of a key, and `$key` is that child's own key.
 - Each entry under `[table.<name>.fields]` is `<field> = { type = "<type>", key = "<key>" }`, reading the document key `<key>` as the typed field `<field>`. Types: `num`, `str`, `name` (one validated file-name component: no separator, no `..`), `path` (compared with catalog paths only, never opened), `time` (seconds since the epoch), `minutes`.
-- `merge = { by = "<field>", <field> = "<reducer>", … }` collapses rows sharing the `by` field, with the reducers `max`, `min`, `sum` and `any`. That is the whole relational algebra: one-hop equality joins and fixed reducers. The language will be pushed to grow into SQL; it does not.
 
-In a filter, `row $r in <table> where $r.<field> == <expr>` requires a matching row and binds its fields; `row $r in <table> from $v` takes the rows read from files under `$v`'s own anchor. `with $r in <table> where …` is the optional join: when the table was read completely and no row matches, the claim gets the bool fact `<table>_found = false`; when one matches, `true`, and its fields; when the table is incomplete, `<table>_found` and every field are absent.
+In a filter, `row $r in <table> where $r.<field> == <expr>` requires a matching row and binds its fields; `row $r in <table> from $v` takes the rows read from files under `$v`'s own anchor. `with $r in <table> where …` is the optional join: when the table was read completely and no row matches, the claim gets the bool fact `<table>_found = false`; when one matches, `true`, and its fields; when the table is incomplete, `<table>_found` and every field are absent. `<table>` here may equally name a projection (see [Projections](#projections), below) — a filter binds the two the same way.
 
 The fields of every bound row become the claim's **facts**, flattened by name. A name bound by two rows is a parse error, except when a `where` equates them.
 
 **Manifest values never become paths to open.** A value can only be compared with a catalog path or name, select one validated child component (`then $lib/steamapps/common/{$app.installdir}/`, where a missing child means no claim), fill a typed handler argument, or be rendered into a description.
+
+### Projections
+
+**Status:** Unit 4.
+
+A table gives one row per manifest entry; a filter often needs rows combined first — Steam keeps one `localconfig.vdf` per local account, and "has anyone on this PC played this game" means every account's rows for one `appid` collapsed into one. A **projection** is that combination step, written as a bounded, SQL-like query over tables (or other projections):
+
+```toml
+[projection.played_by_app]
+query = '''
+from played
+group by appid
+select appid,
+       max(last_played) as last_played,
+       sum(playtime) as playtime
+'''
+```
+
+- `[projection.<name>]` opens the projection, keyed by name exactly as a table is. `query` must be a TOML literal string (`'''…'''` multi-line, `'...'` one-line), for the same reason `filter` must be: a basic string lets TOML's own escaping rewrite the query before the language ever parses it, and a literal string keeps every diagnostic pointing at the real line and column.
+- The grammar is a deliberately bounded subset of SQL, because this is the one place the language reads more than one row at a time and the bound keeps that reach fixed: `from <table-or-projection>` names the one source; an optional `where` uses the same comparison grammar as `filter`; `group by <field>, …` names the grouping fields; `select` lists result fields, each either a bare source field or an aggregate — `max`, `min`, `sum`, `count`, `any` — optionally renamed with `as <alias>`. There are no joins, no subqueries, and no `ORDER BY` or `LIMIT`. A join across two sources stays where [Tables](#tables) already puts it — `row $r in … from $v`, `with $r in …` in a filter — a projection only reshapes rows from one source.
+- A projection may `from` another projection. The engine builds the dependency graph over every `[projection.*]` table before any of them run; a cycle is a load error naming the cycle.
+- A selected field that carries no aggregate must appear in `group by`, or the projection is refused at load — the usual SQL rule, enforced once here rather than left to a surprise at scan time.
+- A result field's type is inferred from the field that produced it: `count` is always `num`; every other aggregate, and every bare `group by` field, keeps the type of the source field it reads.
+- A filter binds a projection exactly like a table: `with $p in played_by_app where $p.appid == $app.appid`; facts come from its `select`ed names, flattened by name the same way a table row's fields are, and `played_by_app_found` works like `<table>_found`.
 
 ## Reads and caps
 
@@ -481,8 +504,9 @@ appid = { type = "num", key = "appid" }
 name = { type = "str", key = "name" }
 installdir = { type = "name", key = "installdir" }
 
-# VDF keys match case-insensitively. Several accounts on one PC: the most
-# recent play wins, and play time adds up.
+# VDF keys match case-insensitively. Several accounts on one PC each keep
+# their own localconfig.vdf, so the projection below combines them: the
+# most recent play wins, and play time adds up.
 [table.played]
 format = "vdf"
 file = '''
@@ -491,12 +515,20 @@ $s has userdata
 then $s/userdata/*/config/localconfig.vdf
 '''
 row = "UserLocalConfigStore.Software.Valve.Steam.apps.*"
-merge = { by = "appid", last_played = "max", playtime = "sum" }
 
 [table.played.fields]
 appid = { type = "num", key = "$key" }
 last_played = { type = "time", key = "LastPlayed" }
 playtime = { type = "minutes", key = "Playtime" }
+
+[projection.played_by_app]
+query = '''
+from played
+group by appid
+select appid,
+       max(last_played) as last_played,
+       sum(playtime) as playtime
+'''
 
 [[classify]]
 title = "Steam client"
@@ -528,7 +560,7 @@ filter = '''
 $lib has steamapps
 row $l in libraries where $l.path == $lib.path
 row $app in apps from $lib
-with $p in played where $p.appid == $app.appid
+with $p in played_by_app where $p.appid == $app.appid
 then $lib/steamapps/common/{$app.installdir}/
 '''
 
@@ -552,7 +584,7 @@ description = "{$g.name}: {subtree_size} bytes, nothing in it changed for {max_d
 action = "steam.uninstall(appid = $g.appid)"
 filter = '''
 claim $g is steam-game/v1
-not $g.played_found
+not $g.played_by_app_found
 $g.max_descendant_age >= 180d
 then $g
 '''
@@ -563,7 +595,7 @@ What this shows:
 - **Three nested exclusive claims from one pack.** The default library sits inside the client folder and games sit inside libraries; all are kept because they share a pack. No other pack's `cache` or `build-output` rule fires inside a game folder.
 - **The library is verified by Steam's own manifest**, not by holding `steamapps/`. A copied or abandoned `steamapps/` on another drive is not a library, and its folders stay in "Other files".
 - **The game folder comes from the manifest's `installdir`**, a validated single component. If the folder is missing, there is no claim.
-- **The never-played suggestion is safe by construction.** `played_found` is false only when every `localconfig.vdf` was read and parsed in full and none lists the game. A cap hit, a parse error or a missing file makes it absent, and `not` of an absent bool is false.
+- **The never-played suggestion is safe by construction.** `played_by_app_found` is false only when every `localconfig.vdf` was read and parsed in full and none lists the game. A cap hit, a parse error or a missing file makes it absent, and `not` of an absent bool is false.
 - **The threshold is fixed at 180 days** in v1. A user who wants another one installs an override pack; how an override pack may speak inside `builtin.steam`'s claims is still open (see [Packs](#packs)).
 - **Removal is a request.** The plan line reads `request  steam.uninstall 1245620  48.2 GB  Elden Ring …  builtin.steam [Steam game not played in 180 days]`, and Steam asks the user to confirm.
 - **The library can sit on another volume.** A library on `D:` while the scan root is `C:` is ordinary: `libraryfolders.vdf` makes it a verified anchor, so the request is allowed to name a game folder there. Nothing is deleted outside the scan root or on another volume — the request only asks Steam to act, and Steam owns that volume's bytes already.
