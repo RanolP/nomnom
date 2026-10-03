@@ -47,6 +47,8 @@ macro_rules! embedded {
 /// `docs/lang.md` makes rule order the last tie-break, so each pack's files
 /// are listed in load order too.
 const PACKS: &[Embedded] = &[
+    embedded!("builtin.ableton", ["ableton.nom"]),
+    embedded!("builtin.after-effects", ["after-effects.nom"]),
     embedded!("builtin.bun", ["bun.nom"]),
     embedded!("builtin.cargo", ["cargo.nom"]),
     embedded!("builtin.chrome", ["chrome.nom"]),

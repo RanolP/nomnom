@@ -1,0 +1,46 @@
+# The installed application. After Effects' own executable sits in
+# `Support Files`, whatever the version folder above it is named.
+
+[After Effects application]
+description = the After Effects application — it holds `AfterFX.exe`; uninstall it through Creative Cloud
+kind = application/v1
+confidence = 0.97
+filter {
+  $s has AfterFX.exe
+  then $s/
+}
+
+# One preferences folder per version. Adobe's preferences guide states the
+# path (https://helpx.adobe.com/after-effects/using/preferences.html):
+# "Windows : \Users\ [user_name] \AppData\Roaming\Adobe\After Effects\ [version]".
+# The prefs file After Effects writes there is the evidence; the folder also
+# holds the user's own presets and scripts.
+
+[After Effects preferences]
+description = After Effects preferences, presets and scripts for one version — it holds `{$prefs}`
+kind = settings/v1
+confidence = 0.93
+filter {
+  $v has "Adobe After Effects * Prefs.txt" as $prefs
+  then $v/
+}
+
+# The conformed-media cache. Adobe's memory and storage guide
+# (https://helpx.adobe.com/after-effects/using/memory-storage1.html) names the
+# files: "Imported audio files are each conformed to a new .cfa file, and MPEG
+# files are indexed to a new .mpgindex file", says the database is "shared with
+# Adobe Media Encoder, Premiere Pro", and documents the manual purge: "navigate
+# to the media cache folder and delete the files". Those files are the
+# evidence. Review only: the cache is shared, and the database keeps listing
+# the deleted files until Clean Database & Cache runs.
+
+[Adobe media cache files]
+description = Adobe's conformed-media cache, shared by After Effects, Premiere Pro and Media Encoder — it holds `{$marker}`; they conform the media again on the next import (Clean Database & Cache in their preferences does this safely)
+kind = cache/v1
+disposition = review
+confidence = 0.55
+filter {
+  $m.dir.name == "Media Cache Files"
+  $m has *.cfa | *.mpgindex as $marker
+  then $m/
+}

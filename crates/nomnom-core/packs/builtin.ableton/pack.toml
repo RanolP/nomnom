@@ -1,0 +1,18 @@
+name = "builtin.ableton"
+version = "1.0.0"
+# Ableton Live (every edition, Suite included) on Windows: the application and
+# its Core Library, the per-version preferences, the browser database, the
+# User Library, every Live Project, and the decoding cache. Only the decoding
+# cache is ever proposed for removal; the rest is recognized and kept.
+
+[kinds."application/v1"]
+disposition = "keep"
+confidence = 0.9
+
+[kinds."settings/v1"]
+disposition = "keep"
+confidence = 0.9
+
+[kinds."user-content/v1"]
+disposition = "keep"
+confidence = 0.9

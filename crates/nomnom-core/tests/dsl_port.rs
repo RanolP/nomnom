@@ -18,7 +18,8 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, TrustedPack, judge};
+use nomnom_core::action::candidates;
+use nomnom_core::verdict::{Disposition, TrustedPack, assess, judge};
 use tempfile::TempDir;
 
 /// What a user actually sees about one path.
@@ -100,6 +101,19 @@ const OWNED: &[&str] = &[
     "vscode/Code/Cache/x",
     "windows/SoftwareDistribution/DataStore/x",
     "windows/SoftwareDistribution/Download/x",
+    "after-effects/Adobe After Effects 2024/Support Files/AfterFX.exe",
+    "after-effects/Roaming/After Effects/24.5/Adobe After Effects 24.5 Prefs.txt",
+    "after-effects/Roaming/Common/Media Cache Files/clip.cfa",
+    "ableton/Live 12 Suite/Program/Ableton Live 12 Suite.exe",
+    "ableton/Live 12 Suite/Program/Ableton Live Engine.dll",
+    "ableton/Live 12 Suite/Resources/GUI.alp",
+    "ableton/Live 12 Suite/Resources/Core Library/x",
+    "ableton/Roaming/Live 12.4.6/Preferences/Preferences.cfg",
+    "ableton/Roaming/Live 12.4.6/Preferences/Library.cfg",
+    "ableton/Local/Ableton/Live Database/Live-files-12300.db",
+    "ableton/Local/Ableton/Cache/Cache/Decoding/x.wav",
+    "ableton/Documents/Ableton/User Library/Presets/x",
+    "ableton/Documents/Ableton/Live Recordings/Temp Project/Ableton Project Info",
     // A Cargo target nested inside an npm tree: the outer verdict has to
     // swallow it rather than report it a second time.
     "npm/proj/node_modules/crate/target/.rustc_info.json",
@@ -150,6 +164,16 @@ const UNOWNED: &[&str] = &[
     // named `Edge`: Chromium's layout, but not Edge's to clear.
     "FL Studio/Settings/Edge/EBWebView/Default/Code Cache/js/x",
     "FL Studio/Settings/Edge/EBWebView/Default/Cache/Cache_Data/index",
+    // Folders named like After Effects' and Live's, with none of the files
+    // those apps write.
+    "lookalike/After Effects 2024/Support Files/readme.txt",
+    "lookalike/After Effects/24.5/Prefs.txt",
+    "lookalike/Media Cache Files/clip.mov",
+    "lookalike/Live 12 Suite/Program/Ableton Live Engine.dll",
+    "lookalike/Live 12 Suite/Resources/Core Library/x",
+    "lookalike/Live 12.4.6/Preferences/Preferences.cfg",
+    "lookalike/Cache/Cache/Decoding/x.wav",
+    "lookalike/User Library/Presets/x",
 ];
 
 fn fixture() -> TempDir {
@@ -158,7 +182,6 @@ fn fixture() -> TempDir {
     for file in OWNED.iter().chain(UNOWNED) {
         write(root.join(file), b"x");
     }
-
     tmp
 }
 
@@ -183,11 +206,21 @@ fn rows(tmp: &TempDir) -> BTreeMap<String, Row> {
         .collect()
 }
 
-use Disposition::{Reclaimable, Review};
+use Disposition::{Keep, Reclaimable, Review};
 
 /// Path, pack, label, disposition, confidence, reason — in path order.
 #[rustfmt::skip]
 const EXPECTED: &[(&str, &str, &str, Disposition, f32, &str)] = &[
+    ("ableton/Documents/Ableton/Live Recordings/Temp Project", "builtin.ableton", "user-content", Keep, 0.91, "an Ableton Live Project — it holds Live's `Ableton Project Info`"),
+    ("ableton/Documents/Ableton/User Library", "builtin.ableton", "user-content", Keep, 0.98, "your Ableton User Library: your own presets, samples, clips and templates"),
+    ("ableton/Live 12 Suite/Program", "builtin.ableton", "application", Keep, 0.96, "the Ableton Live application — it holds `Ableton Live 12 Suite.exe`; uninstall it from Windows Settings"),
+    ("ableton/Live 12 Suite/Resources", "builtin.ableton", "application", Keep, 0.94, "Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`"),
+    ("ableton/Local/Ableton/Cache/Cache/Decoding", "builtin.ableton", "cache", Review, 0.65, "Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)"),
+    ("ableton/Local/Ableton/Live Database", "builtin.ableton", "settings", Keep, 0.88, "Ableton Live's browser database — it holds `Live-files-12300.db`"),
+    ("ableton/Roaming/Live 12.4.6/Preferences", "builtin.ableton", "settings", Keep, 0.92, "Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`"),
+    ("after-effects/Adobe After Effects 2024/Support Files", "builtin.after-effects", "application", Keep, 0.97, "the After Effects application — it holds `AfterFX.exe`; uninstall it through Creative Cloud"),
+    ("after-effects/Roaming/After Effects/24.5", "builtin.after-effects", "settings", Keep, 0.93, "After Effects preferences, presets and scripts for one version — it holds `Adobe After Effects 24.5 Prefs.txt`"),
+    ("after-effects/Roaming/Common/Media Cache Files", "builtin.after-effects", "cache", Review, 0.55, "Adobe's conformed-media cache, shared by After Effects, Premiere Pro and Media Encoder — it holds `clip.cfa`; they conform the media again on the next import (Clean Database & Cache in their preferences does this safely)"),
     ("bun/.bun/install/cache", "builtin.bun", "cache", Reclaimable, 0.7, "Bun's package install cache; Bun re-downloads packages on the next install"),
     ("cargo/home/git/checkouts", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build"),
     ("cargo/home/registry/cache", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them"),
@@ -257,6 +290,32 @@ fn the_built_in_packs_judge_the_fixture_exactly_as_written() {
     }
 
     assert!(actual.is_empty(), "the packs judged paths the fixture does not expect: {actual:#?}");
+}
+
+/// The regression: an edit to `builtin.ableton` or `builtin.after-effects`
+/// (a kind swapped, a disposition dropped) that makes a Live Project, the User
+/// Library, an installed app or its preferences offerable for deletion. Only
+/// the two documented caches may ever be offered, and only as review.
+#[test]
+fn recognized_app_files_and_user_content_are_never_offered_for_removal() {
+    let tmp = fixture();
+    let assessment = assess(&catalog_of(tmp.path()), TrustedPack::builtins());
+    let mut offerable: Vec<String> = candidates(&assessment, true)
+        .into_iter()
+        .filter(|entry| {
+            ["builtin.ableton", "builtin.after-effects"].contains(&entry.verdict.provenance.pack.as_str())
+        })
+        .map(|entry| {
+            let path = std::path::Path::new(&entry.path);
+            let relative = path.strip_prefix(tmp.path()).expect("under root");
+            relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect();
+    offerable.sort();
+    assert_eq!(
+        offerable,
+        ["ableton/Local/Ableton/Cache/Cache/Decoding", "after-effects/Roaming/Common/Media Cache Files"],
+    );
 }
 
 /// The regression: a directory judged on its name alone. Every `UNOWNED`

@@ -415,6 +415,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                ("builtin.ableton", "built-in", "built-in"),
+                ("builtin.after-effects", "built-in", "built-in"),
                 ("builtin.bun", "built-in", "built-in"),
                 ("builtin.cargo", "built-in", "built-in"),
                 ("builtin.chrome", "built-in", "built-in"),

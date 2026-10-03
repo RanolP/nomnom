@@ -1,0 +1,18 @@
+name = "builtin.after-effects"
+version = "1.0.0"
+# Adobe After Effects on Windows: the application, the per-version
+# preferences folder, and the conformed-media cache it shares with Premiere
+# Pro and Media Encoder. Only the media cache is ever proposed for removal;
+# the rest is recognized and kept.
+#
+# The disk cache (`Disk Cache - <host>.noindex`) is not here: Adobe documents
+# how to empty it but not where it lives by default, and nothing inside it is
+# a file only After Effects writes.
+
+[kinds."application/v1"]
+disposition = "keep"
+confidence = 0.9
+
+[kinds."settings/v1"]
+disposition = "keep"
+confidence = 0.9
