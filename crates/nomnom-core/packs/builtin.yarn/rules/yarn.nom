@@ -1,4 +1,4 @@
-# Yarn's installed tree and Yarn 1's package cache.
+# Yarn's installed tree.
 
 # Yarn 1 writes `node_modules/.yarn-integrity`; Yarn 2 and later, with the
 # `node-modules` linker, write `node_modules/.yarn-state.yml`. pnpm's
@@ -15,14 +15,13 @@ filter {
   then $n/
 }
 
-# Yarn 1 keeps its cache in a versioned `v6` directory under `Yarn/Cache`
-# (`~/.cache/yarn` elsewhere), one `npm-<name>-<version>-<hash>` per package.
-[Yarn 1 package cache]
-description = Yarn 1's package cache; Yarn re-downloads packages on the next install
-kind = cache/v1
-confidence = 0.7
-filter {
-  $c.dir.name == "v6"
-  $c under Yarn/
-  then $c/
-}
+# Yarn 1 kept its cache in a versioned directory under `Yarn/Cache`
+# (`~/.cache/yarn` elsewhere), named for Yarn's internal `CACHE_VERSION`
+# (currently `v6`: https://github.com/yarnpkg/yarn/blob/master/src/constants.js).
+# Classic Yarn's own docs (https://classic.yarnpkg.com/en/docs/cli/cache/,
+# https://classic.yarnpkg.com/en/docs/install/) never state this path or the
+# version number — only `yarn cache dir`/`yarn config get cacheFolder`
+# resolve it reliably — and each package subfolder beneath it is named
+# `npm-<name>-<version>-<hash>`, so there is no fixed child name a `has`
+# filter could pin as a signature either. Dropped rather than kept on name
+# alone or given an unreliable signature.

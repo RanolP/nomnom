@@ -57,7 +57,6 @@ const OWNED: &[&str] = &[
     "pnpm/pnpm-cache/metadata/x",
     "yarn/classic/node_modules/.yarn-integrity",
     "yarn/berry/node_modules/.yarn-state.yml",
-    "yarn/Yarn/Cache/v6/x",
     "bun/.bun/install/cache/x.npm",
     "next/proj/.next/BUILD_ID",
     "venv/p1/.venv/pyvenv.cfg",
@@ -143,6 +142,10 @@ const UNOWNED: &[&str] = &[
     "cmake-in-source/main.c",
     // A pyvenv.cfg rooting a tool's environment under a name no rule takes.
     "pipx/venvs/black/pyvenv.cfg",
+    // Yarn 1's cache version directory: no official doc states this path or
+    // its `v6` name, and the dynamically-named package subfolders beneath it
+    // leave no fixed child a `has` filter could pin, so the rule was dropped.
+    "yarn/Yarn/Cache/v6/x",
     // An app's embedded WebView2 profile under a folder that happens to be
     // named `Edge`: Chromium's layout, but not Edge's to clear.
     "FL Studio/Settings/Edge/EBWebView/Default/Code Cache/js/x",
@@ -248,7 +251,6 @@ const EXPECTED: &[(&str, &str, &str, Disposition, f32, &str)] = &[
     ("vscode/Code/CachedData", "builtin.vscode", "cache", Reclaimable, 0.8, "VS Code's V8 code cache, one directory per VS Code build; VS Code rebuilds it on start"),
     ("vscode/Code/CachedExtensionVSIXs", "builtin.vscode", "cache", Reclaimable, 0.8, "extension packages VS Code downloaded; VS Code downloads them again when an extension is installed or updated"),
     ("windows/SoftwareDistribution/Download", "builtin.windows-update", "cache", Review, 0.6, "Windows Update's download cache; Windows Update downloads again what it still needs (stop the Windows Update service first)"),
-    ("yarn/Yarn/Cache/v6", "builtin.yarn", "cache", Reclaimable, 0.7, "Yarn 1's package cache; Yarn re-downloads packages on the next install"),
     ("yarn/berry/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-state.yml`"),
     ("yarn/classic/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-integrity`"),
 ];

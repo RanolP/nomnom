@@ -23,8 +23,12 @@ filter {
   then $c/
 }
 
-# Gradle distributions the wrapper downloaded. A build re-downloads its own
-# version, but these are toolchains, so review only.
+# Gradle distributions the wrapper downloaded. Gradle's own directory-layout
+# docs place them at `wrapper/dists` under `GRADLE_USER_HOME` (default
+# `~/.gradle`): "Distributions downloaded by the Gradle Wrapper."
+# (https://docs.gradle.org/current/userguide/directory_layout.html)
+# A build re-downloads its own version, but these are toolchains, so review
+# only.
 [Gradle wrapper distributions]
 description = Gradle distributions downloaded by the Gradle wrapper; the wrapper downloads its version again on the next build
 kind = cache/v1

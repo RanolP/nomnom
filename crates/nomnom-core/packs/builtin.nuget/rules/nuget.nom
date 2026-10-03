@@ -1,5 +1,9 @@
 # NuGet's caches: the HTTP cache and plugin cache under `%LocalAppData%\NuGet`,
-# and the global packages folder `~/.nuget/packages`.
+# and the global packages folder `~/.nuget/packages`. NuGet's own docs table
+# these exact Windows defaults
+# (https://learn.microsoft.com/en-us/nuget/consume-packages/managing-the-global-packages-and-cache-folders):
+# http-cache `%localappdata%\NuGet\v3-cache`, plugins-cache
+# `%localappdata%\NuGet\plugins-cache`, global-packages `%userprofile%\.nuget\packages`.
 
 [NuGet HTTP cache]
 description = NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore

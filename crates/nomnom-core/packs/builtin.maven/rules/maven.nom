@@ -1,6 +1,9 @@
-# Maven's local repository, `~/.m2/repository`. A build re-downloads what it
-# needs, but artifacts installed locally (`mvn install`) or from a repository
-# you no longer reach exist nowhere else, so review only.
+# Maven's local repository, `~/.m2/repository`. Maven's own configuration
+# guide states the default: "The default value is ${user.home}/.m2/repository/."
+# (https://maven.apache.org/guides/mini/guide-configuring-maven.html)
+# A build re-downloads what it needs, but artifacts installed locally
+# (`mvn install`) or from a repository you no longer reach exist nowhere
+# else, so review only.
 [Maven local repository]
 description = Maven's local repository; Maven re-downloads what a build needs, but locally installed artifacts exist nowhere else
 kind = cache/v1
