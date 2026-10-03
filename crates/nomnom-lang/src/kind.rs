@@ -47,9 +47,8 @@ pub fn split_id(id: &str) -> Option<(&str, u32)> {
     Some((name, version.parse().ok()?))
 }
 
-/// Names no pack may declare: the built-in kinds, plus `duplicate`, which the
-/// engine concludes itself from content hashes and no rule can.
-pub const RESERVED: &[&str] = &["build-output", "cache", "stale-download", "duplicate"];
+/// Names no pack may declare: the built-in kinds.
+pub const RESERVED: &[&str] = &["build-output", "cache", "stale-download"];
 
 /// The kinds one pack's rules may use.
 #[derive(Debug, Clone, PartialEq)]

@@ -6,7 +6,6 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::duplicate::Duplicates;
 use super::{Disposition, Label, TrustedPack, Verdict, judge};
 use crate::catalog::Catalog;
 use crate::timings;
@@ -52,11 +51,6 @@ pub struct Entry {
     /// which is charged its `bytes`.
     #[serde(skip)]
     pub reach: Option<Reach>,
-    /// For a likely copy, the kept original it was matched to by sample. A
-    /// plan carries it so the two are compared byte for byte before anything
-    /// is trashed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copy_of: Option<String>,
 }
 
 /// An entry's subtree as the catalog's id range, and the bytes it adds to its
@@ -104,13 +98,11 @@ pub fn charges(entries: &[&Entry], shared: &[SharedFile]) -> Vec<u64> {
     out
 }
 
-/// One [`judge`] pass over the catalog, grouped: the rules only.
+/// One [`judge`] pass over the catalog, grouped.
 ///
 /// `packs` arrives already in resolution order, built-in first — see
 /// [`super::resolve_packs`]. Every entry's [`Verdict::provenance`] names the
-/// pack and rule that decided it. Duplicates come after, from
-/// [`super::find_duplicates`], merged by [`Assessment::with_duplicates`], so
-/// the rules' answer is on screen while the slower duplicate pass runs.
+/// pack and rule that decided it.
 pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
     let verdicts = judge(catalog, &packs);
     let started = Instant::now();
@@ -128,41 +120,12 @@ pub fn assess(catalog: &Catalog, packs: Vec<TrustedPack>) -> Assessment {
                     end: range.end,
                     rolled: node.rolled_size(),
                 }),
-                copy_of: None,
             }
         })
         .collect();
     let assessment = build(catalog, entries);
     timings::lap("assess: group, sort, shared links", started);
     assessment
-}
-
-impl Assessment {
-    /// This assessment with `duplicates` merged in: every rule entry as it
-    /// was, plus the duplicate group.
-    ///
-    /// The rule entries are carried over untouched, so whatever a user
-    /// already approved or excluded against them names the same entries
-    /// afterwards.
-    pub fn with_duplicates(&self, catalog: &Catalog, duplicates: &Duplicates) -> Assessment {
-        let entries = self
-            .groups
-            .iter()
-            .filter(|group| group.label != Label::DUPLICATE)
-            .flat_map(|group| group.entries.iter().cloned())
-            .chain(duplicates.entries.iter().cloned())
-            .collect();
-        build(catalog, entries)
-    }
-
-    /// Every likely copy the assessment holds, the duplicate pass having run.
-    pub fn duplicate_copies(&self) -> impl Iterator<Item = &Entry> {
-        self.groups
-            .iter()
-            .filter(|group| group.label == Label::DUPLICATE)
-            .flat_map(|group| &group.entries)
-            .filter(|entry| entry.copy_of.is_some())
-    }
 }
 
 fn build(catalog: &Catalog, entries: Vec<Entry>) -> Assessment {

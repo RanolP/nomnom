@@ -40,12 +40,9 @@ fn render(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
-    // Two phases, as in the GUI: the rules' answer is printed as soon as it
-    // exists, and the slower duplicate pass follows.
-    let rules = assess(catalog, packs);
+    let Assessment { groups, reclaimable_bytes, .. } = assess(catalog, packs);
 
     if json {
-        let Assessment { groups, reclaimable_bytes, .. } = input::with_duplicates(catalog, &rules);
         let report = Output {
             root: catalog.path(catalog.root()).display().to_string(),
             reclaimable_bytes,
@@ -55,20 +52,14 @@ fn render(
         return Ok(());
     }
 
-    for group in &rules.groups {
-        print_group(out, &label_name(&group.label), group)?;
-    }
-    out.flush()?;
-
-    let merged = input::with_duplicates(catalog, &rules);
-    if merged.groups.is_empty() {
+    if groups.is_empty() {
         writeln!(out, "Nothing to suggest under {}.", catalog.path(catalog.root()).display())?;
         return Ok(());
     }
-    for group in merged.groups.iter().filter(|group| group.label == Label::DUPLICATE) {
-        print_group(out, "likely duplicates", group)?;
+    for group in &groups {
+        print_group(out, &label_name(&group.label), group)?;
     }
-    writeln!(out, "Reclaimable: {}", format_size(merged.reclaimable_bytes, BINARY))?;
+    writeln!(out, "Reclaimable: {}", format_size(reclaimable_bytes, BINARY))?;
     Ok(())
 }
 

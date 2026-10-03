@@ -111,7 +111,6 @@ file_count    files in subtree
 dir_count     dirs in subtree
 depth         distance from scan root
 is_dir  is_file  is_symlink
-is_duplicate  participates in a duplicate group (computed Rust-side)
 
 modified_age        how long ago this node was modified; absent with no mtime
 accessed_age        how long ago it was opened; absent with no atime
@@ -157,8 +156,6 @@ Several rules can target one node. Resolution is deterministic, in this order:
 3. rule order within the pack (earlier rule wins)
 
 The trust cap (below) applies to the winner, after resolution. Then nesting is resolved: a target inside another target is dropped, whatever its confidence, because the outer verdict already decides it.
-
-Duplicate detection is not a rule and stays in Rust. A file that belongs to a duplicate group gets the duplicate verdict on its own node, over any rule verdict there.
 
 The winning verdict records which pack and rule produced it. With packs coming from the network, "why does nomnom want to delete this" must be answerable down to the rule, so provenance is part of the verdict rather than a debugging aid.
 
@@ -218,8 +215,6 @@ So a refusal is never a rule. It is applied to every candidate, after evaluation
 The other half of that history is worth stating too: every serious incident there was an unrecoverable one, because deletion was a permanent `unlink`. nomnom deletes reversibly, through the platform's own recycle bin, with a journal that restores byte-for-byte. That is the one place the comparison deliberately does not apply.
 
 ## What the language does not do
-
-Catalog-wide analysis stays in Rust. Duplicate detection needs a whole-catalog size-then-hash pass, so the language gets `is_duplicate` as a fact rather than the means to express the algorithm. The same will hold for anything else requiring a global view: a rule sees one node and its immediate neighbourhood, and Rust supplies the facts that a single node cannot know about itself.
 
 ### Facts the vocabulary still needs
 

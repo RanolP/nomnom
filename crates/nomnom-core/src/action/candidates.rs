@@ -130,9 +130,6 @@ pub fn approved<'a>(
 /// removes an entry. A picked path that is not a candidate under
 /// `include_review` is left out.
 ///
-/// A likely copy enters as a [`Plan::push_copy`], which apply refuses until
-/// [`Plan::verify_copies`] has compared it with its original in full.
-///
 /// `Err` only when the root cannot anchor a plan. A path the guards refuse is
 /// information, not a stop: the other actions are still sound, so it comes back
 /// beside the plan for the caller to show.
@@ -158,13 +155,8 @@ pub fn plan_from(
             verdict.provenance.rule.clone(),
         );
         let path = PathBuf::from(&entry.path);
-        let pushed = match &entry.copy_of {
-            Some(original) => {
-                plan.push_copy(path.clone(), PathBuf::from(original), entry.bytes, justification)
-            }
-            None => plan.push(Action::Trash { path: path.clone() }, entry.bytes, justification),
-        };
-        if let Err(error) = pushed {
+        if let Err(error) = plan.push(Action::Trash { path: path.clone() }, entry.bytes, justification)
+        {
             refused.push((path, error));
         }
     }
@@ -198,7 +190,6 @@ mod tests {
                 capped: None,
             },
             reach: None,
-            copy_of: None,
         }
     }
 

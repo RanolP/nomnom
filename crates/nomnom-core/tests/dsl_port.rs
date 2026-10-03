@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, Label, TrustedPack, builtin_pack, judge};
+use nomnom_core::verdict::{Disposition, TrustedPack, builtin_pack, judge};
 use tempfile::TempDir;
 
 /// What a user actually sees about one path.
@@ -116,9 +116,6 @@ fn rows(tmp: &TempDir) -> BTreeMap<PathBuf, Row> {
     let catalog = catalog_of(tmp.path());
     judge(&catalog, &[TrustedPack::builtin(builtin_pack().clone())])
         .into_iter()
-        // Duplicates are still decided in Rust, not by a rule, and this fixture
-        // has no duplicate pair to decide about.
-        .filter(|(_, verdict)| verdict.label != Label::DUPLICATE)
         .map(|(id, verdict)| {
             (
                 catalog.path(id).strip_prefix(tmp.path()).expect("under root").to_path_buf(),

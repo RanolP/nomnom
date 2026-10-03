@@ -114,7 +114,6 @@ vocabulary! {
         IsDir       "is_dir"       : Bool, "the node is a directory";
         IsFile      "is_file"      : Bool, "the node is a regular file";
         IsSymlink   "is_symlink"   : Bool, "the node is a symbolic link";
-        IsDuplicate "is_duplicate" : Bool, "participates in a duplicate group";
         ModifiedAge "modified_age" : Duration,
             "how long ago the node was modified; absent with no mtime";
         AccessedAge "accessed_age" : Duration,

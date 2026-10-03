@@ -4263,7 +4263,6 @@ dependencies = [
 name = "nomnom-core"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "globset",
  "ignore",
  "nomnom-lang",

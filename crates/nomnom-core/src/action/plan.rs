@@ -4,12 +4,9 @@
 //! because dry-run is the default mode. Nothing here touches the filesystem
 //! beyond reading path metadata.
 
-use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
 
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::ActionError;
@@ -100,74 +97,6 @@ pub struct PlanEntry {
     pub pack: String,
     #[serde(default)]
     pub rule: String,
-    /// For a likely copy, the original it must equal byte for byte before it
-    /// may be trashed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copy_of: Option<PathBuf>,
-    /// Set only by [`Plan::verify_copies`], never by deserialization, so a
-    /// plan read back from disk has to be verified again before its copies
-    /// can go.
-    #[serde(skip)]
-    confirmed: Option<Confirmed>,
-}
-
-impl PlanEntry {
-    /// Whether this is a copy [`Plan::verify_copies`] found byte-identical to
-    /// its original.
-    pub fn is_confirmed_copy(&self) -> bool {
-        self.copy_of.is_some() && self.confirmed.is_some()
-    }
-
-    /// Why apply must not trash this entry now, for a copy: never verified,
-    /// or the copy or its original changed since.
-    pub(super) fn copy_refusal(&self) -> Option<String> {
-        let original = self.copy_of.as_ref()?;
-        let copy = self.action.path();
-        let Some(confirmed) = &self.confirmed else {
-            return Some(format!(
-                "refusing to trash {}: it was never verified byte-identical to {}",
-                copy.display(),
-                original.display()
-            ));
-        };
-        if stamp(copy).ok() != Some(confirmed.copy)
-            || stamp(original).ok() != Some(confirmed.original)
-        {
-            return Some(format!(
-                "refusing to trash {}: it or its original {} changed since they were verified",
-                copy.display(),
-                original.display()
-            ));
-        }
-        None
-    }
-}
-
-/// Size and modification time of a copy and its original at the moment their
-/// full hashes matched. Apply compares them again just before trashing, so a
-/// file rewritten after verification is not trashed on a stale comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Confirmed {
-    copy: Stamp,
-    original: Stamp,
-}
-
-type Stamp = (u64, Option<SystemTime>);
-
-fn stamp(path: &Path) -> std::io::Result<Stamp> {
-    let meta = std::fs::metadata(path)?;
-    Ok((meta.len(), meta.modified().ok()))
-}
-
-fn full_hash(path: &Path) -> std::io::Result<(Stamp, [u8; 32])> {
-    let before = stamp(path)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(std::fs::File::open(path)?)?;
-    let after = stamp(path)?;
-    if before != after {
-        return Err(std::io::Error::other("it changed while being read"));
-    }
-    Ok((after, *hasher.finalize().as_bytes()))
 }
 
 /// An ordered, reviewable set of actions rooted at one directory.
@@ -202,112 +131,10 @@ impl Plan {
         bytes: u64,
         justification: impl Into<Justification>,
     ) -> Result<(), ActionError> {
-        self.push_entry(action, bytes, justification.into(), None)
-    }
-
-    /// Add the trashing of a likely copy of `original`. Apply refuses it
-    /// until [`Plan::verify_copies`] has found the two byte-identical.
-    pub fn push_copy(
-        &mut self,
-        copy: PathBuf,
-        original: PathBuf,
-        bytes: u64,
-        justification: impl Into<Justification>,
-    ) -> Result<(), ActionError> {
-        let original = original.canonicalize().unwrap_or(original);
-        self.push_entry(Action::Trash { path: copy }, bytes, justification.into(), Some(original))
-    }
-
-    fn push_entry(
-        &mut self,
-        action: Action,
-        bytes: u64,
-        justification: Justification,
-        copy_of: Option<PathBuf>,
-    ) -> Result<(), ActionError> {
         let action = self.guard(&action)?;
-        let Justification { reason, pack, rule } = justification;
-        self.entries.push(PlanEntry {
-            action,
-            bytes,
-            reason,
-            pack,
-            rule,
-            copy_of,
-            confirmed: None,
-        });
+        let Justification { reason, pack, rule } = justification.into();
+        self.entries.push(PlanEntry { action, bytes, reason, pack, rule });
         Ok(())
-    }
-
-    /// Compare every copy with its original by a full blake3 hash, and drop
-    /// each one that is not proven identical, with the reason.
-    ///
-    /// This is where the duplicate pass's sample becomes certainty, paid only
-    /// for the copies a user approved rather than for every same-size file on
-    /// the drive. Dropped: a copy whose bytes differ, one that or whose
-    /// original cannot be read, and one whose original is itself planned to
-    /// go, since trashing both would keep no copy at all.
-    pub fn verify_copies(&mut self) -> Vec<(PathBuf, String)> {
-        let planned: Vec<PathBuf> =
-            self.entries.iter().map(|entry| entry.action.path().to_path_buf()).collect();
-        let pending: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| self.entries[i].copy_of.is_some() && self.entries[i].confirmed.is_none())
-            .collect();
-        let originals: BTreeSet<&Path> =
-            pending.iter().filter_map(|&i| self.entries[i].copy_of.as_deref()).collect();
-        let originals: HashMap<&Path, Result<(Stamp, [u8; 32]), String>> = originals
-            .into_par_iter()
-            .map(|path| (path, full_hash(path).map_err(|e| e.to_string())))
-            .collect();
-        let outcomes: Vec<(usize, Result<Confirmed, String>)> = pending
-            .par_iter()
-            .map(|&i| {
-                let entry = &self.entries[i];
-                let copy = entry.action.path();
-                let original = entry.copy_of.as_deref().expect("pending entries are copies");
-                let outcome = if planned.iter().any(|path| original.starts_with(path)) {
-                    Err(format!(
-                        "its original {} is planned to go too, which would keep no copy",
-                        original.display()
-                    ))
-                } else {
-                    match (&originals[original], full_hash(copy)) {
-                        (Err(e), _) => Err(format!(
-                            "its original {} could not be read to compare: {e}",
-                            original.display()
-                        )),
-                        (_, Err(e)) => Err(format!("it could not be read to compare: {e}")),
-                        (Ok((original_stamp, a)), Ok((copy_stamp, b))) if a == &b => {
-                            Ok(Confirmed { copy: copy_stamp, original: *original_stamp })
-                        }
-                        _ => Err(format!(
-                            "its contents differ from {}, despite the same size and sampled \
-                             head, middle and tail",
-                            original.display()
-                        )),
-                    }
-                };
-                (i, outcome)
-            })
-            .collect();
-        let mut dropped = Vec::new();
-        let mut drop: BTreeSet<usize> = BTreeSet::new();
-        for (i, outcome) in outcomes {
-            match outcome {
-                Ok(confirmed) => self.entries[i].confirmed = Some(confirmed),
-                Err(reason) => {
-                    dropped.push((self.entries[i].action.path().to_path_buf(), reason));
-                    drop.insert(i);
-                }
-            }
-        }
-        let mut index = 0;
-        self.entries.retain(|_| {
-            let keep = !drop.contains(&index);
-            index += 1;
-            keep
-        });
-        dropped
     }
 
     /// Re-run every guard. Cheap, and the only thing standing between a

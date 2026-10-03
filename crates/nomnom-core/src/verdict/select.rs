@@ -62,10 +62,6 @@ impl TrustedPack {
 
 /// Every target some rule selects, each with the one rule that won it, with
 /// targets inside another target already dropped. In id order.
-///
-/// `is_duplicate` reads `false` throughout: the rules are decided before the
-/// duplicate pass runs, so that the rules' answer can be shown while it does,
-/// and the duplicate pass then leaves every rule target alone.
 pub(super) fn select(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
     let started = Instant::now();
     let rules = compile(packs);
@@ -647,7 +643,6 @@ impl Facts for NodeFacts<'_> {
             Field::IsDir => Value::Bool(node.kind == EntryKind::Dir),
             Field::IsFile => Value::Bool(node.kind == EntryKind::File),
             Field::IsSymlink => Value::Bool(node.kind == EntryKind::Symlink),
-            Field::IsDuplicate => Value::Bool(false),
             Field::ModifiedAge => self.age(node.modified),
             Field::AccessedAge => self.age(node.accessed),
             Field::MaxDescendantAge => self.age(node.max_modified),

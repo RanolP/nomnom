@@ -200,52 +200,27 @@ fn execute(
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
     mode.check()?;
-    // Two phases, as in the GUI: the rules' candidates first, then the likely
-    // duplicates once the slower pass has found them.
-    let rules = assess(catalog, packs);
+    let assessment = assess(catalog, packs);
     if !mode.picks() {
+        let groups = by_rule(&candidates(&assessment, mode.include_review));
         if mode.json {
-            let merged = input::with_duplicates(catalog, &rules);
-            let groups = by_rule(&candidates(&merged, mode.include_review));
-            return report_candidates_json(&merged.root, &groups, exclusions, out);
+            return report_candidates_json(&assessment.root, &groups, exclusions, out);
         }
-        let groups = by_rule(&candidates(&rules, mode.include_review));
-        report_candidates(&rules.root, &groups, exclusions, out)?;
-        out.flush()?;
-        let merged = input::with_duplicates(catalog, &rules);
-        let duplicates: Vec<&Entry> = candidates(&merged, mode.include_review)
-            .into_iter()
-            .filter(|entry| entry.copy_of.is_some())
-            .collect();
-        report_duplicates(&by_rule(&duplicates), exclusions, out)?;
-        return report_hints(groups.is_empty() && duplicates.is_empty(), exclusions, mode, out);
+        report_candidates(&assessment.root, &groups, exclusions, out)?;
+        return report_hints(groups.is_empty(), exclusions, mode, out);
     }
-    // The duplicate pass runs only when a pick needs it: a rule or path the
-    // rules alone do not offer.
-    let unresolved = {
-        let widened = candidates(&rules, true);
-        let groups = by_rule(&widened);
-        mode.rules.iter().any(|text| find_rule(&groups, text).is_err())
-            || mode.paths.iter().any(|path| find(&widened, path).is_none())
-    };
-    let assessment = if unresolved { input::with_duplicates(catalog, &rules) } else { rules };
     let offered = candidates(&assessment, mode.include_review);
     let groups = by_rule(&offered);
     let approval = Approval {
         rules: approve_rules(&groups, &by_rule(&candidates(&assessment, true)), mode.rules)?,
         paths: select(&offered, &candidates(&assessment, true), exclusions, mode.paths)?,
     };
-    let (mut plan, refused) = plan_from(&assessment, &approval, exclusions, mode.include_review)
+    let (plan, refused) = plan_from(&assessment, &approval, exclusions, mode.include_review)
         .with_context(|| format!("cannot anchor a plan at {}", assessment.root.display()))?;
     // A guard refusal is information, not a stop: the other actions are still
     // sound, and the user can act on the named path.
     for (path, error) in refused {
         eprintln!("skipping {}: {error}", path.display());
-    }
-    // A likely copy stays in the plan only once a full hash proves it equal
-    // to the copy that is kept; apply refuses any copy that was not.
-    for (path, reason) in plan.verify_copies() {
-        eprintln!("skipping {}: {reason}", path.display());
     }
 
     if mode.apply {
@@ -408,25 +383,6 @@ fn report_candidates(
     write_groups(groups, exclusions, out)
 }
 
-/// The second phase: the likely copies, approved as one rule.
-fn report_duplicates(
-    groups: &[RuleGroup<'_>],
-    exclusions: &Exclusions,
-    out: &mut dyn Write,
-) -> Result<()> {
-    writeln!(out)?;
-    if groups.is_empty() {
-        writeln!(out, "No likely duplicates.")?;
-        return Ok(());
-    }
-    writeln!(
-        out,
-        "Likely duplicates (same size and sampled contents; each copy is compared in full with \
-         the kept original before anything is trashed):"
-    )?;
-    write_groups(groups, exclusions, out)
-}
-
 fn write_groups(
     groups: &[RuleGroup<'_>],
     exclusions: &Exclusions,
@@ -523,9 +479,6 @@ fn report_plan(
             writeln!(out, "      -> {}", plain(destination))?;
         }
         writeln!(out, "      {}", entry.reason)?;
-        if let Some(original) = entry.copy_of.as_deref().filter(|_| entry.is_confirmed_copy()) {
-            writeln!(out, "      byte-identical to {}, compared in full", plain(original))?;
-        }
     }
     writeln!(out)?;
     writeln!(out, "{} actions, {} reclaimed", plan.len(), format_size(plan.total_bytes(), BINARY))?;
@@ -793,44 +746,6 @@ mod tests {
         let edits = Edits { exclude: &[], unexclude: &[root.join("beta")], list: false };
         edit_exclusions(root, &edits, &mode, &mut Vec::new()).unwrap();
         assert!(Exclusions::load(root).unwrap().is_empty());
-    }
-
-    /// The regressions: the CLI losing parity with the GUI's second phase, so
-    /// likely duplicates are never listed or cannot be approved by their rule;
-    /// and a dry run planning a copy whose sampled ends match but whose bytes
-    /// differ from the kept original.
-    #[test]
-    fn duplicates_follow_the_rules_and_only_verified_copies_are_planned() {
-        let dir = node_fixture();
-        let root = dir.path();
-        let blob = vec![b'k'; 2 * 1024 * 1024];
-        let mut different = blob.clone();
-        different[blob.len() / 4] = b'!';
-        let now = std::time::SystemTime::now();
-        for (age, name, contents) in
-            [(3, "kept.bin", &blob), (2, "copy.bin", &blob), (1, "near.bin", &different)]
-        {
-            write(root.join("dups").join(name), contents);
-            std::fs::File::options()
-                .write(true)
-                .open(root.join("dups").join(name))
-                .unwrap()
-                .set_modified(now - std::time::Duration::from_secs(86_400 * age))
-                .unwrap();
-        }
-
-        let (_, listing) = dry_run(root);
-        let rules_at = listing.find("Rules with candidates").expect(&listing);
-        let duplicates_at = listing.find("Likely duplicates").expect(&listing);
-        assert!(rules_at < duplicates_at, "the rules come first:\n{listing}");
-        assert!(listing.contains("duplicate-copy"), "{listing}");
-
-        let (_, plan) =
-            clean_with(root, &[], &["duplicate-copy".into()], false).expect("clean runs");
-        assert!(plan.contains("1 actions"), "{plan}");
-        assert!(plan.contains("copy.bin"), "{plan}");
-        assert!(!plan.contains("near.bin"), "a copy that differs was planned:\n{plan}");
-        assert!(plan.contains("byte-identical"), "{plan}");
     }
 
     /// A dry run that is not dry is the single worst bug this tool could

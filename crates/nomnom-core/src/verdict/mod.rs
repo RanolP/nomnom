@@ -1,18 +1,15 @@
 //! What a path IS, and whether it should go.
 //!
-//! Two phases. Rule packs written in the nomnom rule language select targets
-//! ([`select`], via [`judge`] and [`assess`]), which is fast and shown at
-//! once; likely copies are then found in Rust ([`find_duplicates`]) and merged
-//! in. Every verdict carries the sentence a human approves it on and the pack
+//! Rule packs written in the nomnom rule language select targets ([`select`],
+//! via [`judge`] and [`assess`]) from catalog metadata alone. Every verdict carries the sentence a human approves it on and the pack
 //! and rule that produced it.
 
 mod assess;
 mod builtin;
-mod duplicate;
 mod packs;
 mod select;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +20,6 @@ use crate::catalog::{Catalog, NodeId};
 
 pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, charges};
 pub use builtin::builtin_pack;
-pub use duplicate::{Duplicates, MIN_DUPLICATE_SIZE, duplicate_copy_rule, find_duplicates};
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };
@@ -55,13 +51,10 @@ impl Label {
     pub const BUILD_OUTPUT: Label = Label(Repr::Static("build-output"));
     /// Refillable by re-fetching or re-computing.
     pub const CACHE: Label = Label(Repr::Static("cache"));
-    /// Byte-identical to another file in the catalog.
-    pub const DUPLICATE: Label = Label(Repr::Static("duplicate"));
     /// Downloaded once and untouched since.
     pub const STALE_DOWNLOAD: Label = Label(Repr::Static("stale-download"));
 
-    const BUILTIN: [Label; 4] =
-        [Label::BUILD_OUTPUT, Label::CACHE, Label::DUPLICATE, Label::STALE_DOWNLOAD];
+    const BUILTIN: [Label; 3] = [Label::BUILD_OUTPUT, Label::CACHE, Label::STALE_DOWNLOAD];
 
     /// A built-in name resolves to its `&'static str` form, so the common case
     /// never allocates.
@@ -201,9 +194,7 @@ pub struct Verdict {
 /// `packs` in resolution order: built-in first, then user, project and
 /// `--pack`, each overriding the last. A rule target is one decision for its
 /// whole subtree, so no verdict lies inside another rule verdict's subtree —
-/// which is what keeps [`Rollup::reclaimable_bytes`] sound. Duplicates are a
-/// second phase ([`find_duplicates`]) that never touches a rule target or
-/// anything inside one.
+/// which is what keeps [`Rollup::reclaimable_bytes`] sound.
 pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
     select::select(ctx, packs)
 }
@@ -246,16 +237,4 @@ fn name_eq(a: &str, b: &str) -> bool {
 #[cfg(not(windows))]
 fn name_eq(a: &str, b: &str) -> bool {
     a == b
-}
-
-/// Whether any strict ancestor of `id` is a rule target.
-fn under_unit(ctx: &Catalog, id: NodeId, units: &HashSet<NodeId>) -> bool {
-    let mut cursor = ctx.node(id).parent;
-    while let Some(current) = cursor {
-        if units.contains(&current) {
-            return true;
-        }
-        cursor = ctx.node(current).parent;
-    }
-    false
 }

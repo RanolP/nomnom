@@ -1,18 +1,10 @@
 //! Integration tests for the `action` domain — the only code in nomnom that
 //! changes a filesystem. Every test here names the regression it catches.
 
-mod common;
-
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
-use common::{catalog_of, write};
-use nomnom_core::action::{Action, ActionError, Approval, Exclusions, Plan, apply, plan_from};
-use nomnom_core::catalog::DuplicateProgress;
-use nomnom_core::verdict::{
-    TrustedPack, assess, builtin_pack, duplicate_copy_rule, find_duplicates,
-};
+use nomnom_core::action::{Action, ActionError, Plan, apply};
 use tempfile::TempDir;
 
 /// root/
@@ -161,89 +153,4 @@ fn reordering_a_plan_keeps_every_path_with_its_own_reason() {
         assert_eq!(record.reason, expected(&record.source), "apply record lost its own reason");
     }
     assert!(archive.join("logs").join("nested").join("deep.log").exists());
-}
-
-/// Three same-size files whose sampled head, middle and tail agree, of which
-/// `different.bin` differs a quarter of the way in, where no sample reads.
-/// Oldest is `original.bin`, so it is the kept copy. Returns the approved
-/// duplicate plan before verification.
-fn likely_copies() -> (TempDir, PathBuf, Plan) {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("root");
-    let len = 2 * 1024 * 1024;
-    let original = vec![b'd'; len];
-    let mut different = original.clone();
-    different[len / 4] = b'X';
-    let now = SystemTime::now();
-    for (age, name, contents) in [
-        (3, "original.bin", &original),
-        (2, "same.bin", &original),
-        (1, "different.bin", &different),
-    ] {
-        let path = root.join(name);
-        write(&path, contents);
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(now - Duration::from_secs(86_400 * age))
-            .unwrap();
-    }
-    let catalog = catalog_of(&root);
-    let rules = assess(&catalog, vec![TrustedPack::builtin(builtin_pack().clone())]);
-    let duplicates =
-        find_duplicates(&catalog, &rules, &DuplicateProgress::default()).expect("not cancelled");
-    let assessment = rules.with_duplicates(&catalog, &duplicates);
-    assert_eq!(assessment.duplicate_copies().count(), 2, "the sample must let both copies through");
-    let approval = Approval { rules: [duplicate_copy_rule()].into(), paths: Default::default() };
-    let (plan, refused) = plan_from(&assessment, &approval, &Exclusions::default(), false).unwrap();
-    assert!(refused.is_empty(), "{refused:?}");
-    assert_eq!(plan.len(), 2);
-    (tmp, root, plan)
-}
-
-/// The regression: a sampled match trusted as identity, so a file that only
-/// shares its size and sampled ends with the kept copy is trashed, and its
-/// unique contents with it.
-#[test]
-fn a_copy_with_the_same_ends_but_a_different_middle_is_never_deleted() {
-    let (_tmp, root, mut plan) = likely_copies();
-
-    let dropped = plan.verify_copies();
-    assert_eq!(dropped.len(), 1, "{dropped:?}");
-    assert!(dropped[0].0.ends_with("different.bin"));
-    assert!(dropped[0].1.contains("differ"), "the reason says why: {}", dropped[0].1);
-
-    let report = apply(&plan).unwrap();
-    assert!(report.failures().next().is_none(), "{:?}", report.records());
-    assert!(root.join("different.bin").exists(), "a copy that differs was trashed");
-    assert!(root.join("original.bin").exists(), "the kept copy was trashed");
-    assert!(!root.join("same.bin").exists(), "the verified copy should go");
-}
-
-/// The regression: apply trusting the plan, so a plan that skipped
-/// verification, or came back from JSON where the verification does not
-/// travel, trashes sampled matches unchecked.
-#[test]
-fn apply_refuses_every_copy_that_was_not_verified() {
-    let (_tmp, root, plan) = likely_copies();
-    let plan: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
-
-    let report = apply(&plan).unwrap();
-    assert_eq!(report.failures().count(), 2, "{:?}", report.records());
-    assert!(root.join("same.bin").exists());
-    assert!(root.join("different.bin").exists());
-}
-
-/// The regression: a copy verified, then rewritten before apply, trashed on
-/// the strength of a comparison that no longer holds.
-#[test]
-fn apply_refuses_a_copy_that_changed_after_it_was_verified() {
-    let (_tmp, root, mut plan) = likely_copies();
-    plan.verify_copies();
-    fs::write(root.join("same.bin"), b"rewritten").unwrap();
-
-    let report = apply(&plan).unwrap();
-    assert_eq!(report.failures().count(), 1, "{:?}", report.records());
-    assert!(root.join("same.bin").exists());
 }

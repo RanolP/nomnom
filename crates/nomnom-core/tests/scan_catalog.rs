@@ -1,5 +1,5 @@
 //! Scan → catalog seam: aggregate roll-up, order independence, depth safety,
-//! duplicate detection, error collection, and the drive-only scan policy.
+//! error collection, and the drive-only scan policy.
 //! Backend dispatch on real trees is tested inside the crate, beside it.
 
 mod common;
@@ -149,28 +149,6 @@ fn deep_chain_builds_without_stack_overflow() {
     assert_eq!(root_node.dir_count, DEPTH as u64);
     assert_eq!(catalog.descendants(catalog.root()).len(), DEPTH + 2);
     assert_eq!(catalog.node(catalog.find(&path).unwrap()).depth, DEPTH as u32);
-}
-
-/// Catches size-only matching being mistaken for duplicate detection: a third
-/// file of the same size but different contents must not join the pair.
-#[test]
-fn duplicate_groups_require_matching_contents_not_just_size() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    std::fs::write(root.join("one.bin"), b"identical contents").unwrap();
-    std::fs::write(root.join("two.bin"), b"identical contents").unwrap();
-    std::fs::write(root.join("three.bin"), b"DIFFERENT contentz").unwrap();
-    assert_eq!(b"identical contents".len(), b"DIFFERENT contentz".len());
-
-    let catalog = Catalog::build(report_of(root));
-    let groups = catalog
-        .likely_duplicate_groups(1, &nomnom_core::catalog::DuplicateProgress::default())
-        .expect("not cancelled");
-
-    assert_eq!(groups.len(), 1, "expected exactly one duplicate group, got {groups:?}");
-    let mut paths: Vec<PathBuf> = groups[0].iter().map(|&id| catalog.path(id)).collect();
-    paths.sort();
-    assert_eq!(paths, vec![root.join("one.bin"), root.join("two.bin")]);
 }
 
 /// Catches a per-entry failure being promoted to a fatal one: errors must ride

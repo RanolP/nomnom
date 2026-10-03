@@ -101,9 +101,7 @@ pub fn apply(plan: &Plan) -> Result<ApplyReport, ActionError> {
             reason: entry.reason.clone(),
             pack: entry.pack.clone(),
             rule: entry.rule.clone(),
-            // Checked here, at the last moment, rather than trusted from the
-            // plan: a copy that was not proven identical is never trashed.
-            status: match entry.copy_refusal().map_or_else(|| perform(&entry.action), Err) {
+            status: match perform(&entry.action) {
                 Ok(()) => RecordStatus::Succeeded,
                 Err(message) => RecordStatus::Failed { message },
             },
