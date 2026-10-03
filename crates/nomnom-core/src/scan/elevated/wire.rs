@@ -1,9 +1,12 @@
-//! The byte stream the elevated helper sends its parent over the pipe.
+//! The byte streams between the elevated helper and its parent over the pipe.
 //!
 //! ```text
-//! stream   = "NNEH" version:u8 frame*
+//! parent   = token{32} request*                     parent -> helper
+//! request  = 1 units                                scan this volume root
+//! helper   = "NNEH" version:u8 answer*              helper -> parent
+//! answer   = frame* (report-frame | failure-frame)  one per request, in order
 //! frame    = 1 entries:u64 total:u64 bytes:u64      progress, little-endian
-//!          | 2 report                               the result; ends the stream
+//!          | 2 report                               the result; ends the answer
 //!          | 3 text                                 the helper's failure; ends it
 //! report   = path backend names odd_names blobs nodes errors
 //! names    = len:varint utf8{len}
@@ -38,7 +41,9 @@ use crate::scan::table::{Blob, EXTRA_LINK, NO_BLOB, Name, ODD_NAME, ScanTable};
 use crate::scan::{BackendUsed, EntryKind, ScanError, ScanReport};
 
 const MAGIC: &[u8; 4] = b"NNEH";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
+
+const TAG_SCAN: u8 = 1;
 
 const TAG_PROGRESS: u8 = 1;
 const TAG_REPORT: u8 = 2;
@@ -215,6 +220,21 @@ pub(crate) fn read_header(r: &mut impl Read) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+pub(crate) fn write_request(w: &mut impl Write, root: &Path) -> io::Result<()> {
+    let mut buf = vec![TAG_SCAN];
+    put_units(&mut buf, &units(root));
+    w.write_all(&buf)
+}
+
+/// The only request the helper understands: a root to scan, which it still
+/// validates as a volume root before touching it.
+pub(crate) fn read_request(r: &mut impl Read) -> io::Result<PathBuf> {
+    match read_u8(r)? {
+        TAG_SCAN => Ok(path_from(&read_units(r, MAX_PATH_UNITS, "request root")?)),
+        tag => Err(invalid(format!("unknown request tag {tag}"))),
+    }
 }
 
 pub(crate) fn read_frame(r: &mut impl Read) -> io::Result<Frame> {

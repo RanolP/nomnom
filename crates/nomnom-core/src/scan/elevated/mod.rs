@@ -1,12 +1,21 @@
 //! The MFT read from an unelevated process: relaunch this same binary behind
-//! a UAC prompt and receive its scan over a named pipe.
+//! a UAC prompt once, and have it serve every scan this process asks for over
+//! a named pipe.
 //!
-//! The parent creates a pipe only it and Administrators can open, starts
-//! `current_exe() --nomnom-elevated-scan <pipe> <mft|walk> <root>` with the
-//! `runas` verb, and reads the stream [`wire`] defines: progress frames it
-//! mirrors into [`ScanOptions::progress`], then the report. The helper writes a
-//! progress frame every 100 ms, so it notices a dead parent within that and
-//! exits rather than finishing a scan nobody will read.
+//! The first scan creates a pipe with a random name that only this user and
+//! Administrators can open, and starts `current_exe() --nomnom-elevated-scan
+//! <pipe> <mft|walk> <parent pid> <token>` with the `runas` verb. Each side
+//! checks the other's PID on the pipe, and the parent's first bytes must be
+//! the random token. Each scan then sends a volume root and reads the answer
+//! [`wire`] defines: progress frames it mirrors into
+//! [`ScanOptions::progress`], then the report. The helper accepts nothing but
+//! a volume root to scan; deleting stays in the unelevated process.
+//!
+//! The helper lives as long as its parent: it waits on the parent's process
+//! handle and exits when it signals, and a broken pipe (the parent closed it,
+//! or dropped a helper whose stream broke) ends it too. A helper that died is
+//! relaunched by the next scan, which costs one new prompt and says so in
+//! [`ScanProgress::relaunch`](crate::scan::ScanProgress::relaunch).
 //!
 //! Every binary that may call [`scan_elevated`] must call [`maybe_run_helper`]
 //! first thing in `main`, because the helper is that binary relaunched.

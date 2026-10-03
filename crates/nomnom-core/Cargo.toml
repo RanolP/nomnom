@@ -20,10 +20,11 @@ thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 ntfs.workspace = true
 # The elevated scan helper: a UAC launch, a named pipe with an explicit DACL,
-# and a token check. Additive to the workspace's feature list.
+# and a random token check. Additive to the workspace's feature list.
 windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Pipes",

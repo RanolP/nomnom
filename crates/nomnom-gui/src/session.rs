@@ -64,15 +64,20 @@ impl ScanProgress {
         self.counters.stage()
     }
 
-    /// Set the moment core's scan falls back to the walk, so the banner shows
-    /// while the slower scan is still running.
+    /// Set the moment core's scan falls back to the walk, or relaunches the
+    /// elevated helper, so the banner shows while the scan is still running.
     pub fn notice(&self) -> Option<String> {
-        self.counters.fallback.get().map(|reason| fallback_notice(reason))
+        scan_notice(&self.counters)
     }
 }
 
-fn fallback_notice(reason: &str) -> String {
-    format!("Using the slower walk scan: {reason}")
+fn scan_notice(counters: &scan::ScanProgress) -> Option<String> {
+    let relaunch = counters.relaunch.get().map(|note| format!("Restarting the scan helper: {note}"));
+    let fallback = counters.fallback.get().map(|reason| format!("Using the slower walk scan: {reason}"));
+    match (relaunch, fallback) {
+        (Some(relaunch), Some(fallback)) => Some(format!("{relaunch}. {fallback}")),
+        (one, other) => one.or(other),
+    }
 }
 
 /// A finished scan and the drive-wide views derived from it once, off the UI
@@ -275,7 +280,7 @@ impl Session {
                     Ok::<_, ScanFailure>(Arc::new(data))
                 })
                 .await;
-            let notice = counters.fallback.get().map(|reason| fallback_notice(reason));
+            let notice = scan_notice(&counters);
             let data = match scanned {
                 Ok(data) => data,
                 Err(error) => {

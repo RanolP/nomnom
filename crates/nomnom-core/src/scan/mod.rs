@@ -146,6 +146,9 @@ pub struct ScanProgress {
     /// Why the MFT read was given up, set the moment [`scan_drive`] falls back
     /// to the walk, so a front-end can say so while the slower scan runs.
     pub fallback: OnceLock<String>,
+    /// Set when the elevated helper an earlier scan in this process started
+    /// had exited, so this scan launches a new one behind a new UAC prompt.
+    pub relaunch: OnceLock<String>,
     /// The [`Stage`] running now, as its discriminant.
     stage: AtomicU8,
     stage_done: AtomicU64,
