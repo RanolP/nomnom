@@ -1,0 +1,52 @@
+# Directories Python tooling rebuilds: virtualenvs, bytecode, and the caches of
+# tox, mypy and pytest.
+#
+# These names mean the same thing everywhere they appear, so a name is enough.
+
+[.venv/]
+description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.venv/
+}
+
+[venv/]
+description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/venv/
+}
+
+[__pycache__/]
+description = regenerable: Python bytecode cache, rewritten on the next import
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/__pycache__/
+}
+
+[.tox/]
+description = regenerable: tox environments, rebuilt by `tox`
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.tox/
+}
+
+[.mypy_cache/]
+description = regenerable: mypy incremental cache, rebuilt on the next type-check
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.mypy_cache/
+}
+
+[.pytest_cache/]
+description = regenerable: pytest run cache, rewritten on the next test run
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.pytest_cache/
+}

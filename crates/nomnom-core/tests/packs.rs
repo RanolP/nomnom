@@ -5,7 +5,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, TrustedPack, Verdict, builtin_pack, judge};
+use nomnom_core::verdict::{Disposition, TrustedPack, Verdict, judge};
 use nomnom_pack::Trust;
 use tempfile::TempDir;
 
@@ -144,7 +144,7 @@ fn a_higher_confidence_earlier_rule_beats_a_later_pack() {
 /// capping everything uniformly, which turns every `reclaimable` the tool ships
 /// with into a `review` and leaves `clean` with nothing to do out of the box.
 #[test]
-fn the_builtin_pack_is_never_capped() {
+fn the_builtin_packs_are_never_capped() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().join("tree");
     write(root.join("package.json"), b"{}");
@@ -152,7 +152,7 @@ fn the_builtin_pack_is_never_capped() {
 
     let catalog = catalog_of(&root);
     let id = catalog.find(&root.join("node_modules")).expect("node_modules node");
-    let verdict = judge(&catalog, &[TrustedPack::builtin(builtin_pack().clone())])
+    let verdict = judge(&catalog, &TrustedPack::builtins())
         .into_iter()
         .find(|(judged, _)| *judged == id)
         .map(|(_, verdict)| verdict)

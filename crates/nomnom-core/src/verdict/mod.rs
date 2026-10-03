@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::catalog::{Catalog, NodeId};
 
 pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, assess_with, charges};
-pub use builtin::builtin_pack;
+pub use builtin::builtin_packs;
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };

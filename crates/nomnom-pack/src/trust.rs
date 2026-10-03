@@ -1,6 +1,6 @@
 //! The cap that keeps a stranger's repository from choosing what to delete.
 //!
-//! `docs/lang.md`: a rule from any pack other than the built-in one is capped
+//! `docs/lang.md`: a rule from any pack other than the built-in ones is capped
 //! at `disposition = review` until the user runs `nomnom pack trust <name>`.
 //!
 //! The cap is a **value the judge applies**, never an edit to a loaded
@@ -15,7 +15,7 @@ use nomnom_lang::ast::Disposition;
 /// Whether a pack's verdicts may propose a deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trust {
-    /// The pack compiled into the binary. Never capped: it is us.
+    /// A pack compiled into the binary. Never capped: it is us.
     Builtin,
     /// The user ran `nomnom pack trust <name>`.
     Trusted,

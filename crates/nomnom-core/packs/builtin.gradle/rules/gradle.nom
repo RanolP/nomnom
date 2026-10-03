@@ -1,0 +1,10 @@
+# The project cache Gradle rebuilds on its next run. The name means the same
+# thing everywhere it appears, so a name is enough.
+
+[.gradle/]
+description = regenerable: Gradle project cache, rebuilt on the next Gradle run
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.gradle/
+}

@@ -415,7 +415,13 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("builtin", "built-in", "built-in"),
+                ("builtin.generic", "built-in", "built-in"),
+                ("builtin.downloads", "built-in", "built-in"),
+                ("builtin.dotnet", "built-in", "built-in"),
+                ("builtin.gradle", "built-in", "built-in"),
+                ("builtin.node", "built-in", "built-in"),
+                ("builtin.python", "built-in", "built-in"),
+                ("builtin.rust", "built-in", "built-in"),
                 ("house-style", "project", "untrusted"),
                 ("vendor", "explicit", "untrusted"),
             ],
@@ -466,7 +472,16 @@ mod tests {
         let removed = pack_ok(root, PackCommand::Remove { name: "rust".into(), json: true });
         assert!(removed.contains("\"removed\": \"rust\""), "{removed}");
         let after = list_json(root, Vec::new());
-        assert_eq!(after["packs"].as_array().expect("packs").len(), 1, "only the built-in is left");
+        let left: Vec<&str> = after["packs"]
+            .as_array()
+            .expect("packs")
+            .iter()
+            .map(|row| row["tier"].as_str().expect("tier"))
+            .collect();
+        assert!(
+            left.iter().all(|tier| *tier == "built-in"),
+            "only the built-in packs are left: {left:?}"
+        );
     }
 
     /// The regression: flattening a `nomnom-pack` error to "could not add

@@ -1,17 +1,17 @@
 //! The pack list one run loads, in `docs/lang.md`'s resolution order.
 //!
 //! `nomnom-pack` resolves tiers 2 to 4 — user, project, `--pack` — and says so
-//! in its own module docs: "The built-in pack is compiled into `nomnom-core`
-//! and is that crate's to put in front." This is that crate doing it, in one
+//! in its own module docs: "The built-in packs are compiled into `nomnom-core`
+//! and are that crate's to put in front." This is that crate doing it, in one
 //! place, so `suggest` and `clean` cannot disagree about what a run loads.
 
 use std::path::{Path, PathBuf};
 
 use nomnom_pack::{Lock, PackSource, Resolver, Store, Tier, Trust};
 
-use super::{TrustedPack, builtin_pack};
+use super::{TrustedPack, builtin_packs};
 
-/// Built-in first, then every pack the lock and the tiers resolve to.
+/// The built-in packs first, then every pack the lock and the tiers resolve to.
 ///
 /// `project_root` is the scan root, which is where `.nomnom/packs.lock` and
 /// `.nomnom/packs/` are looked for — not the shell's working directory, so the
@@ -20,7 +20,7 @@ pub fn resolve_packs(
     project_root: &Path,
     explicit: &[PathBuf],
 ) -> Result<Vec<TrustedPack>, nomnom_pack::Error> {
-    let mut packs = vec![TrustedPack::builtin(builtin_pack().clone())];
+    let mut packs = TrustedPack::builtins();
 
     let store = Store::open()?;
     let lock = Lock::load(project_root)?;
@@ -29,7 +29,9 @@ pub fn resolve_packs(
         packs.push(TrustedPack { pack: source.load()?, trust: source.trust });
     }
 
-    debug_assert!(matches!(packs[0].trust, Trust::Builtin));
+    debug_assert!(
+        packs[..builtin_packs().len()].iter().all(|pack| matches!(pack.trust, Trust::Builtin))
+    );
     Ok(packs)
 }
 
@@ -47,31 +49,34 @@ pub fn resolve_sources(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackRow {
     pub name: String,
-    /// `None` for the built-in pack, which belongs to no resolution tier.
+    /// `None` for a built-in pack, which belongs to no resolution tier.
     pub tier: Option<Tier>,
     pub trust: Trust,
-    /// The pinned commit, or `None` for the built-in pack and for a pack that
+    /// The pinned commit, or `None` for a built-in pack and for a pack that
     /// lives in a directory rather than in git.
     pub sha: Option<String>,
     pub url: Option<String>,
-    /// `None` for the built-in pack, which is compiled in.
+    /// `None` for a built-in pack, which is compiled in.
     pub dir: Option<PathBuf>,
 }
 
-/// The built-in pack, then every pack the project's lock and tiers resolve.
+/// The built-in packs, then every pack the project's lock and tiers resolve.
 pub fn pack_inventory(
     project_root: &Path,
     explicit: &[PathBuf],
 ) -> Result<Vec<PackRow>, nomnom_pack::Error> {
     let lock = Lock::load(project_root)?;
-    let mut rows = vec![PackRow {
-        name: builtin_pack().name.clone(),
-        tier: None,
-        trust: Trust::Builtin,
-        sha: None,
-        url: None,
-        dir: None,
-    }];
+    let mut rows: Vec<PackRow> = builtin_packs()
+        .iter()
+        .map(|pack| PackRow {
+            name: pack.name.clone(),
+            tier: None,
+            trust: Trust::Builtin,
+            sha: None,
+            url: None,
+            dir: None,
+        })
+        .collect();
     for source in resolve_sources(project_root, explicit, &lock)? {
         let locked = lock.get(&source.name);
         rows.push(PackRow {

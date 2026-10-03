@@ -1,4 +1,4 @@
-//! Every rule in the compiled-in built-in pack, on one fixture tree.
+//! Every rule in the compiled-in built-in packs, on one fixture tree.
 //!
 //! The regression this catches is the one a rule pack has: a filter whose
 //! corroboration guard stopped guarding, a confidence that drifted, or a
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use common::{catalog_of, write};
-use nomnom_core::verdict::{Disposition, TrustedPack, builtin_pack, judge};
+use nomnom_core::verdict::{Disposition, TrustedPack, judge};
 use tempfile::TempDir;
 
 /// What a user actually sees about one path.
@@ -32,7 +32,7 @@ struct Row {
     reason: String,
 }
 
-/// Every rule in the built-in pack, on one tree.
+/// Every rule in the built-in packs, on one tree.
 fn fixture() -> TempDir {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
@@ -114,7 +114,7 @@ fn fixture() -> TempDir {
 
 fn rows(tmp: &TempDir) -> BTreeMap<PathBuf, Row> {
     let catalog = catalog_of(tmp.path());
-    judge(&catalog, &[TrustedPack::builtin(builtin_pack().clone())])
+    judge(&catalog, &TrustedPack::builtins())
         .into_iter()
         .map(|(id, verdict)| {
             (
@@ -338,7 +338,7 @@ const EXPECTED: &[(&str, &str, Disposition, f32, &str)] = &[
 ];
 
 #[test]
-fn the_built_in_pack_judges_the_fixture_exactly_as_written() {
+fn the_built_in_packs_judge_the_fixture_exactly_as_written() {
     let tmp = fixture();
     let mut actual = rows(&tmp);
 
@@ -354,4 +354,57 @@ fn the_built_in_pack_judges_the_fixture_exactly_as_written() {
     }
 
     assert!(actual.is_empty(), "the pack judged paths the fixture does not expect: {actual:?}");
+}
+
+/// The pack a provenance names is what `clean --rule 'pack [Title]'` takes, so
+/// a rule that wanders into another pack breaks a command the user already
+/// typed. The regression: a rule landing in the wrong `builtin.<domain>` pack,
+/// or a pack renamed, while the verdict table above still passes.
+#[test]
+fn each_built_in_rule_is_credited_to_the_pack_of_the_toolchain_that_owns_it() {
+    let tmp = fixture();
+    let catalog = catalog_of(tmp.path());
+    for (id, verdict) in judge(&catalog, &TrustedPack::builtins()) {
+        let path = catalog.path(id);
+        let name = path.file_name().expect("a judged path has a name").to_string_lossy();
+        let owner = match name.as_ref() {
+            "installer.iso" => "builtin.downloads",
+            "build" | "dist" | ".cache" | "cache" | "caches" => "builtin.generic",
+            "bin" | "obj" => "builtin.dotnet",
+            ".gradle" => "builtin.gradle",
+            "node_modules" | ".next" => "builtin.node",
+            ".venv" | "venv" | "__pycache__" | ".tox" | ".mypy_cache" | ".pytest_cache" => {
+                "builtin.python"
+            }
+            "target" => "builtin.rust",
+            other => panic!("no owner expected for `{other}`"),
+        };
+        assert_eq!(verdict.provenance.pack, owner, "{}", path.display());
+    }
+}
+
+/// "Later pack wins" on an equal confidence, so a built-in rule that overlaps
+/// another built-in pack's rule makes verdicts depend on the order of the
+/// `PACKS` list. The regression: a new rule that claims a target another
+/// pack's rule already claims — say a `build/` beside a `Cargo.toml` — with
+/// the winner decided by list position rather than by anyone's intent. The
+/// crowded directory puts every corroborating manifest beside every generic
+/// name, which is where such an overlap would surface.
+#[test]
+fn the_built_in_packs_judge_the_same_in_either_order() {
+    let tmp = fixture();
+    let crowded = tmp.path().join("crowded");
+    for marker in ["Cargo.toml", "package.json", "pyproject.toml", "CMakeLists.txt", "App.csproj"] {
+        write(crowded.join(marker), b"{}");
+    }
+    for dir in ["target", "build", "dist", "bin", "obj", "cache", ".cache", "caches"] {
+        write(crowded.join(dir).join("out.bin"), b"built");
+    }
+    let catalog = catalog_of(tmp.path());
+
+    let forward = TrustedPack::builtins();
+    let mut reversed = forward.clone();
+    reversed.reverse();
+
+    assert_eq!(judge(&catalog, &forward), judge(&catalog, &reversed));
 }

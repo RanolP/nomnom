@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 
 use common::{catalog_of, write};
 use nomnom_core::catalog::{Catalog, NodeId};
-use nomnom_core::verdict::{
-    Assessment, Disposition, Label, TrustedPack, Verdict, assess, builtin_pack, rollup,
-};
+use nomnom_core::verdict::{Assessment, Disposition, Label, TrustedPack, Verdict, assess, rollup};
 use tempfile::TempDir;
 
 /// Verdicts keyed by the path they were rendered about.
@@ -34,7 +32,7 @@ fn builtin_verdicts(catalog: &Catalog) -> Vec<(NodeId, Verdict)> {
 }
 
 fn builtin_assessment(catalog: &Catalog) -> Assessment {
-    assess(catalog, vec![TrustedPack::builtin(builtin_pack().clone())])
+    assess(catalog, TrustedPack::builtins())
 }
 
 fn verdict_for(judged: &[(PathBuf, Verdict)], suffix: impl AsRef<Path>) -> Option<&Verdict> {

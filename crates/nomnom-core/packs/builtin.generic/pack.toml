@@ -1,0 +1,6 @@
+name = "builtin.generic"
+version = "1.0.0"
+
+# Every kind this pack uses is built in. A pack that wants a kind of its own
+# declares it here, as `[kinds."name/v1"]` with a `disposition` and a
+# `confidence`.

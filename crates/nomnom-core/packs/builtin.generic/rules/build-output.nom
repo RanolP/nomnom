@@ -1,0 +1,54 @@
+# `build/` and `dist/`, which several toolchains share.
+#
+# No one ecosystem owns these names: npm, Python packaging and CMake all write
+# them. They stay in one pack rather than one per ecosystem because the
+# corroborated rule and its uncorroborated complement must name the same
+# manifest list — split per ecosystem, the "without a manifest" rule would have
+# to list every other pack's manifest, and a directory beside both a
+# `package.json` and a `CMakeLists.txt` would be claimed by two packs at equal
+# confidence.
+#
+# Both names are also ordinary words, so each needs a manifest beside it, and
+# without one the verdict drops to `review`. The alternatives are tried in
+# written order, and the description names the file that actually sits beside
+# the directory.
+
+[build/ beside a manifest]
+description = regenerable: build output, rebuilt by the project's build command — `{$marker}` sits beside it
+kind = build-output/v1
+filter {
+  $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
+  then $dir/build/
+}
+
+[dist/ beside a manifest]
+description = regenerable: build output, rebuilt by the project's build command — `{$marker}` sits beside it
+kind = build-output/v1
+filter {
+  $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
+  then $dir/dist/
+}
+
+# The name matched and nothing backs it up. Still shown, because the human
+# wants to see it, but `review` and low confidence: this is as likely to be
+# their data as it is to be build output.
+
+[build/ without a manifest]
+description = named `build`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `build` is also an ordinary directory name, so this may be your data rather than build output
+kind = build-output/v1
+disposition = review
+confidence = 0.35
+filter {
+  $dir lacks package.json | pyproject.toml | CMakeLists.txt
+  then $dir/build/
+}
+
+[dist/ without a manifest]
+description = named `dist`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `dist` is also an ordinary directory name, so this may be your data rather than build output
+kind = build-output/v1
+disposition = review
+confidence = 0.35
+filter {
+  $dir lacks package.json | pyproject.toml | CMakeLists.txt
+  then $dir/dist/
+}

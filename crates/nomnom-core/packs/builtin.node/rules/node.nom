@@ -1,0 +1,21 @@
+# Directories npm and Next.js rebuild from source.
+#
+# Both names mean the same thing everywhere they appear, so a name is enough.
+# Every target is one decision for its whole subtree, so nothing inside a
+# `node_modules` is judged again on its own.
+
+[node_modules/]
+description = regenerable: npm dependency tree, rebuilt by `npm install`
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/node_modules/
+}
+
+[.next/]
+description = regenerable: Next.js build output, rebuilt by `next build`
+kind = build-output/v1
+confidence = 0.95
+filter {
+  then $p/.next/
+}

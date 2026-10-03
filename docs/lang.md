@@ -180,7 +180,7 @@ Rule files load in file-name order, so rule order — the last conflict tie-brea
 
 Resolution order, later overriding earlier:
 
-1. built-in, compiled into the binary
+1. built-in, compiled into the binary: one pack per ecosystem or app that owns the files, named `builtin.<domain>` — `builtin.generic` (`build/`, `dist/` and caches no one toolchain owns) first, then `builtin.downloads`, `builtin.dotnet`, `builtin.gradle`, `builtin.node`, `builtin.python` and `builtin.rust`, so a pack naming one owner wins a tie against the catch-all
 2. user — `%LOCALAPPDATA%\nomnom\packs\`
 3. project — `./.nomnom/packs/`
 4. `--pack <dir>`, explicit
@@ -196,7 +196,7 @@ Cached at `%LOCALAPPDATA%\nomnom\packs\<host>\<org>\<repo>@<sha>`.
 
 ### Untrusted packs cannot delete
 
-A rule from any pack other than the built-in one is **capped at `disposition = review`** until the user runs `nomnom pack trust <name>`. A pack that declares `reclaimable` is downgraded, and the CLI says why.
+A rule from any pack other than the built-in ones is **capped at `disposition = review`** until the user runs `nomnom pack trust <name>`. A pack that declares `reclaimable` is downgraded, and the CLI says why.
 
 The language is total, so the worst a malicious pack can do is misclassify — but misclassification is precisely the harm here, because the next step deletes files. The cap makes the failure mode "a human is shown a bad suggestion" instead of "a stranger's repository chose what to remove from your disk". Trust is granted per pack, deliberately, once.
 

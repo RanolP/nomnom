@@ -1,4 +1,4 @@
-name = "builtin"
+name = "builtin.rust"
 version = "1.0.0"
 
 # Every kind this pack uses is built in. A pack that wants a kind of its own

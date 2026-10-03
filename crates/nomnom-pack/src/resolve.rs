@@ -2,13 +2,13 @@
 //!
 //! `docs/lang.md` fixes the order, later overriding earlier:
 //!
-//! 1. built-in, compiled into the binary
+//! 1. built-in, the `builtin.<domain>` packs compiled into the binary
 //! 2. user — `%LOCALAPPDATA%\nomnom\packs\`
 //! 3. project — `./.nomnom/packs/`
 //! 4. `--pack <dir>`, explicit
 //!
-//! This resolver returns tiers 2 to 4. The built-in pack is compiled into
-//! `nomnom-core` and is that crate's to put in front.
+//! This resolver returns tiers 2 to 4. The built-in packs are compiled into
+//! `nomnom-core` and are that crate's to put in front.
 //!
 //! Within the user tier, git packs from the lock come first and hand-placed
 //! directories after them, so a directory a user dropped in themselves

@@ -9,7 +9,7 @@
 //! - **locked.** `.nomnom/packs.lock` is what a project loads. Content that
 //!   drifts under a fixed commit is a supply-chain event and an error, not an
 //!   upgrade.
-//! - **capped.** A rule from any pack but the built-in one is capped at
+//! - **capped.** A rule from any pack but the built-in ones is capped at
 //!   `disposition = review` until the pack is trusted, and the cap is a value
 //!   the judge applies so the CLI can say why.
 //!

@@ -55,9 +55,14 @@ pub struct TrustedPack {
 }
 
 impl TrustedPack {
-    /// The pack compiled into the binary. `docs/lang.md`: never capped.
+    /// A pack compiled into the binary. `docs/lang.md`: never capped.
     pub fn builtin(pack: Pack) -> TrustedPack {
         TrustedPack { pack, trust: Trust::Builtin }
+    }
+
+    /// Every built-in pack, in resolution order.
+    pub fn builtins() -> Vec<TrustedPack> {
+        super::builtin_packs().iter().cloned().map(TrustedPack::builtin).collect()
     }
 }
 
