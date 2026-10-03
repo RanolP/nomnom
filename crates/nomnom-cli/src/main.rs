@@ -88,19 +88,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List the drive's cleanup candidates, or plan the ones named. Nothing is
-    /// selected unless named; dry-run unless `--apply` is given, which sends
-    /// the named paths to the recycle bin.
+    /// List the drive's cleanup candidates grouped by rule, or plan the rules
+    /// approved. Nothing is planned unless approved; dry-run unless `--apply`
+    /// is given, which sends the planned paths to the recycle bin.
     Clean {
         #[command(flatten)]
         scan: ScanArgs,
         #[command(flatten)]
         packs: PackArgs,
-        /// Candidates to plan, as `nomnom clean <DRIVE>` lists them. With none,
-        /// the candidates are listed and nothing is planned.
+        /// Single candidates to plan, as `nomnom clean <DRIVE>` lists them.
         #[arg(value_name = "PATH")]
         paths: Vec<PathBuf>,
-        /// Actually carry the plan out. Requires at least one PATH.
+        /// Approve a rule: plan every candidate it matched, minus exclusions.
+        /// Its `[Title]`, or `pack [Title]` when two packs share the title.
+        /// Repeatable.
+        #[arg(long = "rule", value_name = "RULE")]
+        rules: Vec<String>,
+        /// Keep a path, and everything under it, out of every plan on this
+        /// drive. Persists in `<DRIVE>\.nomnom\exclusions.toml`. Repeatable.
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<PathBuf>,
+        /// Remove a path from the drive's exclusion list. Repeatable.
+        #[arg(long, value_name = "PATH")]
+        unexclude: Vec<PathBuf>,
+        /// List the drive's exclusions. Alone, or with only exclusion edits,
+        /// nothing is scanned.
+        #[arg(long)]
+        exclusions: bool,
+        /// Actually carry the plan out. Requires a --rule or a PATH.
         #[arg(long)]
         apply: bool,
         /// Also act on `review` verdicts, which the evidence does not carry on
@@ -173,17 +188,28 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Suggest { scan, packs, json } => {
             suggest::run(&scan.drive, scan.show_errors, &packs.packs, json)
         }
-        Command::Clean { scan, packs, paths, apply, include_review, json } => {
-            clean::run(clean::Request {
-                drive: &scan.drive,
-                show_errors: scan.show_errors,
-                packs: &packs.packs,
-                paths: &paths,
-                apply,
-                include_review,
-                json,
-            })
-        }
+        Command::Clean {
+            scan,
+            packs,
+            paths,
+            rules,
+            exclude,
+            unexclude,
+            exclusions,
+            apply,
+            include_review,
+            json,
+        } => clean::run(clean::Request {
+            drive: &scan.drive,
+            show_errors: scan.show_errors,
+            packs: &packs.packs,
+            paths: &paths,
+            rules: &rules,
+            edits: clean::Edits { exclude: &exclude, unexclude: &unexclude, list: exclusions },
+            apply,
+            include_review,
+            json,
+        }),
         Command::Pack { drive, command } => pack::run(drive, command),
     }
 }

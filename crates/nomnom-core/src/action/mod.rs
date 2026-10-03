@@ -17,13 +17,17 @@
 mod apply;
 mod candidates;
 mod display;
+mod exclusions;
 mod plan;
 
 use std::path::PathBuf;
 
 pub use apply::{ActionKind, ApplyRecord, ApplyReport, RecordStatus, apply};
-pub use candidates::{candidates, plan_from};
+pub use candidates::{
+    Approval, RuleGroup, RuleLookupError, approved, by_rule, candidates, find_rule, plan_from,
+};
 pub use display::plain;
+pub use exclusions::{ExclusionError, Exclusions};
 pub use plan::{Action, Justification, Plan, PlanEntry};
 
 /// Why an action was refused.

@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use humansize::{BINARY, format_size};
-use nomnom_core::action::{ActionError, Plan, candidates, plan_from};
+use nomnom_core::action::{
+    ActionError, Approval, ExclusionError, Exclusions, Plan, RuleGroup, approved, by_rule,
+    candidates, plan_from,
+};
 use nomnom_core::catalog::{Catalog, NodeId};
-use nomnom_core::verdict::{Assessment, Entry};
+use nomnom_core::verdict::{Assessment, Provenance};
 
 pub fn size(bytes: u64) -> String {
     format_size(bytes, BINARY)
@@ -110,16 +113,22 @@ impl TreeModel {
     }
 }
 
-/// What the Clean screen will hand to `plan_from`: the include-review toggle
-/// and the entries the user checked.
+/// What the Clean screen will hand to `plan_from`: the include-review toggle,
+/// the rules the user approved, and the drive's persisted exclusions.
 ///
-/// Opt-in: nothing is in the plan until the user checks it, matching
-/// `nomnom clean`, which plans only the paths named on its command line.
-/// Include-review only widens what can be checked; it never checks anything.
+/// Opt-in: nothing is in the plan until the user approves a rule, matching
+/// `nomnom clean --rule`. Approvals belong to one assessment and clear with
+/// it; exclusions belong to the drive and are reloaded from
+/// `.nomnom/exclusions.toml`, so they survive rescans and restarts. An
+/// exclusion only ever removes a path from the plan. Include-review only
+/// widens what can be approved; it never approves anything.
 #[derive(Debug, Default, Clone)]
 pub struct Selection {
     pub include_review: bool,
-    checked: HashSet<PathBuf>,
+    approval: Approval,
+    exclusions: Exclusions,
+    /// The drive the exclusions were loaded from and are saved to.
+    root: Option<PathBuf>,
 }
 
 /// The dry run the Clean screen previews and Apply carries out.
@@ -130,49 +139,84 @@ pub struct Preview {
 }
 
 impl Selection {
-    pub fn is_checked(&self, path: &str) -> bool {
-        self.checked.contains(Path::new(path))
+    /// What a new assessment of the drive at `root` does: every approval is
+    /// dropped, since a rule approved against other matches is not an
+    /// approval of these, and the drive's exclusions are read back.
+    pub fn reassessed(&mut self, root: &Path) -> Result<(), ExclusionError> {
+        self.approval = Approval::default();
+        self.root = Some(root.to_path_buf());
+        self.exclusions = Exclusions::default();
+        self.exclusions = Exclusions::load(root)?;
+        Ok(())
     }
 
-    pub fn set_checked(&mut self, path: &str, checked: bool) {
-        if checked {
-            self.checked.insert(PathBuf::from(path));
+    /// Drop every approval, keeping the toggle and the exclusions. Called
+    /// after an apply: what was approved is applied.
+    pub fn clear(&mut self) {
+        self.approval = Approval::default();
+    }
+
+    pub fn is_approved(&self, rule: &Provenance) -> bool {
+        self.approval.rules.contains(rule)
+    }
+
+    pub fn set_approved(&mut self, rule: &Provenance, approved: bool) {
+        if approved {
+            self.approval.rules.insert(rule.clone());
         } else {
-            self.checked.remove(Path::new(path));
+            self.approval.rules.remove(rule);
         }
     }
 
-    /// Uncheck everything, keeping the include-review toggle. Called when a new
-    /// assessment lands and after an apply: a choice made against other
-    /// entries is not a choice about these.
-    pub fn clear(&mut self) {
-        self.checked.clear();
+    pub fn exclusions(&self) -> &Exclusions {
+        &self.exclusions
     }
 
-    /// How many of the current candidates the user checked.
-    pub fn checked_count(&self, assessment: &Assessment) -> usize {
-        self.candidates(assessment).iter().filter(|entry| self.is_checked(&entry.path)).count()
+    /// The exclusion keeping `path` out of plans, itself or an ancestor.
+    pub fn excluded_by(&self, path: &str) -> Option<&Path> {
+        self.exclusions.covering(Path::new(path))
     }
 
-    /// Every entry the dispositions allow the user to check, biggest group
-    /// first.
-    pub fn candidates<'a>(&self, assessment: &'a Assessment) -> Vec<&'a Entry> {
-        candidates(assessment, self.include_review)
+    /// Adds `path` to, or removes it from, the drive's exclusion list and
+    /// saves it. Memory changes only once the file is written, so what the
+    /// screen shows is what the next session loads.
+    pub fn set_excluded(&mut self, path: &Path, excluded: bool) -> Result<(), ExclusionError> {
+        let Some(root) = self.root.clone() else { return Ok(()) };
+        let mut next = self.exclusions.clone();
+        if excluded {
+            next.add(&root, path)?;
+        } else {
+            next.remove(path);
+        }
+        next.save(&root)?;
+        self.exclusions = next;
+        Ok(())
+    }
+
+    /// How many paths the approvals put in the plan, after exclusions.
+    pub fn planned_count(&self, assessment: &Assessment) -> usize {
+        approved(assessment, &self.approval, &self.exclusions, self.include_review).len()
+    }
+
+    /// The candidates grouped by rule, biggest rule first.
+    pub fn groups<'a>(&self, assessment: &'a Assessment) -> Vec<RuleGroup<'a>> {
+        by_rule(&candidates(assessment, self.include_review))
     }
 
     pub fn preview(&self, assessment: &Assessment) -> Result<Preview, ActionError> {
-        let (plan, refused) = plan_from(assessment, &self.checked, self.include_review)?;
+        let (plan, refused) =
+            plan_from(assessment, &self.approval, &self.exclusions, self.include_review)?;
         Ok(Preview { plan, refused })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nomnom_core::verdict::{Disposition, Group, Label, Provenance, Verdict};
+    use nomnom_core::verdict::{Disposition, Entry, Group, Label, Verdict};
 
     use super::*;
 
-    fn entry(path: &Path, disposition: Disposition) -> Entry {
+    fn entry(path: &Path, disposition: Disposition, rule: &str) -> Entry {
         std::fs::create_dir_all(path).unwrap();
         Entry {
             path: path.display().to_string(),
@@ -182,7 +226,7 @@ mod tests {
                 disposition,
                 confidence: 1.0,
                 reason: "test".into(),
-                provenance: Provenance::new("p", "r"),
+                provenance: Provenance::new("p", rule),
                 capped: None,
             },
             reach: None,
@@ -205,92 +249,130 @@ mod tests {
             .plan
             .actions()
             .iter()
-            .map(|e| e.action.path().file_name().unwrap().to_string_lossy().into_owned())
+            .map(|e| {
+                let path = e.action.path();
+                let parent = path.parent().unwrap().file_name().unwrap().to_string_lossy();
+                format!("{parent}/{}", path.file_name().unwrap().to_string_lossy())
+            })
             .collect();
         names.sort();
         names
     }
 
-    // Catches "Files to delete" filling itself with every reclaimable verdict
-    // before the user checks anything, or again once a new assessment lands —
-    // the opt-out selection that put unpicked paths behind Reclaim.
+    fn rule(name: &str) -> Provenance {
+        Provenance::new("p", name)
+    }
+
+    /// Two Cargo-like `target/` matches of one rule, and a cache of another.
+    fn fixture(root: &Path) -> Assessment {
+        assessment(
+            root,
+            vec![
+                entry(&root.join("alpha").join("target"), Disposition::Reclaimable, "target"),
+                entry(&root.join("beta").join("target"), Disposition::Reclaimable, "target"),
+                entry(&root.join("web").join("cache"), Disposition::Reclaimable, "cache"),
+            ],
+        )
+    }
+
+    // Catches "Files to delete" filling itself before the user approves any
+    // rule — the opt-out selection that put unpicked paths behind Reclaim.
     #[test]
-    fn fresh_and_reassessed_selections_plan_nothing() {
+    fn a_fresh_selection_plans_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let a = entry(&root.join("a"), Disposition::Reclaimable);
-        let a_path = a.path.clone();
-        let assessment =
-            assessment(&root, vec![a, entry(&root.join("b"), Disposition::Reclaimable)]);
-
+        let assessment = fixture(&root);
         let mut selection = Selection::default();
+        selection.reassessed(&root).unwrap();
         let plan = selection.preview(&assessment).unwrap().plan;
         assert!(plan.is_empty());
-        assert_eq!(plan.total_bytes(), 0);
-        assert_eq!(selection.checked_count(&assessment), 0);
+        assert_eq!(selection.planned_count(&assessment), 0);
+    }
 
-        selection.set_checked(&a_path, true);
+    // Catches an approved rule not reaching the plan, pulling in another
+    // rule's matches, or an excluded match still being trashed on Apply.
+    #[test]
+    fn an_approved_rule_plans_its_matches_minus_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let assessment = fixture(&root);
+        let mut selection = Selection::default();
+        selection.reassessed(&root).unwrap();
+
+        selection.set_approved(&rule("target"), true);
+        assert_eq!(planned(&selection, &assessment), ["alpha/target", "beta/target"]);
+
+        selection.set_excluded(&root.join("beta").join("target"), true).unwrap();
+        assert_eq!(planned(&selection, &assessment), ["alpha/target"]);
+        assert_eq!(selection.planned_count(&assessment), 1);
+
+        selection.set_excluded(&root.join("beta").join("target"), false).unwrap();
+        assert_eq!(planned(&selection, &assessment), ["alpha/target", "beta/target"]);
+
+        selection.set_approved(&rule("target"), false);
+        assert!(planned(&selection, &assessment).is_empty());
+    }
+
+    // Catches a rescan carrying an approval over to matches the user never
+    // saw, and a rescan (or restart) forgetting an exclusion so the user's
+    // active `target/` is back on the next plan.
+    #[test]
+    fn a_new_assessment_clears_approvals_but_keeps_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let assessment = fixture(&root);
+        let mut selection = Selection::default();
+        selection.reassessed(&root).unwrap();
         selection.include_review = true;
+        selection.set_approved(&rule("target"), true);
+        selection.set_excluded(&root.join("beta"), true).unwrap();
+
         // What the Clean screen does when `Assessed` fires.
-        selection.clear();
-        let plan = selection.preview(&assessment).unwrap().plan;
-        assert!(plan.is_empty());
-        assert_eq!(plan.total_bytes(), 0);
-        assert!(selection.include_review, "clearing must keep the toggle");
+        selection.reassessed(&root).unwrap();
+        assert!(!selection.is_approved(&rule("target")));
+        assert!(planned(&selection, &assessment).is_empty());
+        assert!(selection.include_review, "a new assessment must keep the toggle");
+        assert!(
+            selection
+                .excluded_by(&root.join("beta").join("target").display().to_string())
+                .is_some()
+        );
+
+        // A fresh session reads the same list off disk.
+        let mut restarted = Selection::default();
+        restarted.reassessed(&root).unwrap();
+        restarted.set_approved(&rule("target"), true);
+        assert_eq!(planned(&restarted, &assessment), ["alpha/target"]);
     }
 
-    // Catches a checked box not reaching the plan, or an unchecked one still
-    // trashing its path on Apply.
+    // Catches "include review" approving review entries on its own, and an
+    // approved rule's `review` match reaching the plan with the toggle off.
     #[test]
-    fn only_checked_entries_reach_the_plan() {
+    fn include_review_widens_candidates_but_approves_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let a = entry(&root.join("a"), Disposition::Reclaimable);
-        let b = entry(&root.join("b"), Disposition::Reclaimable);
-        let (a_path, b_path) = (a.path.clone(), b.path.clone());
-        let assessment = assessment(&root, vec![a, b]);
-
-        let mut selection = Selection::default();
-        selection.set_checked(&a_path, true);
-        assert_eq!(planned(&selection, &assessment), ["a"]);
-        assert_eq!(selection.checked_count(&assessment), 1);
-
-        selection.set_checked(&b_path, true);
-        assert_eq!(planned(&selection, &assessment), ["a", "b"]);
-
-        selection.set_checked(&a_path, false);
-        assert_eq!(planned(&selection, &assessment), ["b"]);
-    }
-
-    // Catches "include review" checking review entries on its own, and a
-    // checked `review` entry reaching the plan with the toggle off.
-    #[test]
-    fn include_review_widens_candidates_but_checks_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let maybe = entry(&root.join("maybe"), Disposition::Review);
-        let maybe_path = maybe.path.clone();
         let assessment = assessment(
             &root,
             vec![
-                entry(&root.join("gone"), Disposition::Reclaimable),
-                maybe,
-                entry(&root.join("kept"), Disposition::Keep),
+                entry(&root.join("a").join("gone"), Disposition::Reclaimable, "r"),
+                entry(&root.join("a").join("maybe"), Disposition::Review, "m"),
+                entry(&root.join("a").join("kept"), Disposition::Keep, "k"),
             ],
         );
 
         let mut selection = Selection::default();
-        assert_eq!(selection.candidates(&assessment).len(), 1);
+        selection.reassessed(&root).unwrap();
+        assert_eq!(selection.groups(&assessment).len(), 1);
 
         selection.include_review = true;
-        assert_eq!(selection.candidates(&assessment).len(), 2);
+        assert_eq!(selection.groups(&assessment).len(), 2);
         assert!(planned(&selection, &assessment).is_empty());
 
-        selection.set_checked(&maybe_path, true);
-        assert_eq!(planned(&selection, &assessment), ["maybe"]);
+        selection.set_approved(&rule("m"), true);
+        assert_eq!(planned(&selection, &assessment), ["a/maybe"]);
 
         selection.include_review = false;
         assert!(planned(&selection, &assessment).is_empty());
-        assert_eq!(selection.checked_count(&assessment), 0);
+        assert_eq!(selection.planned_count(&assessment), 0);
     }
 }

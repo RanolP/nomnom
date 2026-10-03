@@ -10,15 +10,18 @@ Find what is eating your disk, say what each path is and why, and reclaim it thr
 cargo run -p nomnom-cli -- drives               # fixed drives: label, filesystem, used, free, total
 cargo run -p nomnom-cli -- scan C:\             # the tree, biggest first
 cargo run -p nomnom-cli -- suggest D:           # what each path is, and why
-cargo run -p nomnom-cli -- clean D:             # list the cleanup candidates; selects nothing
-cargo run -p nomnom-cli -- clean D: D:\proj\node_modules          # dry-run plan of only the named paths
+cargo run -p nomnom-cli -- clean D:             # list the cleanup candidates grouped by rule; approves nothing
+cargo run -p nomnom-cli -- clean D: --rule "Cargo target/"        # dry-run plan of every match of that rule, minus exclusions
+cargo run -p nomnom-cli -- clean D: --rule "Cargo target/" --apply  # move them to the recycle bin
+cargo run -p nomnom-cli -- clean D: --exclude D:\work\active      # keep a path and its subtree out of every plan, across scans
+cargo run -p nomnom-cli -- clean D: --exclusions                  # list the drive's exclusions (no scan)
 cargo run -p nomnom-cli -- clean D: D:\proj\node_modules --apply  # move only the named paths to the recycle bin
 cargo run -p nomnom-cli -- pack list --drive D: # the rule packs a drive's runs load
 ```
 
-`clean` is opt-in: nothing is planned until you name it. `nomnom clean <DRIVE>` lists the candidates (every `reclaimable` verdict, plus every `review` one with `--include-review`) and plans nothing. `nomnom clean <DRIVE> <PATH>... [--apply]` plans only the named paths; each must be one of the listed candidates, and any other path fails the command with its name. `--apply` with no paths is an error.
+`clean` is opt-in, and you approve rules rather than files. `nomnom clean <DRIVE>` lists the candidates (every `reclaimable` verdict, plus every `review` one with `--include-review`) grouped by the rule that matched them, as `pack [Title]`, and plans nothing. `--rule <RULE>` (repeatable; the title, or `pack [Title]` when two packs share it) approves a rule, which plans every one of its matches except the excluded ones. `nomnom clean <DRIVE> <PATH>...` plans single candidates; any path that is not a listed candidate fails the command with its name. `--apply` with no rule and no path is an error. Approvals last one run. Exclusions persist: `--exclude <PATH>` keeps a path and everything under it out of every plan on that drive, `--unexclude <PATH>` takes it back, and `--exclusions` lists them. The list lives at `<drive>\.nomnom\exclusions.toml`, and an exclusion can only shrink a plan, never add to it.
 
-The CLI and the GUI offer the same features: `drives`, `scan`, `suggest`, `clean <PATH>... --apply` and `pack` are the GUI's Drives, Tree, files-to-delete list, Reclaim button and Packs.
+The CLI and the GUI offer the same features: `drives`, `scan`, `suggest`, `clean --rule … --exclude … --apply` and `pack` are the GUI's Drives, Tree, rule list (approve a rule, open it to see and exclude its matches, undo exclusions in its Exclusions panel), Reclaim button and Packs.
 
 `--json` gives machine-readable output on every command. A scan reads the NTFS Master File Table, which is much faster than walking the drive: when the shell is not already Administrator, nomnom asks through a UAC prompt, and if you decline it walks the drive instead and says so. In a terminal, a progress line shows the percent done, the entry count and the elapsed time. The pack lock a drive's runs obey lives at `<drive>\.nomnom\packs.lock`, the same file the GUI's Packs screen edits; `pack` commands use the working directory's drive unless `--drive` names another.
 
