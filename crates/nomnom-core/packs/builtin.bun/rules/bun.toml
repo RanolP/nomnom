@@ -1,12 +1,13 @@
 # Bun's global install cache, `~/.bun/install/cache`. Bun's own docs state the
 # default: "Bun stores every package downloaded from the registry in a global
 # cache at ~/.bun/install/cache" (https://bun.com/docs/pm/global-cache).
-[Bun install cache]
-description = Bun's package install cache; Bun re-downloads packages on the next install
-kind = cache/v1
-filter {
-  $c.dir.name == "cache"
-  $c under .bun/
-  $c under install/
-  then $c/
-}
+[[rule]]
+title = "Bun install cache"
+description = "Bun's package install cache; Bun re-downloads packages on the next install"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "cache"
+$c under .bun/
+$c under install/
+then $c/
+'''

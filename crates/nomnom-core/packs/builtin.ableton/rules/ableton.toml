@@ -1,50 +1,54 @@
 # The installed application. Live's executable and engine sit together in
 # the install folder's `Program`, whatever the edition is called.
 
-[Ableton Live application]
-description = the Ableton Live application — it holds `{$exe}`; uninstall it from Windows Settings
-kind = application/v1
-filter {
-  $p has "Ableton Live *.exe" as $exe
-  $p has "Ableton Live Engine.dll"
-  then $p/
-}
+[[rule]]
+title = "Ableton Live application"
+description = "the Ableton Live application — it holds `{$exe}`; uninstall it from Windows Settings"
+kind = "application/v1"
+filter = '''
+$p has "Ableton Live *.exe" as $exe
+$p has "Ableton Live Engine.dll"
+then $p/
+'''
 
 # The Core Library and the rest of Live's bundled resources, beside
 # `Program`. `GUI.alp` is Live's own interface archive.
 
-[Ableton Live resources]
-description = Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`
-kind = application/v1
-filter {
-  $r has GUI.alp
-  $r has "Core Library"
-  then $r/
-}
+[[rule]]
+title = "Ableton Live resources"
+description = "Ableton Live's bundled resources and Core Library — it holds Live's `GUI.alp`"
+kind = "application/v1"
+filter = '''
+$r has GUI.alp
+$r has "Core Library"
+then $r/
+'''
 
 # One preferences folder per Live version. Ableton's crash-report article
 # states the path (https://help.ableton.com/hc/en-us/articles/209071629-Where-to-find-Crash-Reports):
 # "Windows - \Users\[username]\AppData\Roaming\Ableton\Live x.x.x\Preferences\Log.txt".
 # The two configuration files Live writes there are the evidence.
 
-[Ableton Live preferences]
-description = Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`
-kind = settings/v1
-filter {
-  $p has Preferences.cfg
-  $p has Library.cfg
-  then $p/
-}
+[[rule]]
+title = "Ableton Live preferences"
+description = "Ableton Live's preferences for one version — it holds Live's `Preferences.cfg` and `Library.cfg`"
+kind = "settings/v1"
+filter = '''
+$p has Preferences.cfg
+$p has Library.cfg
+then $p/
+'''
 
 # Live's browser index, one file per Live version.
 
-[Ableton Live database]
-description = Ableton Live's browser database — it holds `{$db}`
-kind = settings/v1
-filter {
-  $d has "Live-files-*.db" as $db
-  then $d/
-}
+[[rule]]
+title = "Ableton Live database"
+description = "Ableton Live's browser database — it holds `{$db}`"
+kind = "settings/v1"
+filter = '''
+$d has "Live-files-*.db" as $db
+then $d/
+'''
 
 # The User Library. Live's manual states the default
 # (https://www.ableton.com/en/live-manual/12/working-with-the-browser/):
@@ -52,26 +56,28 @@ filter {
 # is first installed: Windows: \Users\<username>\Documents\Ableton\User Library".
 # It holds the user's own presets and samples, which nothing can restore.
 
-[Ableton User Library]
-description = your Ableton User Library: your own presets, samples, clips and templates
-kind = user-content/v1
-filter {
-  $u.dir.name == "User Library"
-  $u under Ableton/
-  then $u/
-}
+[[rule]]
+title = "Ableton User Library"
+description = "your Ableton User Library: your own presets, samples, clips and templates"
+kind = "user-content/v1"
+filter = '''
+$u.dir.name == "User Library"
+$u under Ableton/
+then $u/
+'''
 
 # Live writes `Ableton Project Info` into the root of every Live Project,
 # wherever it is saved: the user's own Sets, Live's recordings, and every
 # installed Pack.
 
-[Ableton Live Project]
-description = an Ableton Live Project — it holds Live's `Ableton Project Info`
-kind = user-content/v1
-filter {
-  $p has "Ableton Project Info"
-  then $p/
-}
+[[rule]]
+title = "Ableton Live Project"
+description = "an Ableton Live Project — it holds Live's `Ableton Project Info`"
+kind = "user-content/v1"
+filter = '''
+$p has "Ableton Project Info"
+then $p/
+'''
 
 # Decoded copies of compressed samples. Live's manual
 # (https://www.ableton.com/en/live-manual/12/managing-files-and-sets/) says
@@ -82,11 +88,12 @@ filter {
 # Cache folder sits in `%LocalAppData%\Ableton` beside Live's `Live Database`,
 # which is the evidence that this `Ableton` folder is Live's.
 
-[Ableton Live decoding cache]
-description = Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)
-kind = cache/v1
-disposition = review
-filter {
-  $a has "Live Database"
-  then $a/Cache/Cache/Decoding/
-}
+[[rule]]
+title = "Ableton Live decoding cache"
+description = "Ableton Live's decoding cache; Live decodes compressed samples again when a Set loads them (close Live first)"
+kind = "cache/v1"
+disposition = "review"
+filter = '''
+$a has "Live Database"
+then $a/Cache/Cache/Decoding/
+'''

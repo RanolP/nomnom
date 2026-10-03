@@ -19,12 +19,12 @@ fn pack(root: &Path, name: &str, rules: &[(&str, &str)]) -> TrustedPack {
         .iter()
         .map(|(title, then)| {
             format!(
-                "[{title}]\ndescription = test rule {title}\nkind = cache/v1\n\
-                 filter {{\n  then {then}\n}}\n\n"
+                "[[rule]]\ntitle = \"{title}\"\ndescription = \"test rule {title}\"\n\
+                 kind = \"cache/v1\"\nfilter = 'then {then}'\n\n"
             )
         })
         .collect();
-    write(dir.join("rules").join("main.nom"), text.as_bytes());
+    write(dir.join("rules").join("main.toml"), text.as_bytes());
     TrustedPack::builtin(nomnom_lang::pack::load(&dir).expect("a loadable pack"))
 }
 

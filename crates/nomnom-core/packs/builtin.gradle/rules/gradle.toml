@@ -1,0 +1,41 @@
+# Gradle's project cache directory and the caches under `GRADLE_USER_HOME`.
+
+# Every project build writes `.gradle/buildOutputCleanup/` in the root project.
+[[rule]]
+title = "Gradle project .gradle/"
+description = "regenerable: Gradle project cache, rebuilt on the next Gradle run — it holds Gradle's `buildOutputCleanup`"
+kind = "build-output/v1"
+filter = '''
+$g.dir.name == ".gradle"
+$g has buildOutputCleanup
+then $g/
+'''
+
+# `~/.gradle/caches`, whose dependency cache is `modules-2`.
+[[rule]]
+title = "Gradle dependency caches"
+description = "Gradle's dependency and transform caches; Gradle re-downloads and recomputes on the next build"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "caches"
+$c under .gradle/
+$c has modules-2
+then $c/
+'''
+
+# Gradle distributions the wrapper downloaded. Gradle's own directory-layout
+# docs place them at `wrapper/dists` under `GRADLE_USER_HOME` (default
+# `~/.gradle`): "Distributions downloaded by the Gradle Wrapper."
+# (https://docs.gradle.org/current/userguide/directory_layout.html)
+# A build re-downloads its own version, but these are toolchains, so review
+# only.
+[[rule]]
+title = "Gradle wrapper distributions"
+description = "Gradle distributions downloaded by the Gradle wrapper; the wrapper downloads its version again on the next build"
+kind = "cache/v1"
+disposition = "review"
+filter = '''
+$w.dir.name == "wrapper"
+$w under .gradle/
+then $w/dists/
+'''

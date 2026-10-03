@@ -1,0 +1,10 @@
+# Dart's `.dart_tool/`, where `dart pub get` writes `package_config.json`.
+[[rule]]
+title = "Dart .dart_tool/"
+description = "regenerable: Dart tool state, rebuilt by `dart pub get` — it holds pub's `package_config.json`"
+kind = "build-output/v1"
+filter = '''
+$d.dir.name == ".dart_tool"
+$d has package_config.json
+then $d/
+'''

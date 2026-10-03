@@ -3,7 +3,7 @@
 //! ```text
 //! mypack/
 //!   pack.toml     name, version, the kinds it declares
-//!   rules/*.nom
+//!   rules/*.toml  `[[rule]]` tables
 //! ```
 //!
 //! ```toml
@@ -37,8 +37,8 @@ pub struct Pack {
     pub version: String,
     /// Kinds this pack declares, beyond [`Kinds::builtin`].
     pub kinds: Vec<Kind>,
-    /// Rules in load order: `rules/*.nom` sorted by file name, then by
-    /// position within each file. `docs/lang.md` makes rule order the
+    /// Rules in load order: `rules/*.toml` sorted by file name, then by
+    /// position within each file's `[[rule]]` array. `docs/lang.md` makes rule order the
     /// tie-break within a pack, so the order has to be a property of the directory
     /// rather than of the filesystem's readdir order.
     pub rules: Vec<LoadedRule>,
@@ -48,7 +48,7 @@ pub struct Pack {
 #[derive(Debug, Clone)]
 pub struct LoadedRule {
     pub rule: Rule,
-    /// The `.nom` file it came from.
+    /// The rule file it came from.
     pub file: PathBuf,
 }
 
@@ -85,22 +85,31 @@ struct KindDecl {
     confidence: Option<toml::Value>,
 }
 
-/// Read `dir/pack.toml` and every `dir/rules/*.nom`, validating both.
+/// Read `dir/pack.toml` and every `dir/rules/*.toml`, validating both.
 pub fn load(dir: &Path) -> Result<Pack, PackError> {
     let manifest_path = dir.join("pack.toml");
     let manifest = Source::new(display(&manifest_path), read(&manifest_path)?);
 
     let rules_dir = dir.join("rules");
     let mut files: Vec<PathBuf> = match fs::read_dir(&rules_dir) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "nom"))
-            .collect(),
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).collect(),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(source) => return Err(PackError::Io { path: rules_dir, source }),
     };
     files.sort();
+    // The glob below skips a `.nom` file, so a pack written before rule files
+    // became TOML would load with zero rules and no word about why.
+    if let Some(old) = files.iter().find(|path| path.extension().is_some_and(|ext| ext == "nom")) {
+        let source = Source::new(display(old), read(old)?);
+        let first_line = source.text.find('\n').unwrap_or(source.text.len());
+        return Err(Diagnostic::new(&source, Span::new(0, first_line), "rule file in the old format")
+            .with_label("`.nom` rule files are no longer read")
+            .with_help(
+                "rule files are TOML now: rename to .toml and convert to [[rule]] tables (see docs/lang.md)",
+            )
+            .into());
+    }
+    files.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
 
     let mut sources = Vec::with_capacity(files.len());
     for file in files {

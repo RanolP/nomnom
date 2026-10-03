@@ -32,8 +32,11 @@ impl Facts for Node {
 /// One filter line, parsed the way a pack author writes it.
 fn test(line: &str) -> FieldTest {
     let source = Source::new(
-        "t.nom",
-        format!("[t]\ndescription = e\nkind = cache/v1\nfilter {{\n  {line}\n  then $f\n}}\n"),
+        "t.toml",
+        format!(
+            "[[rule]]\ntitle = \"t\"\ndescription = \"e\"\nkind = \"cache/v1\"\n\
+             filter = '''\n{line}\nthen $f\n'''\n"
+        ),
     );
     let mut rules =
         parse(&source, &Kinds::builtin()).unwrap_or_else(|d| panic!("expected a parse, got:\n{d}"));

@@ -9,8 +9,8 @@ use tempfile::TempDir;
 
 fn rule_text(title: &str, kind: &str) -> String {
     format!(
-        "[{title}]\ndescription = a `marker` file sits inside it\nkind = {kind}\n\
-         filter {{\n  $d has marker\n  then $d/\n}}\n"
+        "[[rule]]\ntitle = \"{title}\"\ndescription = \"a `marker` file sits inside it\"\n\
+         kind = \"{kind}\"\nfilter = '''\n$d has marker\nthen $d/\n'''\n"
     )
 }
 
@@ -35,7 +35,7 @@ const RUST_MANIFEST: &str = "name = \"rust\"\nversion = \"0.2.0\"\n\n\
     [kinds.\"toolchain-cache/v1\"]\ndisposition = \"review\"\n";
 
 /// The whole-directory happy path: manifest fields and declared kinds land,
-/// both `.nom` files are read, and rules come back in a deterministic order.
+/// both `.toml` rule files are read, and rules come back in a deterministic order.
 /// Rule order is the tie-break within a pack in `docs/lang.md`, so a
 /// readdir-order-dependent load would make verdicts differ between machines.
 #[test]
@@ -43,8 +43,8 @@ fn a_pack_directory_loads_every_rule_file_in_a_stable_order() {
     let dir = pack_dir(
         RUST_MANIFEST,
         &[
-            ("b-second.nom", rule_text("second", "toolchain-cache/v1")),
-            ("a-first.nom", rule_text("first", "build-output/v1")),
+            ("b-second.toml", rule_text("second", "toolchain-cache/v1")),
+            ("a-first.toml", rule_text("first", "build-output/v1")),
         ],
     );
 
@@ -57,7 +57,7 @@ fn a_pack_directory_loads_every_rule_file_in_a_stable_order() {
     let titles: Vec<&str> = pack.rules.iter().map(|r| r.rule.title.value.as_str()).collect();
     assert_eq!(titles, ["first", "second"], "sorted by file name, not by readdir order");
     assert_eq!(pack.rules[1].rule.disposition, Disposition::Review, "the declared kind's default");
-    assert!(pack.rules[0].file.ends_with("a-first.nom"), "provenance points at the source file");
+    assert!(pack.rules[0].file.ends_with("a-first.toml"), "provenance points at the source file");
 }
 
 /// Catches a pack using a kind it never declared: nothing downstream would
@@ -66,7 +66,7 @@ fn a_pack_directory_loads_every_rule_file_in_a_stable_order() {
 fn a_rule_using_an_undeclared_kind_refuses_the_pack() {
     let dir = pack_dir(
         "name = \"rust\"\nversion = \"0.1.0\"\n",
-        &[("one.nom", rule_text("only", "toolchain-cache/v1"))],
+        &[("one.toml", rule_text("only", "toolchain-cache/v1"))],
     );
     let rendered = diagnostic_of(load(dir.path()).expect_err("undeclared kind"));
     assert!(rendered.contains("unknown kind `toolchain-cache/v1`"), "{rendered}");
@@ -114,12 +114,12 @@ fn an_unknown_manifest_key_is_rejected() {
 fn duplicate_rule_titles_across_files_are_rejected() {
     let dir = pack_dir(
         "name = \"rust\"\nversion = \"0.1.0\"\n",
-        &[("a.nom", rule_text("same", "cache/v1")), ("b.nom", rule_text("same", "build-output/v1"))],
+        &[("a.toml", rule_text("same", "cache/v1")), ("b.toml", rule_text("same", "build-output/v1"))],
     );
 
     let rendered = diagnostic_of(load(dir.path()).expect_err("duplicate rule title"));
     assert!(rendered.contains("duplicate rule title `same`"), "{rendered}");
-    assert!(rendered.contains("a.nom"), "the message names the first definition: {rendered}");
+    assert!(rendered.contains("a.toml"), "the message names the first definition: {rendered}");
 }
 
 /// A parse error inside a pack must keep its file name, or the author cannot
@@ -128,10 +128,22 @@ fn duplicate_rule_titles_across_files_are_rejected() {
 fn a_broken_rule_file_reports_its_own_path() {
     let dir = pack_dir(
         "name = \"rust\"\nversion = \"0.1.0\"\n",
-        &[("broken.nom", "[t]\nkind = cache/v1\n".into())],
+        &[("broken.toml", "[[rule]]\ntitle = \"t\"\nkind = \"cache/v1\"\n".into())],
     );
     let rendered = diagnostic_of(load(dir.path()).expect_err("incomplete rule"));
-    assert!(rendered.contains("broken.nom:1:"), "{rendered}");
+    assert!(rendered.contains("broken.toml:2:"), "{rendered}");
+}
+
+/// Catches a pack still holding pre-TOML `rules/*.nom` files silently loading zero rules.
+#[test]
+fn an_old_nom_rule_file_refuses_the_pack_and_names_the_file() {
+    let dir = pack_dir(
+        "name = \"rust\"\nversion = \"0.1.0\"\n",
+        &[("cargo.nom", "[Cargo target]\nkind = cache/v1\n".into())],
+    );
+    let rendered = diagnostic_of(load(dir.path()).expect_err("an old rule file"));
+    assert!(rendered.contains("cargo.nom:1:"), "{rendered}");
+    assert!(rendered.contains("rule files are TOML now: rename to .toml"), "{rendered}");
 }
 
 /// A missing `pack.toml` is an io failure, not a diagnostic: there is no
@@ -148,7 +160,8 @@ fn a_directory_without_a_manifest_is_an_io_error() {
 fn the_documented_example_rule_still_parses() {
     let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/lang.md");
     let text = fs::read_to_string(&spec).expect("docs/lang.md is next to the crate");
-    let start = text.find("[Yarn node_modules/]").expect("the example is in the spec");
+    let start =
+        text.find("[[rule]]\ntitle = \"Yarn node_modules/\"").expect("the example is in the spec");
     let end = text[start..].find("\n```").expect("the example is fenced") + start;
     let source = Source::new("docs/lang.md", &text[start..end]);
     assert_eq!(parse(&source, &Kinds::builtin()).expect("the spec example parses").len(), 2);

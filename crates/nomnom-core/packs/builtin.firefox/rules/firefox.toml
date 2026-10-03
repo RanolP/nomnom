@@ -1,0 +1,12 @@
+# Firefox's HTTP cache, `cache2` in each profile's local directory, holding
+# `entries` and an `index`.
+[[rule]]
+title = "Firefox HTTP cache"
+description = "Firefox's HTTP cache; Firefox downloads pages again as you browse"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "cache2"
+$c under Firefox/
+$c has entries
+then $c/
+'''

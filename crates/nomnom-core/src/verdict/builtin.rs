@@ -1,6 +1,6 @@
 //! The built-in packs, compiled into the binary.
 //!
-//! The rules live in `packs/builtin.<domain>/` as ordinary `.nom` text next to
+//! The rules live in `packs/builtin.<domain>/` as ordinary `.toml` rule files next to
 //! an ordinary `pack.toml`, so they read, diff and review as source rather than
 //! as a Rust string table — and so each directory could be handed to
 //! [`nomnom_lang::load`] unchanged. There is one pack per tool that creates the
@@ -11,7 +11,7 @@
 //! files are therefore listed one by one in [`PACKS`], because an `include_dir`
 //! over the directory would silently ship a pack missing whatever file nobody
 //! registered, and a missing rule is invisible — it produces no verdict rather
-//! than an error. Adding a `.nom` file without adding it here fails the build.
+//! than an error. Adding a rule file without adding it here fails the build.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -47,36 +47,36 @@ macro_rules! embedded {
 /// `docs/lang.md` makes rule order the last tie-break, so each pack's files
 /// are listed in load order too.
 const PACKS: &[Embedded] = &[
-    embedded!("builtin.ableton", ["ableton.nom"]),
-    embedded!("builtin.after-effects", ["after-effects.nom"]),
-    embedded!("builtin.bun", ["bun.nom"]),
-    embedded!("builtin.cargo", ["cargo.nom"]),
-    embedded!("builtin.chrome", ["chrome.nom"]),
-    embedded!("builtin.cmake", ["cmake.nom"]),
-    embedded!("builtin.cocoapods", ["cocoapods.nom"]),
-    embedded!("builtin.cpython", ["cpython.nom"]),
-    embedded!("builtin.dart", ["dart.nom"]),
-    embedded!("builtin.dotnet", ["dotnet.nom"]),
-    embedded!("builtin.downloads", ["stale-download.nom"]),
-    embedded!("builtin.edge", ["edge.nom"]),
-    embedded!("builtin.firefox", ["firefox.nom"]),
-    embedded!("builtin.go", ["go.nom"]),
-    embedded!("builtin.gradle", ["gradle.nom"]),
-    embedded!("builtin.maven", ["maven.nom"]),
-    embedded!("builtin.mypy", ["mypy.nom"]),
-    embedded!("builtin.next", ["next.nom"]),
-    embedded!("builtin.npm", ["npm.nom"]),
-    embedded!("builtin.nuget", ["nuget.nom"]),
-    embedded!("builtin.pip", ["pip.nom"]),
-    embedded!("builtin.pnpm", ["pnpm.nom"]),
-    embedded!("builtin.pytest", ["pytest.nom"]),
-    embedded!("builtin.ruff", ["ruff.nom"]),
-    embedded!("builtin.tox", ["tox.nom"]),
-    embedded!("builtin.uv", ["uv.nom"]),
-    embedded!("builtin.venv", ["venv.nom"]),
-    embedded!("builtin.vscode", ["vscode.nom"]),
-    embedded!("builtin.windows-update", ["windows-update.nom"]),
-    embedded!("builtin.yarn", ["yarn.nom"]),
+    embedded!("builtin.ableton", ["ableton.toml"]),
+    embedded!("builtin.after-effects", ["after-effects.toml"]),
+    embedded!("builtin.bun", ["bun.toml"]),
+    embedded!("builtin.cargo", ["cargo.toml"]),
+    embedded!("builtin.chrome", ["chrome.toml"]),
+    embedded!("builtin.cmake", ["cmake.toml"]),
+    embedded!("builtin.cocoapods", ["cocoapods.toml"]),
+    embedded!("builtin.cpython", ["cpython.toml"]),
+    embedded!("builtin.dart", ["dart.toml"]),
+    embedded!("builtin.dotnet", ["dotnet.toml"]),
+    embedded!("builtin.downloads", ["stale-download.toml"]),
+    embedded!("builtin.edge", ["edge.toml"]),
+    embedded!("builtin.firefox", ["firefox.toml"]),
+    embedded!("builtin.go", ["go.toml"]),
+    embedded!("builtin.gradle", ["gradle.toml"]),
+    embedded!("builtin.maven", ["maven.toml"]),
+    embedded!("builtin.mypy", ["mypy.toml"]),
+    embedded!("builtin.next", ["next.toml"]),
+    embedded!("builtin.npm", ["npm.toml"]),
+    embedded!("builtin.nuget", ["nuget.toml"]),
+    embedded!("builtin.pip", ["pip.toml"]),
+    embedded!("builtin.pnpm", ["pnpm.toml"]),
+    embedded!("builtin.pytest", ["pytest.toml"]),
+    embedded!("builtin.ruff", ["ruff.toml"]),
+    embedded!("builtin.tox", ["tox.toml"]),
+    embedded!("builtin.uv", ["uv.toml"]),
+    embedded!("builtin.venv", ["venv.toml"]),
+    embedded!("builtin.vscode", ["vscode.toml"]),
+    embedded!("builtin.windows-update", ["windows-update.toml"]),
+    embedded!("builtin.yarn", ["yarn.toml"]),
 ];
 
 /// The built-in packs in resolution order, parsed once, through the same

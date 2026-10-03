@@ -1,0 +1,29 @@
+# Chrome's HTTP disk cache and V8 code cache, per profile under
+# `%LocalAppData%\Google\Chrome\User Data`. The disk cache's backend keeps an `index`
+# file at its root; the code cache holds `js` and `wasm`. The vendor folder
+# above the browser folder keeps out embedded WebView2 and CEF profiles that
+# happen to sit under a folder of the same name.
+
+[[rule]]
+title = "Chrome HTTP cache"
+description = "Chrome's HTTP cache; Chrome downloads pages again as you browse"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "Cache_Data"
+$c under Google/
+$c under Chrome/
+$c has index
+then $c/
+'''
+
+[[rule]]
+title = "Chrome code cache"
+description = "Chrome's compiled-script cache; Chrome recompiles scripts as you browse"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "Code Cache"
+$c under Google/
+$c under Chrome/
+$c has js
+then $c/
+'''

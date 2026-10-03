@@ -1,11 +1,23 @@
 //! A rule file to a validated [`Rule`] list.
 //!
-//! The format is line-oriented, so the parser is too: a `[Title]` line opens a
-//! rule, `key = value` lines set its keys, and a `filter { ... }` block holds
-//! one constraint per line, ending with exactly one `then`. Everything that can
-//! be checked without a filesystem is checked here — known keys, a known kind,
-//! a disposition no stronger than the kind's, bound variables, field types —
-//! so that a bad rule is a startup error rather than a wrong deletion later.
+//! A rule file is TOML: an array of `[[rule]]` tables, each holding `title`,
+//! `description`, `kind`, an optional `disposition`, and a `filter` whose value
+//! is nomnom source in a TOML literal string. TOML reads the container; the
+//! filter body is read here, one constraint per line, ending with exactly one
+//! `then`. Everything that can be checked without a filesystem is checked here
+//! — known keys, a known kind, a disposition no stronger than the kind's, bound
+//! variables, field types — so that a bad rule is a startup error rather than a
+//! wrong deletion later.
+//!
+//! A literal string holds its text byte for byte, so the filter is parsed in
+//! place inside the file and every diagnostic points at the real line and
+//! column. That is also why a basic string is refused there: its escapes would
+//! change a glob and move every position after them.
+
+use std::ops::Range;
+
+use toml::Spanned as TomlSpanned;
+use toml::de::{DeTable, DeValue};
 
 use crate::ast::{
     ChildTest, CmpOp, Constraint, Disposition, FieldTest, Filter, Literal, NamePattern, Rule,
@@ -17,7 +29,7 @@ use crate::kind::{Kind, Kinds, split_id};
 use crate::lex::{self, Word};
 use crate::vocab::{FIELDS, Field, Ty, nearest};
 
-const KEYS: [&str; 3] = ["description", "kind", "disposition"];
+const KEYS: [&str; 5] = ["title", "description", "kind", "disposition", "filter"];
 
 /// Why a rule or a kind that still writes `confidence` is refused, shared with
 /// `pack.toml` so both say the same thing.
@@ -29,74 +41,78 @@ type Subject = (Spanned<String>, Option<Spanned<Field>>);
 
 /// Parse a whole rule file, resolving every `kind` against `kinds`.
 pub fn parse(source: &Source, kinds: &Kinds) -> Result<Vec<Rule>> {
-    let mut parser = Parser { source, kinds, lines: lines(&source.text), next: 0 };
+    let parser = Parser { source, kinds };
+    let document = DeTable::parse(&source.text).map_err(|error| parser.toml_error(&error))?;
     let mut rules = Vec::new();
-    let mut draft: Option<Draft> = None;
-
-    while let Some(span) = parser.line() {
-        let line = &source.text[span.start..span.end];
-        if line.starts_with('[') {
-            if let Some(done) = draft.take() {
-                rules.push(parser.finish(done)?);
-            }
-            draft = Some(parser.header(line, span)?);
-            continue;
-        }
-        let Some(rule) = draft.as_mut() else {
+    for (key, value) in document.get_ref() {
+        let key_span = span(key.span());
+        if key.get_ref() != "rule" {
             return Err(parser
-                .error(span, "expected a `[Title]` line")
-                .with_label("every rule starts with its title in brackets")
-                .with_help("as in `[Cargo target/]`"));
+                .error(key_span, format!("unknown top-level key `{}`", key.get_ref()))
+                .with_label("a rule file holds `[[rule]]` tables only")
+                .with_help("start each rule with a `[[rule]]` line"));
+        }
+        let DeValue::Array(items) = value.get_ref() else {
+            return Err(parser
+                .error(key_span, "`rule` must be an array of tables")
+                .with_label("expected `[[rule]]`")
+                .with_help(
+                    "write each rule under its own `[[rule]]` line with a `title` key; a table \
+                     keyed by title has no order, and within a pack the earlier rule wins",
+                ));
         };
-        if let Some((_, filter_span)) = &rule.filter {
-            return Err(parser
-                .error(span, "nothing may follow a rule's `filter` block")
-                .with_label("expected the next `[Title]`")
-                .with_help(format!(
-                    "keys go above `filter`; this rule's filter ends at line {}",
-                    parser.line_of(filter_span.end)
-                )));
+        for item in items {
+            let DeValue::Table(table) = item.get_ref() else {
+                return Err(parser
+                    .error(span(item.span()), "a rule must be a table")
+                    .with_label("expected `[[rule]]`"));
+            };
+            rules.push(parser.rule(table, span(item.span()))?);
         }
-        if is_filter_opener(line) {
-            rule.filter = Some(parser.filter(span)?);
-        } else {
-            parser.key(rule, line, span)?;
-        }
-    }
-    if let Some(done) = draft {
-        rules.push(parser.finish(done)?);
     }
     Ok(rules)
 }
 
-/// Every line's span, without its line terminator.
-fn lines(text: &str) -> Vec<Span> {
+fn span(range: Range<usize>) -> Span {
+    Span::new(range.start, range.end)
+}
+
+/// The lines of `text[within]` that are not blank or a full-line comment,
+/// each trimmed and without its line terminator.
+fn lines(text: &str, within: Span) -> Vec<Span> {
     let mut out = Vec::new();
-    let mut start = 0;
-    for (at, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            let end = if at > start && text.as_bytes()[at - 1] == b'\r' { at - 1 } else { at };
-            out.push(Span::new(start, end));
-            start = at + 1;
+    let mut start = within.start;
+    while start < within.end {
+        let end = text[start..within.end].find('\n').map_or(within.end, |at| start + at);
+        let raw = &text[start..end];
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            let at = start + (raw.len() - raw.trim_start().len());
+            out.push(Span::new(at, at + trimmed.len()));
         }
-    }
-    if start < text.len() {
-        out.push(Span::new(start, text.len()));
+        start = end + 1;
     }
     out
 }
 
-fn is_filter_opener(line: &str) -> bool {
-    line.strip_prefix("filter").is_some_and(|rest| rest.trim() == "{")
+/// A string value as written: its decoded text, the span of the whole token,
+/// and the span of the characters between its delimiters.
+struct StringValue {
+    value: String,
+    token: Span,
+    inner: Span,
+    /// `'...'` or `'''...'''`, whose inner text is the value byte for byte.
+    literal: bool,
 }
 
-/// A rule whose keys and filter are still being read.
-struct Draft {
-    title: Spanned<String>,
-    description: Option<Spanned<String>>,
-    kind: Option<Spanned<String>>,
-    disposition: Option<Spanned<Disposition>>,
-    filter: Option<(Filter, Span)>,
+impl StringValue {
+    /// The value carrying the span of its text, so an offset into the value
+    /// is an offset into the file. A basic string whose escapes make the two
+    /// differ carries the whole token instead.
+    fn spanned(&self, text: &str) -> Spanned<String> {
+        let exact = text[self.inner.start..self.inner.end] == self.value;
+        Spanned::new(self.value.clone(), if exact { self.inner } else { self.token })
+    }
 }
 
 /// A filter whose lines are still being read.
@@ -112,8 +128,6 @@ struct FilterDraft {
 struct Parser<'a> {
     source: &'a Source,
     kinds: &'a Kinds,
-    lines: Vec<Span>,
-    next: usize,
 }
 
 impl Parser<'_> {
@@ -125,136 +139,104 @@ impl Parser<'_> {
         self.source.text[..offset].matches('\n').count() + 1
     }
 
-    /// The span of the next line that is not blank or a full-line comment,
-    /// trimmed.
-    fn line(&mut self) -> Option<Span> {
-        while let Some(&span) = self.lines.get(self.next) {
-            self.next += 1;
-            let raw = &self.source.text[span.start..span.end];
-            let trimmed = raw.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let start = span.start + (raw.len() - raw.trim_start().len());
-            return Some(Span::new(start, start + trimmed.len()));
+    /// TOML's own complaint, at TOML's span. A duplicate key reads as it does
+    /// for every other key mistake here.
+    fn toml_error(&self, error: &toml::de::Error) -> Diagnostic {
+        let text = &self.source.text;
+        let at = error.span().map_or(Span::new(0, text.len()), span);
+        if error.message().starts_with("duplicate key") {
+            let key = text[at.start..at.end].trim();
+            return self
+                .error(at, format!("`{key}` is set twice"))
+                .with_label("already given above in this rule");
         }
-        None
+        self.error(at, format!("invalid rule file: {}", error.message().trim_end()))
+            .with_label("not valid TOML")
+            .with_help("each rule is a `[[rule]]` table of `key = \"value\"` lines")
     }
 
-    // -- the rule header ---------------------------------------------------
+    // -- the rule table ----------------------------------------------------
 
-    fn header(&self, line: &str, span: Span) -> Result<Draft> {
-        let Some(inner) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) else {
-            return Err(self
-                .error(span, "unclosed rule title")
-                .with_label("expected `]` at the end of this line"));
-        };
-        let title = inner.trim();
-        if title.is_empty() {
-            return Err(self
-                .error(span, "empty rule title")
-                .with_label("a verdict cites its rule by this title")
-                .with_help("name what the rule finds, as in `[Cargo target/]`"));
-        }
-        let start = span.start + 1 + (inner.len() - inner.trim_start().len());
-        Ok(Draft {
-            title: Spanned::new(title.to_owned(), Span::new(start, start + title.len())),
-            description: None,
-            kind: None,
-            disposition: None,
-            filter: None,
-        })
-    }
-
-    fn key(&self, rule: &mut Draft, line: &str, span: Span) -> Result<()> {
-        let Some(eq) = line.find('=') else {
-            return Err(self
-                .error(span, "expected `key = value` or `filter {`")
-                .with_label("not a key or a filter")
-                .with_help(format!("the keys are {}", KEYS.join(", "))));
-        };
-        let key = line[..eq].trim_end();
-        let key_span = Span::new(span.start, span.start + key.len());
-        let raw_value = &line[eq + 1..];
-        let value = raw_value.trim();
-        let value_start = span.start + eq + 1 + (raw_value.len() - raw_value.trim_start().len());
-        let value_span = Span::new(value_start, value_start + value.len());
-        if value.is_empty() {
-            return Err(self
-                .error(Span::new(span.start + eq, span.end), format!("`{key}` has no value"))
-                .with_label("expected a value after `=`"));
-        }
-
-        let twice = |set: bool| -> Result<()> {
-            if set {
-                Err(self
-                    .error(key_span, format!("`{key}` is set twice"))
-                    .with_label("already given above in this rule"))
-            } else {
-                Ok(())
-            }
-        };
-        match key {
-            "description" => {
-                twice(rule.description.is_some())?;
-                rule.description = Some(Spanned::new(value.to_owned(), value_span));
-            }
-            "kind" => {
-                twice(rule.kind.is_some())?;
-                rule.kind = Some(Spanned::new(value.to_owned(), value_span));
-            }
-            "confidence" => {
-                return Err(self
-                    .error(key_span, "unknown key `confidence`")
-                    .with_label("no longer a rule key")
-                    .with_help(CONFIDENCE_REMOVED));
-            }
-            "disposition" => {
-                twice(rule.disposition.is_some())?;
-                let Some(parsed) = Disposition::lookup(value) else {
+    /// One `[[rule]]` table, whose own span is `at`.
+    fn rule(&self, table: &DeTable<'_>, at: Span) -> Result<Rule> {
+        let mut title = None;
+        let mut description = None;
+        let mut kind = None;
+        let mut disposition = None;
+        let mut filter = None;
+        for (key, value) in table {
+            let key_span = span(key.span());
+            let name = key.get_ref().as_ref();
+            match name {
+                "title" => title = Some(self.string(name, value)?),
+                "description" => description = Some(self.string(name, value)?),
+                "kind" => kind = Some(self.string(name, value)?),
+                "filter" => filter = Some(self.string(name, value)?),
+                "disposition" => {
+                    let written = self.string(name, value)?.spanned(&self.source.text);
+                    let Some(parsed) = Disposition::lookup(&written.value) else {
+                        return Err(self
+                            .error(written.span, format!("unknown disposition `{}`", written.value))
+                            .with_label("expected `keep`, `reclaimable` or `review`"));
+                    };
+                    disposition = Some(Spanned::new(parsed, written.span));
+                }
+                "confidence" => {
                     return Err(self
-                        .error(value_span, format!("unknown disposition `{value}`"))
-                        .with_label("expected `keep`, `reclaimable` or `review`"));
-                };
-                rule.disposition = Some(Spanned::new(parsed, value_span));
-            }
-            other => {
-                let diagnostic = self
-                    .error(key_span, format!("unknown key `{other}`"))
-                    .with_label("not a rule key");
-                return Err(match nearest(other, KEYS.into_iter()) {
-                    Some(hint) => diagnostic.with_help(format!("did you mean `{hint}`?")),
-                    None => diagnostic.with_help(format!("the keys are {}", KEYS.join(", "))),
-                });
+                        .error(key_span, "unknown key `confidence`")
+                        .with_label("no longer a rule key")
+                        .with_help(CONFIDENCE_REMOVED));
+                }
+                other => {
+                    let diagnostic = self
+                        .error(key_span, format!("unknown key `{other}`"))
+                        .with_label("not a rule key");
+                    return Err(match nearest(other, KEYS.into_iter()) {
+                        Some(hint) => diagnostic.with_help(format!("did you mean `{hint}`?")),
+                        None => diagnostic.with_help(format!("the keys are {}", KEYS.join(", "))),
+                    });
+                }
             }
         }
-        Ok(())
-    }
 
-    /// Resolve a finished draft: required keys, the kind, the disposition
-    /// against the kind, and the description against the filter's bindings.
-    fn finish(&self, draft: Draft) -> Result<Rule> {
-        let title = &draft.title;
+        let text = &self.source.text;
+        let Some(title) = title else {
+            return Err(self
+                .error(at, "a rule is missing `title`")
+                .with_label("`title` is required")
+                .with_help(
+                    "`title` is what a verdict cites, as in `title = \"Cargo target directory\"`",
+                ));
+        };
+        let title = title.spanned(text);
+        if title.value.trim().is_empty() {
+            return Err(self
+                .error(title.span, "empty rule title")
+                .with_label("a verdict cites its rule by this title")
+                .with_help("name what the rule finds, as in `title = \"Cargo target directory\"`"));
+        }
         let missing = |key: &str, meaning: &str| {
             self.error(title.span, format!("rule `{}` is missing `{key}`", title.value))
                 .with_label(format!("`{key}` is required"))
                 .with_help(format!("`{key}` is {meaning}"))
         };
-        let Some(description) = draft.description else {
+        let Some(description) = description else {
             return Err(missing(
                 "description",
                 "the sentence a human reads before approving a deletion",
             ));
         };
-        let Some(kind) = draft.kind else {
-            return Err(missing("kind", "what the path is, as in `kind = cache/v1`"));
+        let Some(kind) = kind else {
+            return Err(missing("kind", "what the path is, as in `kind = \"cache/v1\"`"));
         };
-        let Some((filter, filter_span)) = draft.filter else {
+        let Some(filter_value) = filter else {
             return Err(missing("filter", "the block saying which paths the rule matches"));
         };
-        let kind = self.kind(&kind)?;
+        let description = description.spanned(text);
+        let kind = self.kind(&kind.spanned(text))?;
+        let filter = self.filter(&filter_value)?;
 
-        let disposition = match draft.disposition {
+        let disposition = match disposition {
             Some(written) if written.value.strength() > kind.value.disposition.strength() => {
                 return Err(self
                     .error(
@@ -289,13 +271,36 @@ impl Parser<'_> {
         self.check_template(&description, &bound)?;
 
         Ok(Rule {
-            span: draft.title.span.to(filter_span),
-            title: draft.title,
+            span: title.span.to(filter_value.token),
+            title,
             description,
             kind,
             disposition,
             filter,
         })
+    }
+
+    /// A key's value, which must be a string.
+    fn string(&self, key: &str, value: &TomlSpanned<DeValue<'_>>) -> Result<StringValue> {
+        let token = span(value.span());
+        let DeValue::String(decoded) = value.get_ref() else {
+            return Err(self
+                .error(token, format!("`{key}` must be a string"))
+                .with_label("expected a quoted value")
+                .with_help(format!("as in `{key} = \"...\"`")));
+        };
+        let raw = &self.source.text[token.start..token.end];
+        let (open, close, literal) = if raw.starts_with("'''") {
+            // TOML drops a newline right after the opening `'''`.
+            let newline = ["\r\n", "\n"].into_iter().find(|nl| raw[3..].starts_with(nl));
+            (3 + newline.map_or(0, str::len), 3, true)
+        } else if raw.starts_with("\"\"\"") {
+            (3, 3, false)
+        } else {
+            (1, 1, raw.starts_with('\''))
+        };
+        let inner = Span::new(token.start + open, (token.end - close).max(token.start + open));
+        Ok(StringValue { value: decoded.to_string(), token, inner, literal })
     }
 
     fn kind(&self, written: &Spanned<String>) -> Result<Spanned<Kind>> {
@@ -390,29 +395,30 @@ impl Parser<'_> {
 
     // -- the filter --------------------------------------------------------
 
-    /// Everything up to the closing `}`. `opener` spans the `filter {` line.
-    fn filter(&mut self, opener: Span) -> Result<(Filter, Span)> {
+    /// The `filter` value's lines, parsed where they sit in the file.
+    fn filter(&self, written: &StringValue) -> Result<Filter> {
+        if !written.literal {
+            return Err(self
+                .error(written.token, "`filter` must be a literal string")
+                .with_label("a basic string reads `\\` as an escape")
+                .with_help(
+                    "write the filter between `'''` lines; escapes would change a glob and move \
+                     every position a diagnostic reports",
+                ));
+        }
         let mut draft = FilterDraft::default();
-        let close = loop {
-            let Some(span) = self.line() else {
-                return Err(self
-                    .error(opener, "unclosed `filter {`")
-                    .with_label("this block has no closing `}`"));
-            };
-            if &self.source.text[span.start..span.end] == "}" {
-                break span;
-            }
-            let words = lex::words(self.source, span.start, span.end)?;
+        for line in lines(&self.source.text, written.inner) {
+            let words = lex::words(self.source, line.start, line.end)?;
             if words.is_empty() {
                 continue;
             }
-            self.constraint(&mut draft, &words, span)?;
-        };
+            self.constraint(&mut draft, &words, line)?;
+        }
 
         let Some((var, then)) = draft.then else {
             return Err(self
-                .error(opener, "this `filter` has no `then`")
-                .with_label("expected a `then` line before the closing `}`")
+                .error(written.token, "this `filter` has no `then`")
+                .with_label("expected a `then` line before the closing `'''`")
                 .with_help("end the filter with the path the verdict lands on, as in `then $dir/target/`"));
         };
         for capture in &draft.captures {
@@ -443,8 +449,7 @@ impl Parser<'_> {
                 .with_help("a filter talks about one node, the one `then` starts from"));
         }
 
-        let filter = Filter { var, constraints: draft.constraints, then };
-        Ok((filter, opener.to(close)))
+        Ok(Filter { var, constraints: draft.constraints, then })
     }
 
     fn constraint(&self, draft: &mut FilterDraft, words: &[Word], line: Span) -> Result<()> {

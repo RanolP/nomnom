@@ -4,15 +4,16 @@
 # `node-modules` linker, write `node_modules/.yarn-state.yml`. pnpm's
 # markers beside one of them mean pnpm installed over Yarn, and pnpm then
 # owns the layout.
-[Yarn node_modules/]
-description = regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`
-kind = build-output/v1
-filter {
-  $n.dir.name == "node_modules"
-  $n has .yarn-integrity | .yarn-state.yml as $marker
-  $n lacks .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json
-  then $n/
-}
+[[rule]]
+title = "Yarn node_modules/"
+description = "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`"
+kind = "build-output/v1"
+filter = '''
+$n.dir.name == "node_modules"
+$n has .yarn-integrity | .yarn-state.yml as $marker
+$n lacks .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json
+then $n/
+'''
 
 # Yarn 1 kept its cache in a versioned directory under `Yarn/Cache`
 # (`~/.cache/yarn` elsewhere), named for Yarn's internal `CACHE_VERSION`

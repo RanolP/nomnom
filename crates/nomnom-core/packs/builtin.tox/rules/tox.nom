@@ -1,9 +1,0 @@
-# tox's work directory. tox 4.39 and later write `CACHEDIR.TAG` into it.
-[.tox/]
-description = regenerable: tox environments, rebuilt by `tox` — it holds tox's `CACHEDIR.TAG`
-kind = build-output/v1
-filter {
-  $t.dir.name == ".tox"
-  $t has CACHEDIR.TAG
-  then $t/
-}

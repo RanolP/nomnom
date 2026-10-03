@@ -101,7 +101,7 @@ fn content_drift_under_a_fixed_sha_is_an_error_that_says_supply_chain() {
     let added = nomnom_pack::add(&fx.store, &mut lock, &pack_url(&fx.repo, "@main")).expect("add");
     let dir = nomnom_pack::materialize(&fx.store, &added).expect("materialize");
 
-    fs::write(dir.join("rules").join("main.nom"), common::rule("sneaky", "reclaimable"))
+    fs::write(dir.join("rules").join("main.toml"), common::rule("sneaky", "reclaimable"))
         .expect("tamper with the cached pack");
 
     let error = nomnom_pack::materialize(&fx.store, &added).expect_err("drift must be refused");
@@ -220,14 +220,14 @@ fn only_an_explicit_update_moves_a_pin() {
     let added = nomnom_pack::add(&fx.store, &mut lock, &pack_url(&fx.repo, "@main")).expect("add");
     lock.trust("rust");
 
-    fs::write(fx.repo.join("rust").join("rules").join("later.nom"), common::rule("later", "keep"))
+    fs::write(fx.repo.join("rust").join("rules").join("later.toml"), common::rule("later", "keep"))
         .expect("a new rule upstream");
     let second = common::commit(&fx.repo, "upstream moves on");
     assert_ne!(first, second);
 
     // Resolving again stays on the old commit.
     let still = nomnom_pack::materialize(&fx.store, &added).expect("materialize");
-    assert!(!still.join("rules").join("later.nom").exists());
+    assert!(!still.join("rules").join("later.toml").exists());
 
     let moved = nomnom_pack::update(&fx.store, &mut lock, "rust").expect("update");
     assert_eq!(moved.sha.as_deref(), Some(second.as_str()));

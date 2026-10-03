@@ -1,0 +1,23 @@
+# The .NET SDK's `obj/` and `bin/`.
+
+# `dotnet restore` writes `project.assets.json` into `obj/`.
+[[rule]]
+title = ".NET obj/"
+description = "regenerable: .NET intermediate build output, rebuilt by `dotnet build` — it holds the SDK's `project.assets.json`"
+kind = "build-output/v1"
+filter = '''
+$o.dir.name == "obj"
+$o has project.assets.json
+then $o/
+'''
+
+# `bin/` carries no SDK signature of its own, so the project file beside it is
+# the evidence: the SDK's default output path is `bin/` next to the project.
+[[rule]]
+title = ".NET bin/"
+description = "regenerable: .NET build output, rebuilt by `dotnet build` — `{$project}` sits beside it"
+kind = "build-output/v1"
+filter = '''
+$p has *.csproj | *.fsproj | *.vbproj as $project
+then $p/bin/
+'''

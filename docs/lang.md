@@ -17,7 +17,7 @@ Two other plugin models were considered and rejected.
 - **WASM modules.** A compiled blob cannot be reviewed, so `pack trust` would become blind consent to a program that can misclassify cleverly. It would also add a runtime, an ABI to version, and a toolchain for every plugin author, and each of the hundreds of small plugins would be code instead of five lines.
 - **External executables.** They have no sandbox and run with the user's full rights, which is unacceptable in a tool whose deletions are permanent. Results and CLI/GUI parity would also depend on whatever happens to be on `PATH`.
 
-A `.nom` pack stays text a human can audit. It cannot compute, open a path it did not spell out, reach the network, or launch anything outside the handler registry. The only Rust that is not a general mechanism is a closed set of **file formats**, **known folders** and **action handlers**, and every pack reuses it. Adding to one of those sets needs a nomnom release, by design: they are the code everyone trusts.
+A pack stays text a human can audit. It cannot compute, open a path it did not spell out, reach the network, or launch anything outside the handler registry. The only Rust that is not a general mechanism is a closed set of **file formats**, **known folders** and **action handlers**, and every pack reuses it. Adding to one of those sets needs a nomnom release, by design: they are the code everyone trusts.
 
 ## Status: what exists today
 
@@ -25,9 +25,9 @@ This document describes the language as it is and as it is being migrated, unit 
 
 | unit | delivers |
 |---|---|
-| implemented | the short form (`[Title]` + keys + `filter { … then … }`), kinds, the filter grammar and vocabulary, packs and their resolution order, conflicts and nesting, git-pinned packs with a lock, the trust cap, engine guards, permanent deletion with opt-in approval |
+| implemented | the short form (`[[rule]]` tables in `rules/*.toml`, with a `filter = '''… then …'''`), kinds, the filter grammar and vocabulary, packs and their resolution order, conflicts and nesting, git-pinned packs with a lock, the trust cap, engine guards, permanent deletion with opt-in approval |
 | Unit 2, ownership | every short-form target becomes an exclusive claim; the claimed/arbitrary byte split; the GUI "Recognized" and "Other files" views; `nomnom classify` and `--view`; downloads stops suggesting |
-| Unit 3, long form | `classify`, `suggest … within`, `claim $g is`, `lens`, `at ~known/`, `in ~known`, `in class/vN`, `before`/`after … ago`, `exists`, `platforms`, `pack lint`, golden `fixtures/*.tree`, the `build.rs` pack enumeration; `builtin.downloads` ported to a lens |
+| Unit 3, long form | `[[classify]]`, `[[suggest]]` with `within`, `claim $g is`, `[[lens]]`, `at ~known/`, `in ~known`, `in class/vN`, `before`/`after … ago`, `exists`, `platforms`, `pack lint`, golden `fixtures/*.tree`, the `build.rs` pack enumeration; `builtin.downloads` ported to a lens |
 | Unit 4, inspect | `table` (bounded manifest reads in vdf, json, toml, ini, plist), read caps, the read log, `suggest --reads`, the GUI "Files read" view |
 | Unit 5 | `builtin.steam`, classify only: client, library and game claims with facts |
 | Unit 6, actions | the handler registry, `action =`, `Action::Request`, the two Steam suggestions, `windows.storage-settings` |
@@ -84,28 +84,32 @@ Rules for tools that could meet on one directory exclude each other's signatures
 
 Most plugins are a cache directory or a build directory with a signature. They stay a few lines:
 
-```
-[Yarn node_modules/]
-description = regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`
-kind = build-output/v1
-filter {
-  $nm.dir.name == "node_modules"
-  $nm has .yarn-integrity | .yarn-state.yml as $marker
-  $nm lacks .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json
-  then $nm/
-}
+```toml
+[[rule]]
+title = "Yarn node_modules/"
+description = "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`"
+kind = "build-output/v1"
+filter = '''
+$nm.dir.name == "node_modules"
+$nm has .yarn-integrity | .yarn-state.yml as $marker
+$nm lacks .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json
+then $nm/
+'''
 
-[Cargo target directory]
-description = regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`
-kind = build-output/v1
-filter {
-  $t has .rustc_info.json
-  $t has CACHEDIR.TAG
-  then $t/
-}
+[[rule]]
+title = "Cargo target directory"
+description = "regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`"
+kind = "build-output/v1"
+filter = '''
+$t has .rustc_info.json
+$t has CACHEDIR.TAG
+then $t/
+'''
 ```
 
-A rule opens with a `[Title]` line. The title is the rule's name: the CLI and the GUI show it beside every verdict the rule produces, as `pack [Title]`, and a pack name plus a title is the stable identity a verdict carries. Keys follow as `key = value`, one per line, and the rule ends with exactly one `filter { ... }` block. `#` starts a comment line.
+A rule file is TOML, and each rule is one `[[rule]]` table. The rules are an array rather than a table keyed by title (`[rule."Title"]`), because a TOML table has no order and within a pack the earlier rule wins (see [Conflicts](#conflicts)); load order is file name, then position in the file. `title` is the rule's name: the CLI and the GUI show it beside every verdict the rule produces, as `pack [Title]`, and a pack name plus a title is the stable identity a verdict carries. `#` starts a comment, as everywhere in TOML.
+
+Only `filter` is written in the nomnom language, and it must be a TOML **literal string**: `'''` on its own line before and after a multi-line filter, or `'...'` for a one-line one. A basic string (`"..."` or `"""..."""`) is refused with a message saying to use `'''`, for two reasons: TOML would read `\` as an escape before the filter ever saw it, changing a glob or a quoted name, and the filter is parsed in place inside the file, so every diagnostic points at the real line and column only while the string holds its text byte for byte.
 
 From Unit 2, a short-form rule compiles to two things: an **exclusive claim** on its target, with class `<pack>:<kind>`, and **one suggestion** covering that whole claim. Every existing pack stays valid unchanged. Open (non-exclusive) claims are available only through the long form, because a short-form rule targets exactly the folder it proposes to remove, and nothing else should speak about the inside of that folder.
 
@@ -113,11 +117,13 @@ From Unit 2, a short-form rule compiles to two things: an **exclusive claim** on
 
 | key | required | meaning |
 |---|---|---|
+| `title` | yes | the rule's name, unique within its pack. |
+| `filter` | yes | the constraints and the `then` line (see [Filters](#filters)), as a literal string. |
 | `description` | yes | the sentence a human reads before approving. A template; see below. |
 | `kind` | yes | what the path is, as `name/vN`. The kind supplies the default disposition. |
 | `disposition` | no, default the kind's | `keep`, `review` or `reclaimable`, and only ever a downgrade of the kind's default. A `cache/v1` rule may say `review`; a `stale-download/v1` rule may not say `reclaimable`. |
 
-An unknown key is an error, with a "did you mean" when one is close. So is a key set twice and a missing required key. `confidence` is no longer a key: it was a hand-picked priority number that only broke ties between rules, and [Conflicts](#conflicts) now needs none, so a rule or a `pack.toml` kind that still writes it is refused with a message saying it was removed.
+Every value is a string. An unknown key is an error, with a "did you mean" when one is close. So is a key set twice and a missing required key. `confidence` is no longer a key: it was a hand-picked priority number that only broke ties between rules, and [Conflicts](#conflicts) now needs none, so a rule or a `pack.toml` kind that still writes it is refused with a message saying it was removed.
 
 ### Kinds
 
@@ -276,20 +282,21 @@ exists ~app-data/Telegram Desktop/tdata/
 
 **Status:** Unit 3 (`classify`, `suggest`, `lens`, `platforms`); tables Unit 4; actions Unit 6. **None of the examples in this section parse today.**
 
-The long form splits what the short form fuses. `classify` makes claims; `suggest` speaks inside them; `lens` highlights part of the arbitrary tree; `table` reads manifests. A pack may mix short-form and long-form rules in one file.
+The long form splits what the short form fuses. `[[classify]]` makes claims; `[[suggest]]` speaks inside them; `[[lens]]` highlights part of the arbitrary tree; `[table.<name>]` reads manifests. Each is its own TOML array of tables, with `title` and a literal-string `filter` exactly as in `[[rule]]`, and a pack may mix short-form and long-form rules in one file. Order within each array is precedence order, as for `[[rule]]`.
 
-### `classify`
+### `[[classify]]`
 
-```
-classify [Windows directory]
-class = windows-os/v1
-description = the Windows directory: `System32` and `WinSxS` under the OS-resolved Windows folder
-filter {
-  $w at ~windows/
-  $w has System32
-  $w has WinSxS
-  then $w/
-}
+```toml
+[[classify]]
+title = "Windows directory"
+class = "windows-os/v1"
+description = "the Windows directory: `System32` and `WinSxS` under the OS-resolved Windows folder"
+filter = '''
+$w at ~windows/
+$w has System32
+$w has WinSxS
+then $w/
+'''
 ```
 
 | key | required | meaning |
@@ -301,37 +308,39 @@ filter {
 
 A classify rule produces a claim and nothing else. It never proposes removal.
 
-### `suggest … within`
+### `[[suggest]]`
 
-```
-suggest [Windows Update downloads]
-kind = cache/v1
-disposition = review
-within windows-os/v1
-description = update packages Windows Update already installed; Windows removes them itself from Storage settings
-action = windows.storage-settings
-filter {
-  claim $w is windows-os/v1
-  then $w/SoftwareDistribution/Download/
-}
+```toml
+[[suggest]]
+title = "Windows Update downloads"
+kind = "cache/v1"
+disposition = "review"
+within = "windows-os/v1"
+description = "update packages Windows Update already installed; Windows removes them itself from Storage settings"
+action = "windows.storage-settings"
+filter = '''
+claim $w is windows-os/v1
+then $w/SoftwareDistribution/Download/
+'''
 ```
 
-- `within` names the class this suggestion speaks inside, and the filter binds it in one of two ways: `claim $g is <class>` binds `$g` to the claimed node itself, with every node field plus every fact of the claim, and the target is a path from it; `$f in <class>` binds `$f` to any node strictly inside such a claim, for suggestions that judge files one by one.
+- The `within` key names the class this suggestion speaks inside, and the filter binds it in one of two ways: `claim $g is <class>` binds `$g` to the claimed node itself, with every node field plus every fact of the claim, and the target is a path from it; `$f in <class>` binds `$f` to any node strictly inside such a claim, for suggestions that judge files one by one.
 - The target must lie inside that claim, and the claim must belong to this pack. Suggestions arise only inside a classified subtree, and only from the pack that owns it.
 - The keys are the short form's (`description`, `kind`, `disposition`) plus `action` (see [Actions](#actions)). Without `action`, the action is a permanent delete.
 - A suggestion produces a verdict exactly as a short-form rule does: same provenance, same conflicts, same nesting.
 
-### `lens`
+### `[[lens]]`
 
-```
-lens [Old downloads]
-description = in your Downloads folder, last modified {modified_age} days ago, {size} bytes; it may be your only copy
-filter {
-  $f in ~downloads
-  $f.is_file
-  $f.modified before 2mo ago
-  then $f
-}
+```toml
+[[lens]]
+title = "Old downloads"
+description = "in your Downloads folder, last modified {modified_age} days ago, {size} bytes; it may be your only copy"
+filter = '''
+$f in ~downloads
+$f.is_file
+$f.modified before 2mo ago
+then $f
+'''
 ```
 
 A lens is the one rule that looks at the **arbitrary** tree, and it can only highlight. Its targets must be arbitrary nodes (no claim contains them); it has no `kind`, no `disposition`, no `action`, and it never puts anything on the delete list. The "Other files" view offers each lens as a filter, and `nomnom scan --view other --lens "<pack> [Title]"` prints the same list. The user picks from it by hand, as from any other part of the arbitrary tree. A claim takes its subtree out of every lens, so once a Telegram pack claims `~downloads/Telegram Desktop/`, those files are judged by Telegram's own suggestions and never appear under "Old downloads".
@@ -346,22 +355,25 @@ A lens is the one rule that looks at the **arbitrary** tree, and it can only hig
 
 A table is a bounded read of named manifest files in one of a closed set of formats — `vdf`, `json`, `toml`, `ini`, `plist` — parsed into rows of typed fields. It is how a pack learns what structure alone cannot say: which libraries Steam itself lists, which game a folder belongs to, when it was last played. It is also how `dist/` and `build/` come back: no rule claims them today, because a name is not evidence, and a later pack can restore them by reading the project's own config (a Vite or TypeScript config that names its output directory).
 
-```
-table apps = vdf
-  file {
-    $lib has steamapps
-    then $lib/steamapps/appmanifest_*.acf
-  }
-  row AppState
-  appid      num  = appid
-  name       str  = name
-  installdir name = installdir
+```toml
+[table.apps]
+format = "vdf"
+file = '''
+$lib has steamapps
+then $lib/steamapps/appmanifest_*.acf
+'''
+row = "AppState"
+
+[table.apps.fields]
+appid = { type = "num", key = "appid" }
+name = { type = "str", key = "name" }
+installdir = { type = "name", key = "installdir" }
 ```
 
-- `table <name> = <format>` opens the table. `file { … then … }` is an ordinary filter whose target is the file to read; its segments must spell a literal stem or extension, and `pack lint` rejects a bare `*`.
-- `row <path>` says where rows sit in the parsed document; `*` iterates the children of a key, and `$key` is that child's own key.
-- Each field line is `<name> <type> = <key>`. Types: `num`, `str`, `name` (one validated file-name component: no separator, no `..`), `path` (compared with catalog paths only, never opened), `time` (seconds since the epoch), `minutes`.
-- `merge by <field>: <reducer> <field>, …` collapses rows sharing a key, with the reducers `max`, `min`, `sum` and `any`. That is the whole relational algebra: one-hop equality joins and fixed reducers. The language will be pushed to grow into SQL; it does not.
+- `[table.<name>]` opens the table, and `format` picks the parser. A table is keyed by name rather than written as an array, because filters refer to it by that name and no two tables compete for precedence. `file` is an ordinary filter, a literal string like every filter, whose target is the file to read; its segments must spell a literal stem or extension, and `pack lint` rejects a bare `*`.
+- `row` says where rows sit in the parsed document; `*` iterates the children of a key, and `$key` is that child's own key.
+- Each entry under `[table.<name>.fields]` is `<field> = { type = "<type>", key = "<key>" }`, reading the document key `<key>` as the typed field `<field>`. Types: `num`, `str`, `name` (one validated file-name component: no separator, no `..`), `path` (compared with catalog paths only, never opened), `time` (seconds since the epoch), `minutes`.
+- `merge = { by = "<field>", <field> = "<reducer>", … }` collapses rows sharing the `by` field, with the reducers `max`, `min`, `sum` and `any`. That is the whole relational algebra: one-hop equality joins and fixed reducers. The language will be pushed to grow into SQL; it does not.
 
 In a filter, `row $r in <table> where $r.<field> == <expr>` requires a matching row and binds its fields; `row $r in <table> from $v` takes the rows read from files under `$v`'s own anchor. `with $r in <table> where …` is the optional join: when the table was read completely and no row matches, the claim gets the bool fact `<table>_found = false`; when one matches, `true`, and its fields; when the table is incomplete, `<table>_found` and every field are absent.
 
@@ -443,93 +455,107 @@ disposition = "review"
 action = "required"
 ```
 
-```
-table libraries = vdf
-  file {
-    $s has steamapps
-    $s has userdata
-    then $s/steamapps/libraryfolders.vdf
-  }
-  row libraryfolders.*
-  path path = path
+```toml
+[table.libraries]
+format = "vdf"
+file = '''
+$s has steamapps
+$s has userdata
+then $s/steamapps/libraryfolders.vdf
+'''
+row = "libraryfolders.*"
 
-table apps = vdf
-  file {
-    $lib has steamapps
-    then $lib/steamapps/appmanifest_*.acf
-  }
-  row AppState
-  appid      num  = appid
-  name       str  = name
-  installdir name = installdir
+[table.libraries.fields]
+path = { type = "path", key = "path" }
+
+[table.apps]
+format = "vdf"
+file = '''
+$lib has steamapps
+then $lib/steamapps/appmanifest_*.acf
+'''
+row = "AppState"
+
+[table.apps.fields]
+appid = { type = "num", key = "appid" }
+name = { type = "str", key = "name" }
+installdir = { type = "name", key = "installdir" }
 
 # VDF keys match case-insensitively. Several accounts on one PC: the most
 # recent play wins, and play time adds up.
-table played = vdf
-  file {
-    $s has steamapps
-    $s has userdata
-    then $s/userdata/*/config/localconfig.vdf
-  }
-  row UserLocalConfigStore.Software.Valve.Steam.apps.*
-  appid       num     = $key
-  last_played time    = LastPlayed
-  playtime    minutes = Playtime
-  merge by appid: max last_played, sum playtime
+[table.played]
+format = "vdf"
+file = '''
+$s has steamapps
+$s has userdata
+then $s/userdata/*/config/localconfig.vdf
+'''
+row = "UserLocalConfigStore.Software.Valve.Steam.apps.*"
+merge = { by = "appid", last_played = "max", playtime = "sum" }
 
-classify [Steam client]
-class = steam-client/v1
-description = Steam's install folder: `steamapps/`, `userdata/` and `{$exe}` side by side
-filter {
-  $s has steamapps
-  $s has userdata
-  $s has steam.exe | steam.sh as $exe
-  then $s/
-}
+[table.played.fields]
+appid = { type = "num", key = "$key" }
+last_played = { type = "time", key = "LastPlayed" }
+playtime = { type = "minutes", key = "Playtime" }
 
-classify [Steam library]
-class = steam-library/v1
-description = a Steam library, listed in Steam's own `libraryfolders.vdf`
-filter {
-  $lib has steamapps
-  row $l in libraries where $l.path == $lib.path
-  then $lib/steamapps/
-}
+[[classify]]
+title = "Steam client"
+class = "steam-client/v1"
+description = "Steam's install folder: `steamapps/`, `userdata/` and `{$exe}` side by side"
+filter = '''
+$s has steamapps
+$s has userdata
+$s has steam.exe | steam.sh as $exe
+then $s/
+'''
 
-classify [Steam game]
-class = steam-game/v1
-identity = steam:app:{$app.appid}
-description = {$app.name}, installed by Steam: `appmanifest_{$app.appid}.acf` names `{$app.installdir}`
-filter {
-  $lib has steamapps
-  row $l in libraries where $l.path == $lib.path
-  row $app in apps from $lib
-  with $p in played where $p.appid == $app.appid
-  then $lib/steamapps/common/{$app.installdir}/
-}
+[[classify]]
+title = "Steam library"
+class = "steam-library/v1"
+description = "a Steam library, listed in Steam's own `libraryfolders.vdf`"
+filter = '''
+$lib has steamapps
+row $l in libraries where $l.path == $lib.path
+then $lib/steamapps/
+'''
 
-suggest [Steam game not played in 180 days]
-kind = unplayed-game/v1
-within steam-game/v1
-description = {$g.name}: {subtree_size} bytes, last played {$g.last_played} days ago by any Steam account on this PC; Steam can reinstall it from your library
-action = steam.uninstall(appid = $g.appid)
-filter {
-  claim $g is steam-game/v1
-  $g.last_played before 180d ago
-  then $g
-}
+[[classify]]
+title = "Steam game"
+class = "steam-game/v1"
+identity = "steam:app:{$app.appid}"
+description = "{$app.name}, installed by Steam: `appmanifest_{$app.appid}.acf` names `{$app.installdir}`"
+filter = '''
+$lib has steamapps
+row $l in libraries where $l.path == $lib.path
+row $app in apps from $lib
+with $p in played where $p.appid == $app.appid
+then $lib/steamapps/common/{$app.installdir}/
+'''
 
-suggest [Steam game never played, installed long ago]
-kind = unplayed-game/v1
-within steam-game/v1
-description = {$g.name}: {subtree_size} bytes, nothing in it changed for {max_descendant_age} days, and no Steam account on this PC has played it (no `LastPlayed` in any `localconfig.vdf`)
-action = steam.uninstall(appid = $g.appid)
-filter {
-  claim $g is steam-game/v1
-  not $g.played_found
-  $g.max_descendant_age >= 180d
-  then $g
-}
+[[suggest]]
+title = "Steam game not played in 180 days"
+kind = "unplayed-game/v1"
+within = "steam-game/v1"
+description = "{$g.name}: {subtree_size} bytes, last played {$g.last_played} days ago by any Steam account on this PC; Steam can reinstall it from your library"
+action = "steam.uninstall(appid = $g.appid)"
+filter = '''
+claim $g is steam-game/v1
+$g.last_played before 180d ago
+then $g
+'''
+
+[[suggest]]
+title = "Steam game never played, installed long ago"
+kind = "unplayed-game/v1"
+within = "steam-game/v1"
+description = "{$g.name}: {subtree_size} bytes, nothing in it changed for {max_descendant_age} days, and no Steam account on this PC has played it (no `LastPlayed` in any `localconfig.vdf`)"
+action = "steam.uninstall(appid = $g.appid)"
+filter = '''
+claim $g is steam-game/v1
+not $g.played_found
+$g.max_descendant_age >= 180d
+then $g
+'''
 ```
 
 What this shows:
@@ -548,50 +574,54 @@ What this shows:
 
 Downloads is arbitrary space: the user put those files there, and a stale download is routinely the only copy of something that cannot be downloaded again. So it is not a tool claim and gets no suggestions. It is an age-based **lens** over "Other files", where the user decides:
 
-```
-lens [Download not modified in 2 months]
-description = in your Downloads folder, last modified {modified_age} days ago, {size} bytes; it may be your only copy
-filter {
-  $f in ~downloads
-  $f.is_file
-  $f.modified before 2mo ago
-  then $f
-}
+```toml
+[[lens]]
+title = "Download not modified in 2 months"
+description = "in your Downloads folder, last modified {modified_age} days ago, {size} bytes; it may be your only copy"
+filter = '''
+$f in ~downloads
+$f.is_file
+$f.modified before 2mo ago
+then $f
+'''
 
-lens [Download not opened in 2 months]
-description = in your Downloads folder, last opened {accessed_age} days ago, {size} bytes; it may be your only copy
-filter {
-  $f in ~downloads
-  $f.is_file
-  $f.accessed before 2mo ago
-  then $f
-}
+[[lens]]
+title = "Download not opened in 2 months"
+description = "in your Downloads folder, last opened {accessed_age} days ago, {size} bytes; it may be your only copy"
+filter = '''
+$f in ~downloads
+$f.is_file
+$f.accessed before 2mo ago
+then $f
+'''
 ```
 
 - `in ~downloads` resolves through the OS, so a Downloads folder the user moved is still found, and `Documents\Image-Line\Downloads` — FL Studio's sample downloads — never matches.
 - Two lenses rather than one because the sentence must say which clock it read. Windows disables last-access updates by default, so `accessed` is usually absent there, and an absent time makes the comparison false rather than true.
 - A program that writes into Downloads with evidence leaves the lens by claiming its folder: Telegram Desktop, below.
 
-```
-classify [Telegram Desktop downloads]
-class = telegram-downloads/v1
-description = `Telegram Desktop/` in Downloads, and Telegram Desktop is installed for this user (`tdata/` in app data)
-filter {
-  $d at ~downloads/Telegram Desktop/
-  exists ~app-data/Telegram Desktop/tdata/
-  then $d/
-}
+```toml
+[[classify]]
+title = "Telegram Desktop downloads"
+class = "telegram-downloads/v1"
+description = "`Telegram Desktop/` in Downloads, and Telegram Desktop is installed for this user (`tdata/` in app data)"
+filter = '''
+$d at ~downloads/Telegram Desktop/
+exists ~app-data/Telegram Desktop/tdata/
+then $d/
+'''
 
-suggest [Telegram download older than 90 days]
-kind = stale-download/v1
-within telegram-downloads/v1
-description = saved from a Telegram chat {modified_age} days ago, {size} bytes; it may be your only copy
-filter {
-  $f in telegram-downloads/v1
-  $f.is_file
-  $f.modified before 90d ago
-  then $f
-}
+[[suggest]]
+title = "Telegram download older than 90 days"
+kind = "stale-download/v1"
+within = "telegram-downloads/v1"
+description = "saved from a Telegram chat {modified_age} days ago, {size} bytes; it may be your only copy"
+filter = '''
+$f in telegram-downloads/v1
+$f.is_file
+$f.modified before 90d ago
+then $f
+'''
 ```
 
 ## How the engine runs a pack
@@ -622,7 +652,7 @@ The winning verdict records which pack and rule produced it. With packs coming f
 ```
 mypack/
   pack.toml        name, version, kinds; from Unit 3 also platforms, classes, handlers, [reads]
-  rules/*.nom
+  rules/*.toml     [[rule]] tables, read in file-name order
   fixtures/*.tree  Unit 3: golden tests, with a .expect beside each
 ```
 
@@ -634,7 +664,7 @@ version = "0.2.0"
 disposition = "reclaimable"
 ```
 
-Rule files load in file-name order, so rule order — the tie-break within a pack — is the same on every machine.
+Rule files load in file-name order, so rule order — the tie-break within a pack — is the same on every machine. A `rules/` directory still holding a `.nom` file from the old line-based format refuses the whole pack, naming the file, because skipping it would load the pack with none of its rules and no word about why.
 
 Resolution order (which packs load; it no longer decides a conflict between them, see [Conflicts](#conflicts)):
 
@@ -658,7 +688,7 @@ Cached at `%LOCALAPPDATA%\nomnom\packs\<host>\<org>\<repo>@<sha>`.
 
 Packs graduate into the built-in set by pull request, the way Mole keeps one catalog in its own tree.
 
-**Open: override packs.** Suggestions come only from the pack that owns the claim, so a pack that wants to change `builtin.steam`'s 180-day threshold cannot simply add its own `suggest … within steam-game/v1`. The likely shape is an explicit `extends = ["builtin.steam"]` in `pack.toml`, shown at trust time, under which the extending pack may suggest inside the named pack's classes and wins a same-node conflict against it instead of contesting it. Not decided; do not implement it before it is.
+**Open: override packs.** Suggestions come only from the pack that owns the claim, so a pack that wants to change `builtin.steam`'s 180-day threshold cannot simply add its own `[[suggest]]` with `within = "steam-game/v1"`. The likely shape is an explicit `extends = ["builtin.steam"]` in `pack.toml`, shown at trust time, under which the extending pack may suggest inside the named pack's classes and wins a same-node conflict against it instead of contesting it. Not decided; do not implement it before it is.
 
 ## Trust
 

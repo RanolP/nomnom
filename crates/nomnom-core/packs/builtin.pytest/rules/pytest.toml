@@ -1,0 +1,10 @@
+# pytest's cache-provider directory, which pytest marks with `CACHEDIR.TAG`.
+[[rule]]
+title = ".pytest_cache/"
+description = "regenerable: pytest run cache, rewritten on the next test run — it holds pytest's `CACHEDIR.TAG`"
+kind = "build-output/v1"
+filter = '''
+$c.dir.name == ".pytest_cache"
+$c has CACHEDIR.TAG
+then $c/
+'''

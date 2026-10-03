@@ -5,7 +5,7 @@ use nomnom_lang::vocab::Field;
 use nomnom_lang::{Kinds, Rule, Source, parse};
 
 fn rules(text: &str) -> Vec<Rule> {
-    let source = Source::new("t.nom", text);
+    let source = Source::new("t.toml", text);
     parse(&source, &Kinds::builtin()).unwrap_or_else(|d| panic!("expected a parse, got:\n{d}"))
 }
 
@@ -15,22 +15,28 @@ fn one(text: &str) -> Rule {
     parsed.remove(0)
 }
 
+/// A rule of `keys` (beyond its title) and a filter of `body`.
+fn rule_text(keys: &str, body: &str) -> String {
+    format!("[[rule]]\ntitle = \"t\"\n{keys}\nfilter = '''\n{body}\n'''\n")
+}
+
 /// A rule around one filter line, for tests about that line alone.
 fn with_line(line: &str) -> Rule {
-    one(&format!(
-        "[t]\ndescription = evidence\nkind = cache/v1\nfilter {{\n  {line}\n  then $f\n}}\n"
+    one(&rule_text(
+        "description = \"evidence\"\nkind = \"cache/v1\"",
+        &format!("  {line}\n  then $f"),
     ))
 }
 
-const SPEC: &str = "\
-[build/ beside a manifest]
-description = build output, rebuilt by the project's build command — `{$marker}` sits beside it
-kind = build-output/v1
-filter {
+const SPEC: &str = r#"[[rule]]
+title = "build/ beside a manifest"
+description = "build output, rebuilt by the project's build command — `{$marker}` sits beside it"
+kind = "build-output/v1"
+filter = '''
   $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
   then $dir/build/
-}
-";
+'''
+"#;
 
 /// Catches a parser that drops or reorders part of the documented example:
 /// every key, the alternation in written order, the capture and the target.
@@ -63,9 +69,10 @@ fn the_spec_rule_parses_with_every_part_intact() {
 /// not a hard-coded fallback, is where an unset disposition comes from.
 #[test]
 fn an_unset_disposition_comes_from_the_kind() {
-    let rule = one(
-        "[s]\ndescription = old\nkind = stale-download/v1\nfilter {\n  $f.is_file\n  then $f\n}\n",
-    );
+    let rule = one(&rule_text(
+        "description = \"old\"\nkind = \"stale-download/v1\"",
+        "$f.is_file\nthen $f",
+    ));
     assert_eq!(rule.disposition, Disposition::Review);
 }
 
@@ -73,10 +80,10 @@ fn an_unset_disposition_comes_from_the_kind() {
 /// the kind's disposition is the whole point of the key.
 #[test]
 fn a_disposition_below_the_kind_is_accepted() {
-    let rule = one(
-        "[t]\ndescription = maybe\nkind = build-output/v1\ndisposition = review\n\
-         filter {\n  $d lacks Cargo.toml\n  then $d/target/\n}\n",
-    );
+    let rule = one(&rule_text(
+        "description = \"maybe\"\nkind = \"build-output/v1\"\ndisposition = \"review\"",
+        "$d lacks Cargo.toml\nthen $d/target/",
+    ));
     assert_eq!(rule.disposition, Disposition::Review);
 }
 
@@ -93,10 +100,10 @@ fn a_name_with_glob_characters_is_a_glob_and_any_other_is_literal() {
 /// Catches a deep target losing a segment or its directory requirement.
 #[test]
 fn a_then_path_keeps_every_segment_and_only_a_trailing_slash_requires_a_directory() {
-    let rule = one(
-        "[n]\ndescription = x\nkind = cache/v1\nfilter {\n  $p has next.config.js\n  \
-         then $p/.next/cache/\n}\n",
-    );
+    let rule = one(&rule_text(
+        "description = \"x\"\nkind = \"cache/v1\"",
+        "$p has next.config.js\nthen $p/.next/cache/",
+    ));
     let segments: Vec<&str> = rule.filter.then.segments.iter().map(|s| s.value.text()).collect();
     assert_eq!(segments, [".next", "cache"]);
     assert!(rule.filter.then.dir);
@@ -149,8 +156,15 @@ fn a_bare_word_compared_to_a_string_field_is_a_string() {
     assert_eq!(literal_of("$f.name == \"two words\""), Literal::Str("two words".into()));
 }
 
-/// Catches CRLF checkouts (the Windows default) breaking `}` and key parsing,
-/// and comments being read as constraints.
+/// Catches TOML unescaping a filter before the filter language does: in a
+/// literal string `\\` reaches the filter as written and means one backslash.
+#[test]
+fn a_filter_escape_is_read_once_by_the_filter_language() {
+    assert_eq!(literal_of(r#"$f.name == "a\\b""#), Literal::Str(r"a\b".into()));
+}
+
+/// Catches CRLF checkouts (the Windows default) breaking the filter's lines or
+/// the newline TOML drops after `'''`, and comments being read as constraints.
 #[test]
 fn crlf_line_endings_and_comments_parse_like_lf() {
     let text = format!("# leading comment\r\n{}", SPEC.replace('\n', "\r\n"))
@@ -158,12 +172,26 @@ fn crlf_line_endings_and_comments_parse_like_lf() {
     let rule = one(&text);
     assert_eq!(rule.title.value, "build/ beside a manifest");
     assert_eq!(rule.filter.constraints.len(), 1);
+    assert_eq!(rule.filter.then.segments[0].value.text(), "build");
 }
 
-/// Catches rules after the first being lost or merged.
+/// Catches rule order being lost: rules read through a map come back sorted by
+/// title, and within a pack the earlier rule wins, so `z` written first must
+/// stay first.
 #[test]
-fn several_rules_in_one_file_parse_in_order() {
-    let text = format!("{SPEC}\n{}", SPEC.replace("[build/ beside", "[dist/ beside"));
+fn several_rules_in_one_file_parse_in_written_order() {
+    let text = format!(
+        "{}\n{}",
+        SPEC.replace("\"build/ beside", "\"z build/ beside"),
+        SPEC.replace("\"build/ beside", "\"a dist/ beside")
+    );
     let titles: Vec<String> = rules(&text).into_iter().map(|r| r.title.value).collect();
-    assert_eq!(titles, ["build/ beside a manifest", "dist/ beside a manifest"]);
+    assert_eq!(titles, ["z build/ beside a manifest", "a dist/ beside a manifest"]);
+}
+
+/// Catches a file of comments alone (a pack whose rules were all retired, like
+/// `builtin.downloads`) being refused instead of loading no rules.
+#[test]
+fn a_file_of_comments_alone_has_no_rules() {
+    assert!(rules("# nothing here yet\n").is_empty());
 }

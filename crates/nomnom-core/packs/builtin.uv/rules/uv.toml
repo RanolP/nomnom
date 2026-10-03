@@ -2,11 +2,12 @@
 # `CACHEDIR.TAG` at its root beside versioned buckets such as `archive-v0`.
 # uv's managed Pythons and installed tools live outside the cache and are not
 # touched.
-[uv cache]
-description = uv's package cache; uv re-downloads and re-unpacks on the next sync
-kind = cache/v1
-filter {
-  $c has archive-v0
-  $c has CACHEDIR.TAG
-  then $c/
-}
+[[rule]]
+title = "uv cache"
+description = "uv's package cache; uv re-downloads and re-unpacks on the next sync"
+kind = "cache/v1"
+filter = '''
+$c has archive-v0
+$c has CACHEDIR.TAG
+then $c/
+'''

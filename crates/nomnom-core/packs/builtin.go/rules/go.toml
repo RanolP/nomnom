@@ -2,27 +2,29 @@
 
 # GOCACHE (`%LocalAppData%\go-build`) carries a `README` and `trim.txt`, the
 # timestamp of its last trim.
-[Go build cache]
-description = Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)
-kind = cache/v1
-filter {
-  $c.dir.name == "go-build"
-  $c has trim.txt
-  $c has README
-  then $c/
-}
+[[rule]]
+title = "Go build cache"
+description = "Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "go-build"
+$c has trim.txt
+$c has README
+then $c/
+'''
 
 # `GOMODCACHE/cache/download`, from which Go unpacks modules; the module
 # proxy serves them again. The Go modules reference states: "the go command
 # caches most content it downloads from module proxies in its module cache in
 # $GOPATH/pkg/mod/cache/download" (https://go.dev/ref/mod#module-cache),
 # and GOMODCACHE defaults to `$GOPATH/pkg/mod`.
-[Go module download cache]
-description = Go's module download cache; Go re-downloads modules from the module proxy on demand
-kind = cache/v1
-filter {
-  $c.dir.name == "cache"
-  $c under mod/
-  $c under pkg/
-  then $c/download/
-}
+[[rule]]
+title = "Go module download cache"
+description = "Go's module download cache; Go re-downloads modules from the module proxy on demand"
+kind = "cache/v1"
+filter = '''
+$c.dir.name == "cache"
+$c under mod/
+$c under pkg/
+then $c/download/
+'''

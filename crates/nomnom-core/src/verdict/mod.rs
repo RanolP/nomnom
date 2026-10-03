@@ -149,7 +149,7 @@ pub enum Disposition {
 pub struct Provenance {
     /// The pack's `name` from its `pack.toml`.
     pub pack: String,
-    /// The rule's `[Title]`, unique within that pack.
+    /// The rule's `title`, unique within that pack.
     pub rule: String,
 }
 

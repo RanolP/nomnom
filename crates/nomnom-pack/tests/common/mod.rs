@@ -10,14 +10,14 @@ pub fn write_pack(dir: &Path, name: &str, rule: &str) {
     fs::create_dir_all(dir.join("rules")).expect("rules dir");
     fs::write(dir.join("pack.toml"), format!("name = \"{name}\"\nversion = \"0.1.0\"\n"))
         .expect("pack.toml");
-    fs::write(dir.join("rules").join("main.nom"), rule).expect("rule file");
+    fs::write(dir.join("rules").join("main.toml"), rule).expect("rule file");
 }
 
 pub fn rule(rule_name: &str, disposition: &str) -> String {
     format!(
-        "[{rule_name}]\ndescription = a `marker` file sits inside it\nkind = cache/v1\n\
-         disposition = {disposition}\n\
-         filter {{\n  $d has marker\n  then $d/\n}}\n"
+        "[[rule]]\ntitle = \"{rule_name}\"\ndescription = \"a `marker` file sits inside it\"\n\
+         kind = \"cache/v1\"\ndisposition = \"{disposition}\"\n\
+         filter = '''\n$d has marker\nthen $d/\n'''\n"
     )
 }
 

@@ -1,0 +1,36 @@
+# NuGet's caches: the HTTP cache and plugin cache under `%LocalAppData%\NuGet`,
+# and the global packages folder `~/.nuget/packages`. NuGet's own docs table
+# these exact Windows defaults
+# (https://learn.microsoft.com/en-us/nuget/consume-packages/managing-the-global-packages-and-cache-folders):
+# http-cache `%localappdata%\NuGet\v3-cache`, plugins-cache
+# `%localappdata%\NuGet\plugins-cache`, global-packages `%userprofile%\.nuget\packages`.
+
+[[rule]]
+title = "NuGet HTTP cache"
+description = "NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore"
+kind = "cache/v1"
+filter = '''
+$n.dir.name == "NuGet"
+then $n/v3-cache/
+'''
+
+[[rule]]
+title = "NuGet plugins cache"
+description = "NuGet's credential-plugin cache; NuGet rebuilds it on the next restore"
+kind = "cache/v1"
+filter = '''
+$n.dir.name == "NuGet"
+then $n/plugins-cache/
+'''
+
+# Every restored project reads its packages from here. A restore re-downloads
+# them, but a package delisted from or never on a public feed is gone for good.
+[[rule]]
+title = "NuGet global packages"
+description = "NuGet's global packages folder; `dotnet restore` re-downloads what is missing, but a package from a feed you no longer reach cannot be fetched again"
+kind = "cache/v1"
+disposition = "review"
+filter = '''
+$n.dir.name == ".nuget"
+then $n/packages/
+'''

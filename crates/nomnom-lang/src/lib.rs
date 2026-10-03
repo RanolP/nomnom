@@ -13,8 +13,8 @@
 //!   evaluator
 //! - [`kind`] — what a rule concludes a path is, and that kind's defaults
 //! - [`ast`] — the validated shape
-//! - [`parse`] — the line-oriented parser, doing every check that needs no
-//!   filesystem
+//! - [`parse`] — a TOML rule file to rules, parsing each `filter` in place and
+//!   doing every check that needs no filesystem
 //! - [`eval`] — a field test and one node's facts to a yes or no, plus the
 //!   `description` rendering that turns a verdict into a sentence
 //! - [`pack`] — a directory on disk to a validated [`pack::Pack`]
@@ -28,15 +28,16 @@
 //! ```
 //! use nomnom_lang::{Kinds, Source, parse};
 //!
-//! let source = Source::new("example.nom", "\
-//! [Cargo target/]
-//! description = Cargo build output, rebuilt by `cargo build`
-//! kind = build-output/v1
-//! filter {
-//!   $dir has Cargo.toml
-//!   then $dir/target/
-//! }
-//! ");
+//! let source = Source::new("example.toml", r#"
+//! [[rule]]
+//! title = "Cargo target/"
+//! description = "Cargo build output, rebuilt by `cargo build`"
+//! kind = "build-output/v1"
+//! filter = '''
+//! $dir has Cargo.toml
+//! then $dir/target/
+//! '''
+//! "#);
 //! let rules = parse(&source, &Kinds::builtin()).expect("valid rule");
 //! assert_eq!(rules[0].title.value, "Cargo target/");
 //! assert_eq!(rules[0].disposition.name(), "reclaimable", "the kind's default");

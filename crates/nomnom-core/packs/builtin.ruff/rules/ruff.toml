@@ -1,0 +1,10 @@
+# Ruff's lint cache, which Ruff marks with `CACHEDIR.TAG`.
+[[rule]]
+title = ".ruff_cache/"
+description = "regenerable: Ruff lint cache, rewritten on the next `ruff check` — it holds Ruff's `CACHEDIR.TAG`"
+kind = "build-output/v1"
+filter = '''
+$c.dir.name == ".ruff_cache"
+$c has CACHEDIR.TAG
+then $c/
+'''

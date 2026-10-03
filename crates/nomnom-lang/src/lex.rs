@@ -1,7 +1,6 @@
 //! One `filter` line to words, and a word to a literal.
 //!
-//! A rule file is line-oriented: a `[Title]` line, `key = value` lines, and a
-//! `filter { ... }` block holding one constraint per line. So there is no
+//! A rule's `filter` is line-oriented, one constraint per line, so there is no
 //! token stream across lines — the parser hands each filter line here and gets
 //! back its words. A word is a run of non-blank characters, a `"quoted string"`
 //! (for a name with a space in it), or a lone `|`.

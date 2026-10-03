@@ -10,20 +10,19 @@ use nomnom_pack::Trust;
 use tempfile::TempDir;
 
 /// A pack directory holding one rule, so a test can say what a pack concludes
-/// without a `.nom` file on the side.
+/// without a rule file on the side.
 fn pack_dir(root: &Path, name: &str, rule: &str) -> PathBuf {
     let dir = root.join(name);
     write(dir.join("pack.toml"), format!("name = \"{name}\"\nversion = \"0.1.0\"\n").as_bytes());
-    write(dir.join("rules").join("main.nom"), rule.as_bytes());
+    write(dir.join("rules").join("main.toml"), rule.as_bytes());
     dir
 }
 
 /// One rule matching a directory named `blobs`.
 fn blobs_rule(rule_name: &str, disposition: &str, reason: &str) -> String {
     format!(
-        "[{rule_name}]\ndescription = {reason}\nkind = cache/v1\n\
-         disposition = {disposition}\n\
-         filter {{\n  then $p/blobs/\n}}\n"
+        "[[rule]]\ntitle = \"{rule_name}\"\ndescription = \"{reason}\"\nkind = \"cache/v1\"\n\
+         disposition = \"{disposition}\"\nfilter = 'then $p/blobs/'\n"
     )
 }
 

@@ -110,10 +110,10 @@ impl Diagnostic {
 impl fmt::Display for Diagnostic {
     /// ```text
     /// error: unknown disposition `nuke`
-    ///   --> rules/bad.nom:4:23
+    ///   --> rules/bad.toml:4:16
     ///    |
-    ///  4 |         disposition = nuke
-    ///    |                       ^^^^ expected `keep`, `reclaimable` or `review`
+    ///  4 | disposition = "nuke"
+    ///    |                ^^^^ expected `keep`, `reclaimable` or `review`
     ///    |
     ///    = help: ...
     /// ```

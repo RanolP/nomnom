@@ -28,7 +28,7 @@ impl<T> Spanned<T> {
     }
 }
 
-/// One `[Title]` section.
+/// One `[[rule]]` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
     /// What a verdict cites as the rule that produced it.
@@ -41,11 +41,11 @@ pub struct Rule {
     /// The kind's default unless the rule downgraded it.
     pub disposition: Disposition,
     pub filter: Filter,
-    /// From the `[` of the title to the `}` closing the filter.
+    /// From the title's text to the `'''` closing the filter.
     pub span: Span,
 }
 
-/// `filter { ... }`: every constraint holds of [`Filter::var`], and `then`
+/// `filter = '''...'''`: every constraint holds of [`Filter::var`], and `then`
 /// names the node the verdict lands on, relative to it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
