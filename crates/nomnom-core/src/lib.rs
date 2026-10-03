@@ -24,8 +24,12 @@ pub mod verdict;
 pub enum Feature {
     /// The fixed drives, with label, filesystem and capacity.
     Drives,
-    /// A drive's tree with rolled-up sizes, biggest first.
+    /// A drive's tree with rolled-up sizes, biggest first, as every file, as
+    /// only the recognized subtrees, or as only the other files.
     Tree,
+    /// Which pack owns which subtree, and how the drive splits into recognized
+    /// and other bytes.
+    Classify,
     /// What each path is, and whether it can go.
     Suggest,
     /// A dry-run cleanup plan, permanently deleted on request.
@@ -37,6 +41,12 @@ pub enum Feature {
 impl Feature {
     /// Every variant. Parity tests iterate this, so a new variant belongs here
     /// as well as in each front-end's match.
-    pub const ALL: [Feature; 5] =
-        [Feature::Drives, Feature::Tree, Feature::Suggest, Feature::Clean, Feature::Packs];
+    pub const ALL: [Feature; 6] = [
+        Feature::Drives,
+        Feature::Tree,
+        Feature::Classify,
+        Feature::Suggest,
+        Feature::Clean,
+        Feature::Packs,
+    ];
 }

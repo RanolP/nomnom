@@ -159,20 +159,6 @@ fn fixture() -> TempDir {
         write(root.join(file), b"x");
     }
 
-    // A stale download, both timestamps pushed back past the 90-day gate. Only
-    // the by-access rule can fire here: the by-mtime rule wants a file the
-    // platform reports no atime for, which no fixture can manufacture on a
-    // filesystem that records one.
-    let download = root.join("Downloads").join("installer.iso");
-    write(&download, b"a downloaded thing");
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(200 * 24 * 60 * 60);
-    std::fs::File::options()
-        .write(true)
-        .open(&download)
-        .expect("reopen download")
-        .set_times(std::fs::FileTimes::new().set_accessed(old).set_modified(old))
-        .expect("set timestamps");
-
     tmp
 }
 
@@ -202,7 +188,6 @@ use Disposition::{Reclaimable, Review};
 /// Path, pack, label, disposition, confidence, reason — in path order.
 #[rustfmt::skip]
 const EXPECTED: &[(&str, &str, &str, Disposition, f32, &str)] = &[
-    ("Downloads/installer.iso", "builtin.downloads", "stale-download", Review, 0.5, "in Downloads, last opened 200 days ago, 18 bytes; may still be the only copy"),
     ("bun/.bun/install/cache", "builtin.bun", "cache", Reclaimable, 0.7, "Bun's package install cache; Bun re-downloads packages on the next install"),
     ("cargo/home/git/checkouts", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build"),
     ("cargo/home/registry/cache", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them"),

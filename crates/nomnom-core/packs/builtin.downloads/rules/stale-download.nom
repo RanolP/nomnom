@@ -1,30 +1,11 @@
-# Downloads nobody has touched in months.
+# Downloads is arbitrary space: the user put those files there, and a stale
+# download is routinely the only copy of something that cannot be downloaded
+# again. So it is not a tool claim, and from Unit 2 it gets no suggestions
+# (`docs/lang.md`, "Worked example: Downloads").
 #
-# `stale-download/v1` is always `review`, never reclaimable: a stale download is
-# routinely the only copy of something that cannot be downloaded again.
-#
-# Two rules rather than one because the sentence has to say which clock it
-# read. Windows disables last-access updates by default, so `accessed_age` is
-# usually absent and the mtime rule is the one that fires there.
-
-[Stale download by access]
-description = in Downloads, last opened {accessed_age} days ago, {size} bytes; may still be the only copy
-kind = stale-download/v1
-filter {
-  $f.is_file
-  $f under Downloads/
-  $f.has_accessed
-  $f.accessed_age >= 90d
-  then $f
-}
-
-[Stale download by mtime]
-description = in Downloads, last modified {modified_age} days ago, {size} bytes; may still be the only copy
-kind = stale-download/v1
-filter {
-  $f.is_file
-  $f under Downloads/
-  not $f.has_accessed
-  $f.modified_age >= 90d
-  then $f
-}
+# The two short-form `stale-download/v1` rules that lived here matched
+# `under Downloads/`, which also caught folders merely named Downloads (FL
+# Studio's `Documents\Image-Line\Downloads`), and in Unit 2 every short-form
+# rule compiles to an exclusive claim, which would have made the user's
+# Downloads folder "recognized". Unit 3 brings them back as age-based lenses
+# over "Other files", keyed on `in ~downloads`, which resolves through the OS.

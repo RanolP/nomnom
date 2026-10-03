@@ -14,6 +14,12 @@ mod session;
 mod state;
 mod treemap;
 
+// The Other files tree is tested over a real fixture catalog, built by the
+// core's own fixture helpers rather than a copy of them.
+#[cfg(test)]
+#[path = "../../nomnom-core/tests/common/mod.rs"]
+mod scan_fixtures;
+
 use std::process::ExitCode;
 
 use gpui_kit::*;

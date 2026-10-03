@@ -11,15 +11,18 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use nomnom_core::action::plain;
 use nomnom_core::catalog::NodeId;
 use nomnom_core::scan::{BackendUsed, EntryKind};
+use nomnom_core::verdict::Assessment;
 
 use crate::session::{Phase, ScanData, Session};
-use crate::state::{TreeModel, count, modified, size};
+use crate::state::{RecognizedRow, TreeModel, count, modified, recognized_rows, size};
 use crate::treemap::Treemap;
 
 const ROW_HEIGHT: f32 = 24.;
@@ -28,11 +31,25 @@ const SIZE_W: f32 = 90.;
 const COUNT_W: f32 = 80.;
 const MODIFIED_W: f32 = 130.;
 
+/// The tree's three views, `nomnom scan --view all|recognized|other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    All,
+    Recognized,
+    Other,
+}
+
 pub struct ScanScreen {
     session: Entity<Session>,
     /// The scan the tree was built from, so a rescan is noticed by pointer.
     built_from: Option<Arc<ScanData>>,
     tree: TreeModel,
+    view: View,
+    /// The assessment the Recognized and Other files views were built from;
+    /// both stay disabled until one lands.
+    assessed_from: Option<Arc<Assessment>>,
+    other: TreeModel,
+    recognized: Vec<RecognizedRow>,
     selected: Option<NodeId>,
     hovered: Option<NodeId>,
     treemap: Rc<RefCell<Treemap>>,
@@ -48,6 +65,10 @@ impl ScanScreen {
             session,
             built_from: None,
             tree: TreeModel::default(),
+            view: View::All,
+            assessed_from: None,
+            other: TreeModel::default(),
+            recognized: Vec::new(),
             selected: None,
             hovered: None,
             treemap: Rc::default(),
@@ -65,17 +86,94 @@ impl ScanScreen {
             self.hovered = None;
             self.show_errors = false;
         }
+        let assessment = self.session.read(cx).assessment.clone();
+        let same = match (&assessment, &self.assessed_from) {
+            (Some(now), Some(built)) => Arc::ptr_eq(now, built),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            match &assessment {
+                Some(assessment) => {
+                    self.other = TreeModel::other_files(&data.catalog, assessment.clone());
+                    self.recognized = recognized_rows(&data.catalog, &assessment.ownership);
+                }
+                None => {
+                    self.other = TreeModel::default();
+                    self.recognized.clear();
+                    self.view = View::All;
+                }
+            }
+            self.assessed_from = assessment;
+        }
         Some(data)
     }
 
-    /// Select `id`, open the tree down to it and scroll it into view.
+    fn active(&self) -> &TreeModel {
+        if self.view == View::Other { &self.other } else { &self.tree }
+    }
+
+    fn active_mut(&mut self) -> &mut TreeModel {
+        if self.view == View::Other { &mut self.other } else { &mut self.tree }
+    }
+
+    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.view = view;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if let Some(id) = self.selected {
+            self.reveal(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Select `id`, open the tree down to it and scroll it into view. In the
+    /// Recognized view, the row is the claim that owns `id`.
     pub fn reveal(&mut self, id: NodeId, cx: &mut Context<Self>) {
         let Some(data) = self.sync(cx) else { return };
         self.selected = Some(id);
-        if let Some(row) = self.tree.reveal(&data.catalog, id) {
+        let row = match self.view {
+            View::Recognized => {
+                let owner = self.other.ownership().and_then(|o| o.owner(id)).map(|(root, _)| *root);
+                self.recognized.iter().position(
+                    |row| matches!(row, RecognizedRow::Claim { id: claim, .. } if Some(*claim) == owner),
+                )
+            }
+            _ => self.active_mut().reveal(&data.catalog, id),
+        };
+        if let Some(row) = row {
             self.scroll.scroll_to_item(row, ScrollStrategy::Center);
         }
         cx.notify();
+    }
+
+    fn render_views(&self, data: &ScanData, cx: &mut Context<Self>) -> Div {
+        let ready = self.assessed_from.is_some();
+        let button = |id: &'static str, label: &'static str, view: View| {
+            Button::new(id)
+                .small()
+                .label(label)
+                .selected(self.view == view)
+                .disabled(view != View::All && !ready)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+        };
+        let split = match self.other.ownership() {
+            Some(ownership) => {
+                let root = data.catalog.root();
+                format!(
+                    "Recognized {} · Other files {}",
+                    size(ownership.claimed(root)),
+                    size(ownership.arbitrary(&data.catalog, root))
+                )
+            }
+            None => "Recognized and Other files open once the packs have judged the drive."
+                .to_string(),
+        };
+        h_flex()
+            .gap_2()
+            .child(button("view-all", "All files", View::All))
+            .child(button("view-recognized", "Recognized", View::Recognized))
+            .child(button("view-other", "Other files", View::Other))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(split))
     }
 
     /// Repainted by the session's 100 ms ticker while the scan runs.
@@ -285,32 +383,57 @@ impl Render for ScanScreen {
         let timing = format!("{backend} scan in {:.1} s", data.elapsed.as_secs_f32());
         let has_allocated = data.allocated.is_some();
 
-        let rows = self.tree.rows().len();
+        let view = self.view;
+        let rows = match view {
+            View::Recognized => self.recognized.len(),
+            _ => self.active().rows().len(),
+        };
         let list_data = data.clone();
         let list = uniform_list(
-            "scan-tree",
+            match view {
+                View::All => "scan-tree",
+                View::Recognized => "recognized-list",
+                View::Other => "other-tree",
+            },
             rows,
             cx.processor(move |this, range: Range<usize>, _, cx| {
-                range.map(|ix| this.render_row(&list_data, ix, cx)).collect::<Vec<_>>()
+                range
+                    .map(|ix| match view {
+                        View::Recognized => this.render_recognized(ix, cx),
+                        _ => this.render_row(&list_data, ix, cx),
+                    })
+                    .collect::<Vec<_>>()
             }),
         )
         .track_scroll(&self.scroll)
         .size_full();
 
         let muted = cx.theme().muted_foreground;
-        let header = h_flex()
-            .px_2()
-            .text_xs()
-            .text_color(muted)
-            .child(div().flex_1().child("Name"))
-            .child(div().w(px(PERCENT_W)).child("% of parent"))
-            .child(div().w(px(SIZE_W)).text_right().child("Size"))
-            .when(has_allocated, |row| {
-                row.child(div().w(px(SIZE_W)).text_right().child("Allocated"))
-            })
-            .child(div().w(px(COUNT_W)).text_right().child("Files"))
-            .child(div().w(px(COUNT_W)).text_right().child("Dirs"))
-            .child(div().w(px(MODIFIED_W)).text_right().child("Modified"));
+        let header = match view {
+            View::Recognized => h_flex()
+                .px_2()
+                .text_xs()
+                .text_color(muted)
+                .child(div().flex_1().child("Pack › claim"))
+                .child(div().w(px(SIZE_W)).text_right().child("Size")),
+            _ => h_flex()
+                .px_2()
+                .text_xs()
+                .text_color(muted)
+                .child(div().flex_1().child("Name"))
+                .child(div().w(px(PERCENT_W)).child("% of parent"))
+                .child(div().w(px(SIZE_W)).text_right().child(if view == View::Other {
+                    "Other files"
+                } else {
+                    "Size"
+                }))
+                .when(has_allocated, |row| {
+                    row.child(div().w(px(SIZE_W)).text_right().child("Allocated"))
+                })
+                .child(div().w(px(COUNT_W)).text_right().child("Files"))
+                .child(div().w(px(COUNT_W)).text_right().child("Dirs"))
+                .child(div().w(px(MODIFIED_W)).text_right().child("Modified")),
+        };
 
         v_flex()
             .size_full()
@@ -323,6 +446,7 @@ impl Render for ScanScreen {
                     .child(div().text_xs().text_color(muted).child(timing)),
             )
             .child(self.render_banners(&data, notice, cx))
+            .child(self.render_views(&data, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -346,23 +470,31 @@ impl Render for ScanScreen {
 
 impl ScanScreen {
     fn render_row(&self, data: &Arc<ScanData>, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let row = self.tree.rows()[ix];
+        let tree = self.active();
+        let row = tree.rows()[ix];
         let id = row.id;
         let catalog = &data.catalog;
         let node = catalog.node(id);
-        let expanded = self.tree.is_expanded(id);
-        let is_dir = node.kind == EntryKind::Dir && !catalog.children(id).is_empty();
+        let expanded = tree.is_expanded(id);
+        let is_dir = tree.expandable(catalog, id);
         let marker = match (is_dir, expanded) {
             (false, _) => "  ",
             (true, false) => "▸ ",
             (true, true) => "▾ ",
         };
         let suffix = if node.kind == EntryKind::Dir { "\\" } else { "" };
-        let parent_size = node.parent.map_or(0, |parent| catalog.node(parent).subtree_size);
-        let share =
-            if parent_size == 0 { 0. } else { node.subtree_size as f32 / parent_size as f32 };
+        // In Other files a claim root is a link to the Recognized view: it
+        // shows what claimed it and the bytes it holds, none of them other.
+        let link = tree.link(id).map(|claim| {
+            format!("  → recognized: {} [{}]", claim.class, claim.provenance.rule)
+        });
+        let bytes = tree.bytes(catalog, id);
+        let shown = if link.is_some() { node.subtree_size } else { bytes };
+        let parent_size = node.parent.map_or(0, |parent| tree.bytes(catalog, parent));
+        let share = if parent_size == 0 { 0. } else { bytes as f32 / parent_size as f32 };
         let selected = self.selected == Some(id);
         let theme = cx.theme();
+        let muted = theme.muted_foreground;
         let toggle_data = data.clone();
 
         h_flex()
@@ -377,7 +509,7 @@ impl ScanScreen {
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.selected = Some(id);
                 if is_dir && event.click_count() == 2 {
-                    this.tree.toggle(&toggle_data.catalog, id);
+                    this.active_mut().toggle(&toggle_data.catalog, id);
                 }
                 cx.notify();
             }))
@@ -394,12 +526,15 @@ impl ScanScreen {
                             let toggle_data = data.clone();
                             marker.on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.tree.toggle(&toggle_data.catalog, id);
+                                this.active_mut().toggle(&toggle_data.catalog, id);
                                 cx.notify();
                             }))
                         },
                     ))
-                    .child(format!("{}{suffix}", catalog.name(id).to_string_lossy())),
+                    .child(format!("{}{suffix}", catalog.name(id).to_string_lossy()))
+                    .when_some(link, |name, link| {
+                        name.child(div().text_xs().text_color(muted).child(link))
+                    }),
             )
             .child(
                 h_flex()
@@ -414,7 +549,7 @@ impl ScanScreen {
                     )
                     .child(div().text_xs().child(format!("{:.1} %", share * 100.))),
             )
-            .child(div().w(px(SIZE_W)).text_right().child(size(node.subtree_size)))
+            .child(div().w(px(SIZE_W)).text_right().child(size(shown)))
             .when_some(data.allocated(id), |row, allocated| {
                 row.child(div().w(px(SIZE_W)).text_right().child(size(allocated)))
             })
@@ -428,5 +563,58 @@ impl ScanScreen {
                     .child(node.max_modified.map(modified).unwrap_or_default()),
             )
             .into_any_element()
+    }
+
+    /// One row of the Recognized view: a pack, one of its claims (click to
+    /// select it on the map), or a dropped claim.
+    fn render_recognized(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let row = h_flex().id(("recognized-row", ix)).h(px(ROW_HEIGHT)).w_full().px_2().text_sm();
+        let name = |indent: f32| {
+            h_flex().flex_1().min_w_0().gap_2().overflow_hidden().whitespace_nowrap().pl(px(indent))
+        };
+        match &self.recognized[ix] {
+            RecognizedRow::Pack { name: pack, bytes, claims } => row
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name(0.).child(pack.clone()).child(
+                    div().text_xs().text_color(muted).child(format!(
+                        "{claims} {}",
+                        if *claims == 1 { "claim" } else { "claims" }
+                    )),
+                ))
+                .child(div().w(px(SIZE_W)).text_right().child(size(*bytes))),
+            RecognizedRow::Claim { id, path, class, rule, bytes, nested } => {
+                let id = *id;
+                let selected = self.selected == Some(id);
+                let note = if *nested {
+                    format!("{class} [{rule}] · inside another of this pack's claims")
+                } else {
+                    format!("{class} [{rule}]")
+                };
+                row.cursor_pointer()
+                    .when(selected, |row| row.bg(theme.list_active))
+                    .when(!selected, |row| row.hover(|style| style.bg(theme.list_hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(id);
+                        cx.notify();
+                    }))
+                    .child(
+                        name(if *nested { 32. } else { 16. })
+                            .child(path.clone())
+                            .child(div().text_xs().text_color(muted).child(note)),
+                    )
+                    .child(div().w(px(SIZE_W)).text_right().child(size(*bytes)))
+            }
+            RecognizedRow::DroppedHeader { count } => row
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name(0.).child(format!("Dropped claims ({count})"))),
+            RecognizedRow::Dropped { path, provenance, why } => row.text_color(muted).child(
+                name(16.)
+                    .child(path.clone())
+                    .child(div().text_xs().child(format!("{provenance} — {why}"))),
+            ),
+        }
+        .into_any_element()
     }
 }

@@ -1,6 +1,7 @@
 //! `nomnom` — argument parsing and dispatch. Every answer comes from
 //! `nomnom-core`; this crate only asks and renders.
 
+mod classify;
 mod clean;
 mod drives;
 mod input;
@@ -66,16 +67,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show the drive's tree with rolled-up sizes, biggest first.
+    /// Show the drive's tree with rolled-up sizes, biggest first: every file,
+    /// only what the packs recognize, or only the other files.
     Scan {
         #[command(flatten)]
         scan: ScanArgs,
+        #[command(flatten)]
+        packs: PackArgs,
+        /// Which files to show. `recognized` and `other` load the packs.
+        #[arg(long, value_enum, default_value_t = scan::View::All)]
+        view: scan::View,
         /// How many levels of the tree to print.
         #[arg(long, default_value_t = 2)]
         depth: u32,
         /// Cap the children shown per level.
         #[arg(long, default_value_t = 10)]
         top: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which pack owns which subtree, and how the drive splits into
+    /// recognized and other bytes. Suggests nothing.
+    Classify {
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[command(flatten)]
+        packs: PackArgs,
         #[arg(long)]
         json: bool,
     },
@@ -144,6 +161,7 @@ impl Command {
         match self {
             Command::Drives { .. } => Feature::Drives,
             Command::Scan { .. } => Feature::Tree,
+            Command::Classify { .. } => Feature::Classify,
             Command::Suggest { .. } => Feature::Suggest,
             Command::Clean { .. } => Feature::Clean,
             Command::Pack { .. } => Feature::Packs,
@@ -160,6 +178,7 @@ fn subcommand_name(feature: Feature) -> &'static str {
     match feature {
         Feature::Drives => "drives",
         Feature::Tree => "scan",
+        Feature::Classify => "classify",
         Feature::Suggest => "suggest",
         Feature::Clean => "clean",
         Feature::Packs => "pack",
@@ -184,8 +203,17 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Drives { json } => drives::run(json),
-        Command::Scan { scan, depth, top, json } => {
-            scan::run(&scan.drive, scan.show_errors, depth, top, json)
+        Command::Scan { scan, packs, view, depth, top, json } => scan::run(scan::Request {
+            drive: &scan.drive,
+            show_errors: scan.show_errors,
+            packs: &packs.packs,
+            view,
+            depth,
+            top,
+            json,
+        }),
+        Command::Classify { scan, packs, json } => {
+            classify::run(&scan.drive, scan.show_errors, &packs.packs, json)
         }
         Command::Suggest { scan, packs, json } => {
             suggest::run(&scan.drive, scan.show_errors, &packs.packs, json)
@@ -237,6 +265,22 @@ mod tests {
             };
             let parsed = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             assert_eq!(parsed.command.feature(), feature, "{args:?}");
+        }
+    }
+
+    /// The GUI tree's three views are one `--view` flag here; a renamed or
+    /// dropped value breaks parity with the GUI's view switch.
+    #[test]
+    fn scan_offers_every_tree_view() {
+        for (value, view) in [
+            ("all", scan::View::All),
+            ("recognized", scan::View::Recognized),
+            ("other", scan::View::Other),
+        ] {
+            let args = ["nomnom", "scan", "C:\\", "--view", value];
+            let parsed = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let Command::Scan { view: parsed, .. } = parsed.command else { panic!("not scan") };
+            assert_eq!(parsed, view, "{value}");
         }
     }
 }

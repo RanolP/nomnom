@@ -199,6 +199,7 @@ mod tests {
             groups: vec![Group { label: Label::CACHE, bytes: entries.len() as u64, entries }],
             reclaimable_bytes: 0,
             shared: Vec::new(),
+            ownership: Default::default(),
         }
     }
 

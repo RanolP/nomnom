@@ -36,6 +36,7 @@ use nomnom_lang::{
 };
 use nomnom_pack::Trust;
 
+use super::claim::{Claim, DropReason, DroppedClaim, Ownership};
 use super::{Disposition, Label, Provenance, Verdict, name_eq, node_name};
 use crate::scan::{ScanProgress, Stage, advance};
 use crate::catalog::{Catalog, NodeId};
@@ -67,12 +68,13 @@ impl TrustedPack {
 }
 
 /// Every target some rule selects, each with the one rule that won it, with
-/// targets inside another target already dropped. In id order.
+/// targets inside another target already dropped, in id order; and who owns
+/// which subtree.
 pub(super) fn select(
     ctx: &Catalog,
     packs: &[TrustedPack],
     progress: Option<&ScanProgress>,
-) -> Vec<(NodeId, Verdict)> {
+) -> (Vec<(NodeId, Verdict)>, Ownership) {
     let started = Instant::now();
     // The front-end may have entered Index already, before resolving packs.
     if let Some(progress) = progress {
@@ -122,9 +124,9 @@ pub(super) fn select(
     if let Some(progress) = progress {
         progress.enter(Stage::Group, 0);
     }
-    let verdicts = resolve(ctx, packs, &rules, hits, &clock);
+    let resolved = resolve(ctx, packs, &rules, hits, &clock);
     timings::lap("assess: resolve conflicts and nesting", started);
-    verdicts
+    resolved
 }
 
 /// One rule, ready to match.
@@ -561,35 +563,87 @@ struct Clock {
 /// Highest confidence, then the later-resolved pack, then the earlier rule in
 /// that pack (`docs/lang.md`); the trust cap is applied to the winner only, so
 /// an untrusted pack's downgraded rule cannot lose to a weaker one and change
-/// which rule a human is shown. Then an outer target swallows every target
-/// inside it — the directory is one decision.
+/// which rule a human is shown.
+///
+/// Every winner is an exclusive claim (`docs/lang.md`, "Ownership"). A claim
+/// inside another pack's claim is dropped; inside its own pack's claim it is
+/// kept, and the innermost claim owns the node. Then one suggestion per claim,
+/// an outer one swallowing every one inside it — the directory is one
+/// decision. So every suggestion lies inside a claim, and the arbitrary tree
+/// gets none.
 fn resolve(
     ctx: &Catalog,
     packs: &[TrustedPack],
     rules: &[Compiled],
     hits: Vec<Hit>,
     clock: &Clock,
-) -> Vec<(NodeId, Verdict)> {
+) -> (Vec<(NodeId, Verdict)>, Ownership) {
     let mut best: HashMap<NodeId, Hit> = HashMap::new();
+    // Every rule that lost the conflict on some node, as (node, rule).
+    let mut outranked: Vec<(NodeId, usize)> = Vec::new();
     for hit in hits {
         match best.get(&hit.target) {
-            Some(current) if !outranks(&rules[hit.rule], &rules[current.rule]) => {}
+            Some(current) if !outranks(&rules[hit.rule], &rules[current.rule]) => {
+                outranked.push((hit.target, hit.rule));
+            }
             _ => {
-                best.insert(hit.target, hit);
+                if let Some(old) = best.insert(hit.target, hit) {
+                    outranked.push((old.target, old.rule));
+                }
             }
         }
     }
     let mut winners: Vec<Hit> = best.into_values().collect();
     winners.sort_unstable_by_key(|hit| hit.target);
 
+    let claim_of = |rule: usize| {
+        let compiled = &rules[rule];
+        let pack = &packs[compiled.pack].pack;
+        Claim {
+            class: format!("{}:{}", pack.name, compiled.rule.kind.value),
+            provenance: Provenance::new(&pack.name, &compiled.rule.title.value),
+            confidence: compiled.rule.confidence,
+            exclusive: true,
+        }
+    };
+    let mut dropped: Vec<DroppedClaim> = Vec::new();
+    // In id order: (node, claim, enclosing claim); beside it each claim's pack
+    // and the end of its id range.
+    let mut claims: Vec<(NodeId, Claim, Option<usize>)> = Vec::new();
+    let mut claim_pack: Vec<usize> = Vec::new();
+    let mut claim_end: Vec<u32> = Vec::new();
+    // The claims containing the current node, innermost last.
+    let mut open: Vec<usize> = Vec::new();
+
     let mut out = Vec::new();
     let mut fence = 0;
     for hit in winners {
+        while open.last().is_some_and(|&top| hit.target.0 >= claim_end[top]) {
+            open.pop();
+        }
+        let compiled = &rules[hit.rule];
+        // Every open claim is from one pack: a claim from another pack never
+        // gets on the stack.
+        if let Some(&owner) = open.last()
+            && claim_pack[owner] != compiled.pack
+        {
+            dropped.push(DroppedClaim {
+                path: ctx.path(hit.target).display().to_string(),
+                claim: claim_of(hit.rule),
+                reason: DropReason::Inside { owner: claims[owner].1.provenance.clone() },
+            });
+            continue;
+        }
+        let end = ctx.subtree(hit.target).end;
+        claims.push((hit.target, claim_of(hit.rule), open.last().copied()));
+        claim_pack.push(compiled.pack);
+        claim_end.push(end);
+        open.push(claims.len() - 1);
+
         if hit.target.0 < fence {
             continue;
         }
-        fence = ctx.subtree(hit.target).end;
-        let compiled = &rules[hit.rule];
+        fence = end;
         let rule = compiled.rule;
         let source = &packs[compiled.pack];
         let capped = source.trust.cap(rule.disposition);
@@ -613,7 +667,21 @@ fn resolve(
             },
         ));
     }
-    out
+
+    // A loser on a node whose winner was itself dropped as nested is not
+    // logged twice: the nesting already says why nothing there is owned.
+    for (node, rule) in outranked {
+        let Ok(ix) = claims.binary_search_by_key(&node, |(id, ..)| *id) else { continue };
+        dropped.push(DroppedClaim {
+            path: ctx.path(node).display().to_string(),
+            claim: claim_of(rule),
+            reason: DropReason::Outranked { by: claims[ix].1.provenance.clone() },
+        });
+    }
+    dropped.sort_by(|a, b| {
+        a.path.cmp(&b.path).then_with(|| a.claim.provenance.cmp(&b.claim.provenance))
+    });
+    (out, Ownership::new(ctx, claims, dropped))
 }
 
 /// On an equal confidence a later pack takes over and a later rule in the

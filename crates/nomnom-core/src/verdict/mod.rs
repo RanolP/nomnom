@@ -6,6 +6,7 @@
 
 mod assess;
 mod builtin;
+mod claim;
 mod packs;
 mod select;
 
@@ -20,6 +21,7 @@ use crate::catalog::{Catalog, NodeId};
 
 pub use assess::{Assessment, Entry, Group, Reach, SharedFile, assess, assess_with, charges};
 pub use builtin::builtin_packs;
+pub use claim::{Claim, ClaimRow, DropReason, DroppedClaim, Ownership, PackClaims};
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };
@@ -196,7 +198,14 @@ pub struct Verdict {
 /// whole subtree, so no verdict lies inside another rule verdict's subtree —
 /// which is what keeps [`Rollup::reclaimable_bytes`] sound.
 pub fn judge(ctx: &Catalog, packs: &[TrustedPack]) -> Vec<(NodeId, Verdict)> {
-    select::select(ctx, packs, None)
+    select::select(ctx, packs, None).0
+}
+
+/// Every claim the packs make over the catalog, and the claimed/arbitrary byte
+/// split (`docs/lang.md`, "Ownership"). [`assess`] carries the same value as
+/// [`Assessment::ownership`].
+pub fn classify(ctx: &Catalog, packs: &[TrustedPack]) -> Ownership {
+    select::select(ctx, packs, None).1
 }
 
 /// What the CLI prints after an assessment.

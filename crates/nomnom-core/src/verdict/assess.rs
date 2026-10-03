@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::{Disposition, Label, TrustedPack, Verdict, select};
+use super::{Disposition, Label, Ownership, TrustedPack, Verdict, select};
 use crate::catalog::Catalog;
 use crate::scan::ScanProgress;
 use crate::timings;
@@ -21,6 +21,9 @@ pub struct Assessment {
     /// Hard-linked files whose counted name lies under some entry: trashing
     /// that entry frees their bytes only if every other name goes too.
     pub shared: Vec<SharedFile>,
+    /// Who owns which subtree, and the claimed/arbitrary byte split. Every
+    /// entry above lies inside one of its claims.
+    pub ownership: Ownership,
 }
 
 /// One hard-linked file, as node ids of the catalog the assessment came from.
@@ -117,7 +120,7 @@ pub fn assess_with(
     packs: Vec<TrustedPack>,
     progress: Option<&ScanProgress>,
 ) -> Assessment {
-    let verdicts = select::select(catalog, &packs, progress);
+    let (verdicts, ownership) = select::select(catalog, &packs, progress);
     let started = Instant::now();
     let entries = verdicts
         .into_iter()
@@ -136,12 +139,12 @@ pub fn assess_with(
             }
         })
         .collect();
-    let assessment = build(catalog, entries);
+    let assessment = build(catalog, entries, ownership);
     timings::lap("assess: group, sort, shared links", started);
     assessment
 }
 
-fn build(catalog: &Catalog, entries: Vec<Entry>) -> Assessment {
+fn build(catalog: &Catalog, entries: Vec<Entry>, ownership: Ownership) -> Assessment {
     let mut spans: Vec<(u32, u32)> =
         entries.iter().filter_map(|entry| entry.reach.map(|r| (r.start, r.end))).collect();
     spans.sort_unstable();
@@ -185,5 +188,11 @@ fn build(catalog: &Catalog, entries: Vec<Entry>) -> Assessment {
         .filter(|entry| entry.verdict.disposition == Disposition::Reclaimable)
         .collect();
     let reclaimable_bytes = charges(&reclaimable, &shared).iter().sum();
-    Assessment { root: catalog.path(catalog.root()), groups, reclaimable_bytes, shared }
+    Assessment {
+        root: catalog.path(catalog.root()),
+        groups,
+        reclaimable_bytes,
+        shared,
+        ownership,
+    }
 }

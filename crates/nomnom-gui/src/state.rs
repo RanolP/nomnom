@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use humansize::{BINARY, format_size};
@@ -12,7 +13,8 @@ use nomnom_core::action::{
     candidates, plan_from,
 };
 use nomnom_core::catalog::{Catalog, NodeId};
-use nomnom_core::verdict::{Assessment, Provenance};
+use nomnom_core::scan::EntryKind;
+use nomnom_core::verdict::{Assessment, Claim, DropReason, Ownership, Provenance};
 
 pub fn size(bytes: u64) -> String {
     format_size(bytes, BINARY)
@@ -47,11 +49,16 @@ pub struct TreeRow {
 /// Children are sorted (by `children_by_size`) only when their parent is first
 /// expanded, so a volume-sized catalog never pays for sorting subtrees nobody
 /// opened.
+///
+/// Built with [`other_files`](Self::other_files) it is the "Other files"
+/// tree, `nomnom scan --view other`: children sorted by the bytes no pack
+/// recognizes, and each claim root a leaf that stands in for its subtree.
 #[derive(Default)]
 pub struct TreeModel {
     expanded: HashSet<NodeId>,
     sorted: HashMap<NodeId, Vec<NodeId>>,
     rows: Vec<TreeRow>,
+    other: Option<Arc<Assessment>>,
 }
 
 impl TreeModel {
@@ -61,6 +68,40 @@ impl TreeModel {
         model.expanded.insert(catalog.root());
         model.rebuild(catalog);
         model
+    }
+
+    /// The Other files tree of `assessment`'s ownership.
+    pub fn other_files(catalog: &Catalog, assessment: Arc<Assessment>) -> Self {
+        let mut model = Self { other: Some(assessment), ..Self::default() };
+        model.expanded.insert(catalog.root());
+        model.rebuild(catalog);
+        model
+    }
+
+    /// The ownership this tree is the Other files view of.
+    pub fn ownership(&self) -> Option<&Ownership> {
+        self.other.as_deref().map(|assessment| &assessment.ownership)
+    }
+
+    /// The claim `id`'s row stands in for, in the Other files tree.
+    pub fn link(&self, id: NodeId) -> Option<&Claim> {
+        self.ownership()?.claim_at(id)
+    }
+
+    /// The bytes this tree sizes `id` by.
+    pub fn bytes(&self, catalog: &Catalog, id: NodeId) -> u64 {
+        match self.ownership() {
+            Some(ownership) => ownership.arbitrary(catalog, id),
+            None => catalog.node(id).subtree_size,
+        }
+    }
+
+    /// Whether `id`'s row can open: a non-empty folder, and in the Other files
+    /// tree not a claim root.
+    pub fn expandable(&self, catalog: &Catalog, id: NodeId) -> bool {
+        catalog.node(id).kind == EntryKind::Dir
+            && !catalog.children(id).is_empty()
+            && self.link(id).is_none()
     }
 
     pub fn rows(&self) -> &[TreeRow] {
@@ -78,8 +119,20 @@ impl TreeModel {
         self.rebuild(catalog);
     }
 
-    /// Expand every ancestor of `id` and return its row.
+    /// Expand every ancestor of `id` and return its row. In the Other files
+    /// tree a recognized node has no row of its own, so the row is the
+    /// outermost claim root holding it.
     pub fn reveal(&mut self, catalog: &Catalog, id: NodeId) -> Option<usize> {
+        let mut id = id;
+        if let Some(ownership) = self.ownership() {
+            let mut cursor = Some(id);
+            while let Some(node) = cursor {
+                if ownership.claim_at(node).is_some() {
+                    id = node;
+                }
+                cursor = catalog.node(node).parent;
+            }
+        }
         let mut cursor = catalog.node(id).parent;
         let mut opened = false;
         while let Some(ancestor) = cursor {
@@ -100,7 +153,7 @@ impl TreeModel {
             self.children(catalog, root).iter().rev().map(|&id| TreeRow { id, depth: 0 }).collect();
         while let Some(row) = stack.pop() {
             self.rows.push(row);
-            if self.expanded.contains(&row.id) {
+            if self.expanded.contains(&row.id) && self.link(row.id).is_none() {
                 let depth = row.depth + 1;
                 let children = self.children(catalog, row.id).clone();
                 stack.extend(children.into_iter().rev().map(|id| TreeRow { id, depth }));
@@ -109,8 +162,55 @@ impl TreeModel {
     }
 
     fn children(&mut self, catalog: &Catalog, id: NodeId) -> &Vec<NodeId> {
-        self.sorted.entry(id).or_insert_with(|| catalog.children_by_size(id))
+        let ownership = self.other.as_deref().map(|assessment| &assessment.ownership);
+        self.sorted.entry(id).or_insert_with(|| match ownership {
+            Some(ownership) => ownership.children_by_arbitrary(catalog, id),
+            None => catalog.children_by_size(id),
+        })
     }
+}
+
+/// One row of the Recognized view, `nomnom classify`'s listing flattened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecognizedRow {
+    Pack { name: String, bytes: u64, claims: usize },
+    Claim { id: NodeId, path: String, class: String, rule: String, bytes: u64, nested: bool },
+    DroppedHeader { count: usize },
+    Dropped { path: String, provenance: String, why: String },
+}
+
+/// Pack › claim, biggest first, then the dropped claims: the same listing
+/// `nomnom classify` prints.
+pub fn recognized_rows(catalog: &Catalog, ownership: &Ownership) -> Vec<RecognizedRow> {
+    let mut rows = Vec::new();
+    for pack in ownership.recognized(catalog) {
+        rows.push(RecognizedRow::Pack {
+            name: pack.pack,
+            bytes: pack.bytes,
+            claims: pack.claims.len(),
+        });
+        rows.extend(pack.claims.into_iter().map(|row| RecognizedRow::Claim {
+            id: row.id,
+            path: row.path,
+            class: row.claim.class,
+            rule: row.claim.provenance.rule,
+            bytes: row.bytes,
+            nested: row.nested,
+        }));
+    }
+    let dropped = ownership.dropped();
+    if !dropped.is_empty() {
+        rows.push(RecognizedRow::DroppedHeader { count: dropped.len() });
+        rows.extend(dropped.iter().map(|claim| RecognizedRow::Dropped {
+            path: claim.path.clone(),
+            provenance: claim.claim.provenance.to_string(),
+            why: match &claim.reason {
+                DropReason::Outranked { by } => format!("outranked by {by}"),
+                DropReason::Inside { owner } => format!("inside {owner}'s exclusive claim"),
+            },
+        }));
+    }
+    rows
 }
 
 /// What the Clean screen will hand to `plan_from`: the include-review toggle,
@@ -239,6 +339,7 @@ mod tests {
             groups: vec![Group { label: Label::CACHE, bytes: entries.len() as u64, entries }],
             reclaimable_bytes: 0,
             shared: Vec::new(),
+            ownership: Default::default(),
         }
     }
 
@@ -343,6 +444,40 @@ mod tests {
         restarted.reassessed(&root).unwrap();
         restarted.set_approved(&rule("target"), true);
         assert_eq!(planned(&restarted, &assessment), ["alpha/target"]);
+    }
+
+    // Catches the Other files tree opening a recognized folder (its files are
+    // not "other"), sizing rows by full bytes, or a reveal of a recognized
+    // file landing on no row.
+    #[test]
+    fn the_other_files_tree_stops_at_claim_roots() {
+        use nomnom_core::verdict::{TrustedPack, assess};
+
+        use crate::scan_fixtures::{catalog_of, write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root.join("package.json"), br#"{"name":"fixture"}"#);
+        write(root.join("src/index.js"), b"console.log('hi');\n");
+        write(root.join("node_modules/.package-lock.json"), br#"{"name":"fixture"}"#);
+        write(root.join("node_modules/left-pad/index.js"), b"module.exports = 1;\n");
+        write(root.join("node_modules/left-pad/package.json"), br#"{"name":"left-pad"}"#);
+        let catalog = catalog_of(root);
+        let assessment = Arc::new(assess(&catalog, TrustedPack::builtins()));
+        let modules = catalog.find(&root.join("node_modules")).unwrap();
+        assert!(assessment.ownership.claim_at(modules).is_some(), "node_modules unclaimed");
+
+        let mut tree = TreeModel::other_files(&catalog, assessment);
+        assert!(!tree.expandable(&catalog, modules));
+        tree.toggle(&catalog, modules);
+        assert!(tree.rows().iter().all(|row| catalog.node(row.id).parent == Some(catalog.root())));
+        assert_eq!(tree.bytes(&catalog, modules), 0);
+        let src = catalog.find(&root.join("src")).unwrap();
+        assert_eq!(tree.bytes(&catalog, src), catalog.node(src).subtree_size);
+
+        let inside = catalog.find(&root.join("node_modules/left-pad/index.js")).unwrap();
+        let row = tree.reveal(&catalog, inside).expect("a recognized file reveals its claim");
+        assert_eq!(tree.rows()[row].id, modules);
     }
 
     // Catches "include review" approving review entries on its own, and an

@@ -31,12 +31,14 @@ enum Screen {
 }
 
 /// Where each feature lives. Drives is the root; the tree is pushed by
-/// picking a drive; Suggest is the panel beside the tree and Clean the
+/// picking a drive, and Classify is its Recognized and Other files views;
+/// Suggest is the panel beside the tree and Clean the
 /// Reclaim button at that panel's foot; Packs is the header button.
 fn screen(feature: Feature) -> Screen {
     match feature {
         Feature::Drives => Screen::Drives,
         Feature::Tree => Screen::Tree,
+        Feature::Classify => Screen::Tree,
         Feature::Suggest => Screen::Tree,
         Feature::Clean => Screen::Tree,
         Feature::Packs => Screen::Packs,
