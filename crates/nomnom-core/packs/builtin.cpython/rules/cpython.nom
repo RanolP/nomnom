@@ -1,0 +1,10 @@
+# CPython's bytecode cache: `__pycache__` holding `.pyc` files (PEP 3147).
+[__pycache__/]
+description = regenerable: Python bytecode cache, rewritten on the next import — it holds `{$pyc}`
+kind = build-output/v1
+confidence = 0.95
+filter {
+  $d.dir.name == "__pycache__"
+  $d has *.pyc as $pyc
+  then $d/
+}

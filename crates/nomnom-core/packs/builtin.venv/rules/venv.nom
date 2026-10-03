@@ -1,0 +1,26 @@
+# Virtual environments made by Python's `venv` module or by `virtualenv`,
+# both of which write `pyvenv.cfg` into the environment's root (PEP 405).
+#
+# Only the two conventional project-local names are taken: `pyvenv.cfg` also
+# roots the environments of installed tools (pipx, `uv tool`), and deleting
+# one of those uninstalls the tool.
+
+[.venv/]
+description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`
+kind = build-output/v1
+confidence = 0.9
+filter {
+  $v.dir.name == ".venv"
+  $v has pyvenv.cfg
+  then $v/
+}
+
+[venv/]
+description = regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`
+kind = build-output/v1
+confidence = 0.9
+filter {
+  $v.dir.name == "venv"
+  $v has pyvenv.cfg
+  then $v/
+}

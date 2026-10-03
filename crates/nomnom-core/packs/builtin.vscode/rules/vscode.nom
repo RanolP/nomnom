@@ -1,0 +1,35 @@
+# VS Code's caches in its user-data directory (`%AppData%\Code`), recognized
+# by `User/` and `CachedData/` side by side.
+
+[VS Code compiled-code cache]
+description = VS Code's V8 code cache, one directory per VS Code build; VS Code rebuilds it on start
+kind = cache/v1
+confidence = 0.8
+filter {
+  $c.dir.name == "Code"
+  $c has User
+  $c has CachedData
+  then $c/CachedData/
+}
+
+[VS Code extension downloads]
+description = extension packages VS Code downloaded; VS Code downloads them again when an extension is installed or updated
+kind = cache/v1
+confidence = 0.8
+filter {
+  $c.dir.name == "Code"
+  $c has User
+  $c has CachedData
+  then $c/CachedExtensionVSIXs/
+}
+
+[VS Code HTTP cache]
+description = VS Code's HTTP cache; VS Code downloads again on demand
+kind = cache/v1
+confidence = 0.8
+filter {
+  $c.dir.name == "Code"
+  $c has User
+  $c has CachedData
+  then $c/Cache/
+}

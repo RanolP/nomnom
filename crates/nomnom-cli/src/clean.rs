@@ -733,6 +733,8 @@ mod tests {
             let root = dir.path().join(project);
             write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n");
             write(root.join("src/main.rs"), b"fn main() {}\n");
+            write(root.join("target/.rustc_info.json"), b"{}");
+            write(root.join("target/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55");
             write(root.join("target/debug/x.exe"), b"binary");
         }
         dir
@@ -786,7 +788,7 @@ mod tests {
     fn an_approved_rule_plans_its_matches_minus_exclusions() {
         let dir = cargo_fixture();
         let root = dir.path();
-        let rule = ["Cargo target/".to_string()];
+        let rule = ["Cargo target directory".to_string()];
 
         let (_, text) = clean_with(root, &[], &rule, false).expect("clean runs");
         assert!(text.contains("2 actions"), "{text}");

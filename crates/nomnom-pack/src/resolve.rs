@@ -2,7 +2,7 @@
 //!
 //! `docs/lang.md` fixes the order, later overriding earlier:
 //!
-//! 1. built-in, the `builtin.<domain>` packs compiled into the binary
+//! 1. built-in, the `builtin.<tool>` packs compiled into the binary
 //! 2. user — `%LOCALAPPDATA%\nomnom\packs\`
 //! 3. project — `./.nomnom/packs/`
 //! 4. `--pack <dir>`, explicit

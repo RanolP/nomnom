@@ -1,0 +1,29 @@
+# Edge's HTTP disk cache and V8 code cache, per profile under
+# `%LocalAppData%\Microsoft\Edge\User Data`. The disk cache's backend keeps an `index`
+# file at its root; the code cache holds `js` and `wasm`. The vendor folder
+# above the browser folder keeps out embedded WebView2 and CEF profiles that
+# happen to sit under a folder of the same name.
+
+[Edge HTTP cache]
+description = Edge's HTTP cache; Edge downloads pages again as you browse
+kind = cache/v1
+confidence = 0.8
+filter {
+  $c.dir.name == "Cache_Data"
+  $c under Microsoft/
+  $c under Edge/
+  $c has index
+  then $c/
+}
+
+[Edge code cache]
+description = Edge's compiled-script cache; Edge recompiles scripts as you browse
+kind = cache/v1
+confidence = 0.8
+filter {
+  $c.dir.name == "Code Cache"
+  $c under Microsoft/
+  $c under Edge/
+  $c has js
+  then $c/
+}

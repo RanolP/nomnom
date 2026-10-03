@@ -30,12 +30,14 @@ pub fn isolated_store() {
     });
 }
 
-/// A tree that trips exactly one rule: `node_modules` beside a `package.json`.
+/// A tree that trips exactly one rule: an npm-installed `node_modules`, which
+/// carries npm's hidden lockfile.
 pub fn node_fixture() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     write(root.join("package.json"), br#"{"name":"fixture"}"#);
     write(root.join("src/index.js"), b"console.log('hi');\n");
+    write(root.join("node_modules/.package-lock.json"), br#"{"name":"fixture"}"#);
     write(root.join("node_modules/left-pad/index.js"), b"module.exports = 1;\n");
     write(root.join("node_modules/left-pad/package.json"), br#"{"name":"left-pad"}"#);
     write(root.join("node_modules/.bin/left-pad"), b"#!/bin/sh\n");

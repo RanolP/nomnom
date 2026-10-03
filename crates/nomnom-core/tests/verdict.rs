@@ -47,6 +47,7 @@ fn node_modules_is_reclaimable_and_source_is_not() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
     write(root.join("package.json"), b"{}");
+    write(root.join("node_modules/.package-lock.json"), b"{}");
     write(root.join("node_modules/left-pad/index.js"), b"module.exports = 1;");
     write(root.join("src/main.js"), b"console.log(1);");
 
@@ -73,6 +74,8 @@ fn files_inside_a_flagged_directory_produce_no_verdicts() {
     // A cache directory inside, which would otherwise attract a verdict of
     // its own.
     write(root.join("node_modules/.cache/babel/a.bin"), &vec![b'x'; 1024 * 1024 + 7]);
+    write(root.join("node_modules/pkg/__pycache__/m.cpython-312.pyc"), b"bytecode");
+    write(root.join("node_modules/.package-lock.json"), b"{}");
     write(root.join("node_modules/pkg/index.js"), b"1");
 
     let judged = judged(root);
@@ -97,18 +100,21 @@ fn files_inside_a_flagged_directory_produce_no_verdicts() {
     );
 }
 
-/// `target` is also an ordinary word. Dropping the corroboration guard would
-/// let the tool propose deleting someone's `target/` data directory.
+/// `target` is also an ordinary word, and a `Cargo.toml` beside it proves
+/// nothing about what is inside. Judging by name would propose deleting
+/// someone's `target/` data directory; only Cargo's own files inside count.
 #[test]
-fn generic_target_needs_a_cargo_toml_beside_it() {
+fn target_is_judged_only_when_cargo_s_signature_is_inside() {
     let bare = TempDir::new().expect("tempdir");
+    write(bare.path().join("Cargo.toml"), b"[package]\nname = \"x\"\n");
     write(bare.path().join("target/measurements.csv"), b"1,2,3");
     write(bare.path().join("notes.txt"), b"shooting range data");
-    let bare_verdict = verdict_for(&judged(bare.path()), "target").expect("target judged").clone();
-    assert_eq!(bare_verdict.disposition, Disposition::Review);
+    assert!(verdict_for(&judged(bare.path()), "target").is_none(), "a bare target/ was judged");
 
     let cargo = TempDir::new().expect("tempdir");
     write(cargo.path().join("Cargo.toml"), b"[package]\nname = \"x\"\n");
+    write(cargo.path().join("target/.rustc_info.json"), b"{}");
+    write(cargo.path().join("target/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55");
     write(cargo.path().join("target/debug/x.exe"), b"binary");
     let cargo_verdict =
         verdict_for(&judged(cargo.path()), "target").expect("target judged").clone();
@@ -123,9 +129,11 @@ fn every_verdict_carries_a_reason() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
     write(root.join("package.json"), b"{}");
+    write(root.join("node_modules/.package-lock.json"), b"{}");
     write(root.join("node_modules/pkg/index.js"), b"1");
-    write(root.join("target/data.csv"), b"1,2");
-    write(root.join(".cache/blob.bin"), b"cached");
+    write(root.join("target/.rustc_info.json"), b"{}");
+    write(root.join("target/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55");
+    write(root.join("__pycache__/m.cpython-312.pyc"), b"bytecode");
 
     let judged = judged(root);
     assert!(judged.len() >= 3,"fixture must exercise several rules: {judged:?}");

@@ -3,8 +3,8 @@
 //! The rules live in `packs/builtin.<domain>/` as ordinary `.nom` text next to
 //! an ordinary `pack.toml`, so they read, diff and review as source rather than
 //! as a Rust string table — and so each directory could be handed to
-//! [`nomnom_lang::load`] unchanged. There is one pack per ecosystem or app that
-//! owns the files, so a verdict's provenance names that owner.
+//! [`nomnom_lang::load`] unchanged. There is one pack per tool that creates the
+//! files, so a verdict's provenance names that tool.
 //!
 //! [`nomnom_lang::load`] reads a directory at runtime, which the built-in packs
 //! must not: they have to be there when the binary is alone on a machine. The
@@ -39,21 +39,42 @@ macro_rules! embedded {
 
 /// Every built-in pack, in resolution order.
 ///
-/// On an equal confidence a later pack wins a contested target, so the
-/// catch-all `builtin.generic` comes first and every pack that names one owner
-/// comes after it. No two built-in rules select the same target today —
-/// `tests/dsl_port.rs` holds that by judging the packs in both orders — so the
-/// order only decides a future overlap; it is this list rather than a readdir
-/// so that it is the same on every machine. `docs/lang.md` makes rule order
-/// the last tie-break, so each pack's files are listed in load order too.
+/// Every rule names the one tool that made its target and matches only on
+/// evidence that tool left, so no two built-in rules select the same target —
+/// `tests/dsl_port.rs` holds that by judging the packs in both orders — and
+/// the order decides nothing today. It is this list rather than a readdir so
+/// that it is the same on every machine should two rules ever overlap.
+/// `docs/lang.md` makes rule order the last tie-break, so each pack's files
+/// are listed in load order too.
 const PACKS: &[Embedded] = &[
-    embedded!("builtin.generic", ["build-output.nom", "cache.nom"]),
-    embedded!("builtin.downloads", ["stale-download.nom"]),
+    embedded!("builtin.bun", ["bun.nom"]),
+    embedded!("builtin.cargo", ["cargo.nom"]),
+    embedded!("builtin.chrome", ["chrome.nom"]),
+    embedded!("builtin.cmake", ["cmake.nom"]),
+    embedded!("builtin.cocoapods", ["cocoapods.nom"]),
+    embedded!("builtin.cpython", ["cpython.nom"]),
+    embedded!("builtin.dart", ["dart.nom"]),
     embedded!("builtin.dotnet", ["dotnet.nom"]),
+    embedded!("builtin.downloads", ["stale-download.nom"]),
+    embedded!("builtin.edge", ["edge.nom"]),
+    embedded!("builtin.firefox", ["firefox.nom"]),
+    embedded!("builtin.go", ["go.nom"]),
     embedded!("builtin.gradle", ["gradle.nom"]),
-    embedded!("builtin.node", ["node.nom"]),
-    embedded!("builtin.python", ["python.nom"]),
-    embedded!("builtin.rust", ["cargo.nom"]),
+    embedded!("builtin.maven", ["maven.nom"]),
+    embedded!("builtin.mypy", ["mypy.nom"]),
+    embedded!("builtin.next", ["next.nom"]),
+    embedded!("builtin.npm", ["npm.nom"]),
+    embedded!("builtin.nuget", ["nuget.nom"]),
+    embedded!("builtin.pip", ["pip.nom"]),
+    embedded!("builtin.pnpm", ["pnpm.nom"]),
+    embedded!("builtin.pytest", ["pytest.nom"]),
+    embedded!("builtin.ruff", ["ruff.nom"]),
+    embedded!("builtin.tox", ["tox.nom"]),
+    embedded!("builtin.uv", ["uv.nom"]),
+    embedded!("builtin.venv", ["venv.nom"]),
+    embedded!("builtin.vscode", ["vscode.nom"]),
+    embedded!("builtin.windows-update", ["windows-update.nom"]),
+    embedded!("builtin.yarn", ["yarn.nom"]),
 ];
 
 /// The built-in packs in resolution order, parsed once, through the same

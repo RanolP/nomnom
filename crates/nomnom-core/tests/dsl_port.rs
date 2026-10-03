@@ -1,23 +1,21 @@
 //! Every rule in the compiled-in built-in packs, on one fixture tree.
 //!
 //! The regression this catches is the one a rule pack has: a filter whose
-//! corroboration guard stopped guarding, a confidence that drifted, or a
+//! ownership signature stopped guarding, a confidence that drifted, or a
 //! description that reads right but is not the sentence the tool actually
 //! prints. So it pins the whole verdict set on exactly the fields a user sees —
-//! label, disposition, confidence and the reason itself — rather than
-//! spot-checking a rule or two.
+//! label, disposition, confidence and the reason itself — plus the pack the
+//! verdict is credited to, rather than spot-checking a rule or two.
 //!
-//! This table was first proven equal, path for path, to the hand-written Rust
-//! judge the pack replaced, and again to the `when`/`then` pack that came
-//! between. One wording differs on purpose from that pack: `bin`/`obj` name the
-//! project file that sits beside them (`App.csproj`) where the old language
-//! could only name the glob (`*.csproj`), because `has *.csproj | *.sln as
-//! $marker` captures the match. That is what the hand-written Rust printed.
+//! The fixture also holds the directories no rule may judge: a `target/`,
+//! `build/`, `dist/`, `bin/`, `obj/`, `cache/`, `node_modules/` and friends with
+//! no evidence of the tool that would own them. Each built-in rule names one
+//! tool and matches only on a signature that tool leaves, so a name alone must
+//! produce no verdict at all.
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::{catalog_of, write};
 use nomnom_core::verdict::{Disposition, TrustedPack, judge};
@@ -26,73 +24,136 @@ use tempfile::TempDir;
 /// What a user actually sees about one path.
 #[derive(Debug, PartialEq)]
 struct Row {
+    pack: String,
     label: String,
     disposition: Disposition,
     confidence: f32,
     reason: String,
 }
 
-/// Every rule in the built-in packs, on one tree.
+/// One file per entry, each placed so a rule's signature is present: the
+/// path's directories are the target and its parents, the file name is the
+/// evidence the owning tool writes.
+const OWNED: &[&str] = &[
+    "cargo/proj/target/.rustc_info.json",
+    "cargo/proj/target/CACHEDIR.TAG",
+    "cargo/home/registry/CACHEDIR.TAG",
+    "cargo/home/registry/index/x",
+    "cargo/home/registry/cache/x.crate",
+    "cargo/home/registry/src/x.rs",
+    "cargo/home/git/CACHEDIR.TAG",
+    "cargo/home/git/db/x",
+    "cargo/home/git/checkouts/x",
+    "npm/proj/node_modules/.package-lock.json",
+    "npm/npm-cache/_cacache/content-v2/x",
+    "npm/npm-cache/_cacache/index-v5/x",
+    "npm/npm-cache/_npx/x",
+    "pnpm/proj/node_modules/.modules.yaml",
+    // pnpm trees missing `.modules.yaml` (an interrupted or copied install).
+    "pnpm/proj3/node_modules/.pnpm-workspace-state-v1.json",
+    "pnpm/proj4/node_modules/.pnpm/lock.yaml",
+    "pnpm/pnpm/store/v10/x",
+    "pnpm/proj2/.pnpm-store/v3/x",
+    "pnpm/pnpm-cache/metadata/x",
+    "yarn/classic/node_modules/.yarn-integrity",
+    "yarn/berry/node_modules/.yarn-state.yml",
+    "yarn/Yarn/Cache/v6/x",
+    "bun/.bun/install/cache/x.npm",
+    "next/proj/.next/BUILD_ID",
+    "venv/p1/.venv/pyvenv.cfg",
+    "venv/p2/venv/pyvenv.cfg",
+    "cpython/__pycache__/m.cpython-312.pyc",
+    "pip/pip/cache/http-v2/x",
+    "pip/pip/cache/wheels/x",
+    "pip/xdg/pip/http/x",
+    "pip/xdg/pip/wheels/x",
+    "uv/cache/CACHEDIR.TAG",
+    "uv/cache/archive-v0/x",
+    "python/.tox/CACHEDIR.TAG",
+    "python/.mypy_cache/CACHEDIR.TAG",
+    "python/.pytest_cache/CACHEDIR.TAG",
+    "python/.ruff_cache/CACHEDIR.TAG",
+    "dotnet/proj/App.csproj",
+    "dotnet/proj/obj/project.assets.json",
+    "dotnet/proj/bin/App.dll",
+    "nuget/NuGet/v3-cache/x",
+    "nuget/NuGet/plugins-cache/x",
+    "nuget/.nuget/packages/x",
+    "gradle/proj/.gradle/buildOutputCleanup/x",
+    "gradle/home/.gradle/caches/modules-2/x",
+    "gradle/home/.gradle/wrapper/dists/x",
+    "maven/.m2/repository/x",
+    "go/go-build/trim.txt",
+    "go/go-build/README",
+    "go/pkg/mod/cache/download/x",
+    "cmake/proj/out/CMakeCache.txt",
+    "cmake/proj/out/CMakeFiles/x",
+    "cocoapods/Pods/Manifest.lock",
+    "dart/.dart_tool/package_config.json",
+    "chrome/Google/Chrome/User Data/Default/Cache/Cache_Data/index",
+    "chrome/Google/Chrome/User Data/Default/Code Cache/js/x",
+    "edge/Microsoft/Edge/User Data/Default/Cache/Cache_Data/index",
+    "edge/Microsoft/Edge/User Data/Default/Code Cache/js/x",
+    "firefox/Firefox/Profiles/p.default/cache2/entries/x",
+    "vscode/Code/User/settings.json",
+    "vscode/Code/CachedData/x",
+    "vscode/Code/CachedExtensionVSIXs/x",
+    "vscode/Code/Cache/x",
+    "windows/SoftwareDistribution/DataStore/x",
+    "windows/SoftwareDistribution/Download/x",
+    // A Cargo target nested inside an npm tree: the outer verdict has to
+    // swallow it rather than report it a second time.
+    "npm/proj/node_modules/crate/target/.rustc_info.json",
+    "npm/proj/node_modules/crate/target/CACHEDIR.TAG",
+];
+
+/// Ordinary names with no tool's signature in or beside them, each next to a
+/// manifest that used to vouch for it or that a guess would lean on. None of
+/// these may be judged.
+const UNOWNED: &[&str] = &[
+    "bare/target/data.csv",
+    "bare/build/data.csv",
+    "bare/dist/data.csv",
+    "bare/bin/data.csv",
+    "bare/obj/data.csv",
+    "bare/cache/data.csv",
+    "bare/.cache/data.csv",
+    "bare/caches/data.csv",
+    "bare/node_modules/data.csv",
+    "bare/.venv/data.csv",
+    "bare/venv/data.csv",
+    "bare/__pycache__/notes.txt",
+    "bare/.next/data.csv",
+    "bare/.tox/data.csv",
+    "bare/.mypy_cache/data.csv",
+    "bare/Pods/data.csv",
+    "manifests/Cargo.toml",
+    "manifests/package.json",
+    "manifests/pyproject.toml",
+    "manifests/CMakeLists.txt",
+    "manifests/App.sln",
+    "manifests/target/data.csv",
+    "manifests/build/data.csv",
+    "manifests/dist/data.csv",
+    "manifests/obj/data.csv",
+    // An in-source CMake build: the cache sits in the source tree itself.
+    "cmake-in-source/CMakeLists.txt",
+    "cmake-in-source/CMakeCache.txt",
+    "cmake-in-source/CMakeFiles/x",
+    "cmake-in-source/main.c",
+    // A pyvenv.cfg rooting a tool's environment under a name no rule takes.
+    "pipx/venvs/black/pyvenv.cfg",
+    // An app's embedded WebView2 profile under a folder that happens to be
+    // named `Edge`: Chromium's layout, but not Edge's to clear.
+    "FL Studio/Settings/Edge/EBWebView/Default/Code Cache/js/x",
+    "FL Studio/Settings/Edge/EBWebView/Default/Cache/Cache_Data/index",
+];
+
 fn fixture() -> TempDir {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
-
-    // Unambiguous build-output names, one each.
-    for name in [
-        "node_modules",
-        ".venv",
-        "venv",
-        "__pycache__",
-        ".next",
-        ".gradle",
-        ".tox",
-        ".mypy_cache",
-        ".pytest_cache",
-    ] {
-        write(root.join("unambiguous").join(name).join("payload.bin"), b"x");
-    }
-    // A corroborated `target` nested inside `node_modules`: the outer verdict
-    // has to swallow it rather than report it a second time.
-    let nested = root.join("unambiguous").join("node_modules").join("crate");
-    write(nested.join("Cargo.toml"), b"[package]");
-    write(nested.join("target").join("out.bin"), b"built");
-
-    // Generic names, corroborated: one directory per (name, sibling) pair, each
-    // in its own parent so the corroborating files cannot cross over.
-    let corroborated: &[(&str, &str)] = &[
-        ("target", "Cargo.toml"),
-        ("build", "package.json"),
-        ("build", "pyproject.toml"),
-        ("build", "CMakeLists.txt"),
-        ("dist", "package.json"),
-        ("dist", "pyproject.toml"),
-        ("dist", "CMakeLists.txt"),
-        ("bin", "App.csproj"),
-        ("bin", "App.sln"),
-        ("obj", "App.csproj"),
-        ("obj", "App.sln"),
-    ];
-    for (index, (dir, sibling)) in corroborated.iter().enumerate() {
-        let parent = root.join("corroborated").join(format!("p{index}"));
-        write(parent.join(sibling), b"{}");
-        write(parent.join(dir).join("out.bin"), b"built");
-    }
-
-    // Generic names with nothing beside them.
-    for (index, dir) in ["target", "build", "dist", "bin", "obj"].iter().enumerate() {
-        let parent = root.join("bare").join(format!("p{index}"));
-        write(parent.join("notes.txt"), b"my data");
-        write(parent.join(dir).join("data.csv"), b"1,2,3");
-    }
-
-    // Cache directories, each with a different file count so the rendered
-    // counts in the reason are distinguishable. The container is not itself
-    // named like a cache, or it would swallow the three as one unit.
-    for (index, name) in [".cache", "cache", "caches"].iter().enumerate() {
-        let dir = root.join("cache-fixtures").join(format!("p{index}")).join(name);
-        for file in 0..=index {
-            write(dir.join(format!("blob{file}.bin")), b"cached bytes");
-        }
+    for file in OWNED.iter().chain(UNOWNED) {
+        write(root.join(file), b"x");
     }
 
     // A stale download, both timestamps pushed back past the 90-day gate. Only
@@ -112,14 +173,17 @@ fn fixture() -> TempDir {
     tmp
 }
 
-fn rows(tmp: &TempDir) -> BTreeMap<PathBuf, Row> {
+fn rows(tmp: &TempDir) -> BTreeMap<String, Row> {
     let catalog = catalog_of(tmp.path());
     judge(&catalog, &TrustedPack::builtins())
         .into_iter()
         .map(|(id, verdict)| {
+            let path = catalog.path(id);
+            let relative = path.strip_prefix(tmp.path()).expect("under root");
             (
-                catalog.path(id).strip_prefix(tmp.path()).expect("under root").to_path_buf(),
+                relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
                 Row {
+                    pack: verdict.provenance.pack.clone(),
                     label: verdict.label.as_str().to_owned(),
                     disposition: verdict.disposition,
                     confidence: verdict.confidence,
@@ -130,211 +194,63 @@ fn rows(tmp: &TempDir) -> BTreeMap<PathBuf, Row> {
         .collect()
 }
 
-/// Path, label, disposition, confidence, reason — in path order.
-const EXPECTED: &[(&str, &str, Disposition, f32, &str)] = &[
-    (
-        "Downloads/installer.iso",
-        "stale-download",
-        Disposition::Review,
-        0.5,
-        "in Downloads, last opened 200 days ago, 18 bytes; may still be the only copy",
-    ),
-    (
-        "bare/p0/target",
-        "build-output",
-        Disposition::Review,
-        0.35,
-        "named `target`, but no Cargo.toml beside it — `target` is also an ordinary directory name, so this may be your data rather than build output",
-    ),
-    (
-        "bare/p1/build",
-        "build-output",
-        Disposition::Review,
-        0.35,
-        "named `build`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `build` is also an ordinary directory name, so this may be your data rather than build output",
-    ),
-    (
-        "bare/p2/dist",
-        "build-output",
-        Disposition::Review,
-        0.35,
-        "named `dist`, but no package.json or pyproject.toml or CMakeLists.txt beside it — `dist` is also an ordinary directory name, so this may be your data rather than build output",
-    ),
-    (
-        "bare/p3/bin",
-        "build-output",
-        Disposition::Review,
-        0.35,
-        "named `bin`, but no *.csproj or *.sln beside it — `bin` is also an ordinary directory name, so this may be your data rather than build output",
-    ),
-    (
-        "bare/p4/obj",
-        "build-output",
-        Disposition::Review,
-        0.35,
-        "named `obj`, but no *.csproj or *.sln beside it — `obj` is also an ordinary directory name, so this may be your data rather than build output",
-    ),
-    (
-        "cache-fixtures/p0/.cache",
-        "cache",
-        Disposition::Reclaimable,
-        0.6,
-        "cache directory `.cache`: 12 bytes across 1 files, refilled on next use",
-    ),
-    (
-        "cache-fixtures/p1/cache",
-        "cache",
-        Disposition::Reclaimable,
-        0.6,
-        "cache directory `cache`: 24 bytes across 2 files, refilled on next use",
-    ),
-    (
-        "cache-fixtures/p2/caches",
-        "cache",
-        Disposition::Reclaimable,
-        0.6,
-        "cache directory `caches`: 36 bytes across 3 files, refilled on next use",
-    ),
-    (
-        "corroborated/p0/target",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: Cargo build output, rebuilt by `cargo build` — `Cargo.toml` sits beside it",
-    ),
-    (
-        "corroborated/p1/build",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `package.json` sits beside it",
-    ),
-    (
-        "corroborated/p10/obj",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.sln` sits beside it",
-    ),
-    (
-        "corroborated/p2/build",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `pyproject.toml` sits beside it",
-    ),
-    (
-        "corroborated/p3/build",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `CMakeLists.txt` sits beside it",
-    ),
-    (
-        "corroborated/p4/dist",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `package.json` sits beside it",
-    ),
-    (
-        "corroborated/p5/dist",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `pyproject.toml` sits beside it",
-    ),
-    (
-        "corroborated/p6/dist",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: build output, rebuilt by the project's build command — `CMakeLists.txt` sits beside it",
-    ),
-    (
-        "corroborated/p7/bin",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it",
-    ),
-    (
-        "corroborated/p8/bin",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.sln` sits beside it",
-    ),
-    (
-        "corroborated/p9/obj",
-        "build-output",
-        Disposition::Reclaimable,
-        0.9,
-        "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it",
-    ),
-    (
-        "unambiguous/.gradle",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: Gradle project cache, rebuilt on the next Gradle run",
-    ),
-    (
-        "unambiguous/.mypy_cache",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: mypy incremental cache, rebuilt on the next type-check",
-    ),
-    (
-        "unambiguous/.next",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: Next.js build output, rebuilt by `next build`",
-    ),
-    (
-        "unambiguous/.pytest_cache",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: pytest run cache, rewritten on the next test run",
-    ),
-    (
-        "unambiguous/.tox",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: tox environments, rebuilt by `tox`",
-    ),
-    (
-        "unambiguous/.venv",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall",
-    ),
-    (
-        "unambiguous/__pycache__",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: Python bytecode cache, rewritten on the next import",
-    ),
-    (
-        "unambiguous/node_modules",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: npm dependency tree, rebuilt by `npm install`",
-    ),
-    (
-        "unambiguous/venv",
-        "build-output",
-        Disposition::Reclaimable,
-        0.95,
-        "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall",
-    ),
+use Disposition::{Reclaimable, Review};
+
+/// Path, pack, label, disposition, confidence, reason — in path order.
+#[rustfmt::skip]
+const EXPECTED: &[(&str, &str, &str, Disposition, f32, &str)] = &[
+    ("Downloads/installer.iso", "builtin.downloads", "stale-download", Review, 0.5, "in Downloads, last opened 200 days ago, 18 bytes; may still be the only copy"),
+    ("bun/.bun/install/cache", "builtin.bun", "cache", Reclaimable, 0.7, "Bun's package install cache; Bun re-downloads packages on the next install"),
+    ("cargo/home/git/checkouts", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build"),
+    ("cargo/home/registry/cache", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them"),
+    ("cargo/home/registry/src", "builtin.cargo", "cache", Reclaimable, 0.8, "Cargo's unpacked crate sources; Cargo re-extracts them from its download cache on the next build"),
+    ("cargo/proj/target", "builtin.cargo", "build-output", Reclaimable, 0.95, "regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`"),
+    ("chrome/Google/Chrome/User Data/Default/Cache/Cache_Data", "builtin.chrome", "cache", Reclaimable, 0.8, "Chrome's HTTP cache; Chrome downloads pages again as you browse"),
+    ("chrome/Google/Chrome/User Data/Default/Code Cache", "builtin.chrome", "cache", Reclaimable, 0.8, "Chrome's compiled-script cache; Chrome recompiles scripts as you browse"),
+    ("cmake/proj/out", "builtin.cmake", "build-output", Reclaimable, 0.9, "regenerable: CMake build directory, rebuilt by configuring and building again — it holds CMake's `CMakeCache.txt`"),
+    ("cocoapods/Pods", "builtin.cocoapods", "build-output", Reclaimable, 0.9, "regenerable: CocoaPods dependencies, rebuilt by `pod install` — it holds CocoaPods' `Manifest.lock`"),
+    ("cpython/__pycache__", "builtin.cpython", "build-output", Reclaimable, 0.95, "regenerable: Python bytecode cache, rewritten on the next import — it holds `m.cpython-312.pyc`"),
+    ("dart/.dart_tool", "builtin.dart", "build-output", Reclaimable, 0.9, "regenerable: Dart tool state, rebuilt by `dart pub get` — it holds pub's `package_config.json`"),
+    ("dotnet/proj/bin", "builtin.dotnet", "build-output", Reclaimable, 0.85, "regenerable: .NET build output, rebuilt by `dotnet build` — `App.csproj` sits beside it"),
+    ("dotnet/proj/obj", "builtin.dotnet", "build-output", Reclaimable, 0.9, "regenerable: .NET intermediate build output, rebuilt by `dotnet build` — it holds the SDK's `project.assets.json`"),
+    ("edge/Microsoft/Edge/User Data/Default/Cache/Cache_Data", "builtin.edge", "cache", Reclaimable, 0.8, "Edge's HTTP cache; Edge downloads pages again as you browse"),
+    ("edge/Microsoft/Edge/User Data/Default/Code Cache", "builtin.edge", "cache", Reclaimable, 0.8, "Edge's compiled-script cache; Edge recompiles scripts as you browse"),
+    ("firefox/Firefox/Profiles/p.default/cache2", "builtin.firefox", "cache", Reclaimable, 0.8, "Firefox's HTTP cache; Firefox downloads pages again as you browse"),
+    ("go/go-build", "builtin.go", "cache", Reclaimable, 0.85, "Go's build cache; `go build` recompiles on demand (`go clean -cache` empties it the same way)"),
+    ("go/pkg/mod/cache/download", "builtin.go", "cache", Reclaimable, 0.7, "Go's module download cache; Go re-downloads modules from the module proxy on demand"),
+    ("gradle/home/.gradle/caches", "builtin.gradle", "cache", Reclaimable, 0.8, "Gradle's dependency and transform caches; Gradle re-downloads and recomputes on the next build"),
+    ("gradle/home/.gradle/wrapper/dists", "builtin.gradle", "cache", Review, 0.7, "Gradle distributions downloaded by the Gradle wrapper; the wrapper downloads its version again on the next build"),
+    ("gradle/proj/.gradle", "builtin.gradle", "build-output", Reclaimable, 0.95, "regenerable: Gradle project cache, rebuilt on the next Gradle run — it holds Gradle's `buildOutputCleanup`"),
+    ("maven/.m2/repository", "builtin.maven", "cache", Review, 0.6, "Maven's local repository; Maven re-downloads what a build needs, but locally installed artifacts exist nowhere else"),
+    ("next/proj/.next", "builtin.next", "build-output", Reclaimable, 0.95, "regenerable: Next.js build output, rebuilt by `next build` — it holds Next.js's `BUILD_ID`"),
+    ("npm/npm-cache/_cacache", "builtin.npm", "cache", Reclaimable, 0.8, "npm's download cache (`_cacache`); npm re-downloads packages on demand"),
+    ("npm/npm-cache/_npx", "builtin.npm", "cache", Reclaimable, 0.8, "packages `npx` installed to run once; npx installs them again on the next run"),
+    ("npm/proj/node_modules", "builtin.npm", "build-output", Reclaimable, 0.95, "regenerable: npm dependency tree, rebuilt by `npm install` — it holds npm's hidden lockfile `.package-lock.json`"),
+    ("nuget/.nuget/packages", "builtin.nuget", "cache", Review, 0.7, "NuGet's global packages folder; `dotnet restore` re-downloads what is missing, but a package from a feed you no longer reach cannot be fetched again"),
+    ("nuget/NuGet/plugins-cache", "builtin.nuget", "cache", Reclaimable, 0.8, "NuGet's credential-plugin cache; NuGet rebuilds it on the next restore"),
+    ("nuget/NuGet/v3-cache", "builtin.nuget", "cache", Reclaimable, 0.8, "NuGet's HTTP cache (`v3-cache`); NuGet downloads again on the next restore"),
+    ("pip/pip/cache", "builtin.pip", "cache", Reclaimable, 0.8, "pip's download and wheel cache; pip downloads or rebuilds on the next install"),
+    ("pip/xdg/pip", "builtin.pip", "cache", Reclaimable, 0.8, "pip's download and wheel cache; pip downloads or rebuilds on the next install"),
+    ("pnpm/pnpm-cache", "builtin.pnpm", "cache", Reclaimable, 0.8, "pnpm's registry metadata cache; pnpm fetches the metadata again on the next install"),
+    ("pnpm/pnpm/store", "builtin.pnpm", "cache", Review, 0.7, "pnpm's content-addressable package store; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
+    ("pnpm/proj/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.modules.yaml`"),
+    ("pnpm/proj3/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm-workspace-state-v1.json`"),
+    ("pnpm/proj4/node_modules", "builtin.pnpm", "build-output", Reclaimable, 0.95, "regenerable: pnpm dependency tree, rebuilt by `pnpm install` — it holds pnpm's `.pnpm`"),
+    ("pnpm/proj2/.pnpm-store", "builtin.pnpm", "cache", Review, 0.7, "a pnpm package store kept beside a project; the next `pnpm install` re-downloads what is missing, but a package unpublished from the registry cannot be fetched again"),
+    ("python/.mypy_cache", "builtin.mypy", "build-output", Reclaimable, 0.95, "regenerable: mypy incremental cache, rebuilt on the next type-check — it holds mypy's `CACHEDIR.TAG`"),
+    ("python/.pytest_cache", "builtin.pytest", "build-output", Reclaimable, 0.95, "regenerable: pytest run cache, rewritten on the next test run — it holds pytest's `CACHEDIR.TAG`"),
+    ("python/.ruff_cache", "builtin.ruff", "build-output", Reclaimable, 0.95, "regenerable: Ruff lint cache, rewritten on the next `ruff check` — it holds Ruff's `CACHEDIR.TAG`"),
+    ("python/.tox", "builtin.tox", "build-output", Reclaimable, 0.95, "regenerable: tox environments, rebuilt by `tox` — it holds tox's `CACHEDIR.TAG`"),
+    ("uv/cache", "builtin.uv", "cache", Reclaimable, 0.8, "uv's package cache; uv re-downloads and re-unpacks on the next sync"),
+    ("venv/p1/.venv", "builtin.venv", "build-output", Reclaimable, 0.9, "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
+    ("venv/p2/venv", "builtin.venv", "build-output", Reclaimable, 0.9, "regenerable: Python virtualenv, rebuilt by `python -m venv` plus a reinstall — it holds `pyvenv.cfg`"),
+    ("vscode/Code/Cache", "builtin.vscode", "cache", Reclaimable, 0.8, "VS Code's HTTP cache; VS Code downloads again on demand"),
+    ("vscode/Code/CachedData", "builtin.vscode", "cache", Reclaimable, 0.8, "VS Code's V8 code cache, one directory per VS Code build; VS Code rebuilds it on start"),
+    ("vscode/Code/CachedExtensionVSIXs", "builtin.vscode", "cache", Reclaimable, 0.8, "extension packages VS Code downloaded; VS Code downloads them again when an extension is installed or updated"),
+    ("windows/SoftwareDistribution/Download", "builtin.windows-update", "cache", Review, 0.6, "Windows Update's download cache; Windows Update downloads again what it still needs (stop the Windows Update service first)"),
+    ("yarn/Yarn/Cache/v6", "builtin.yarn", "cache", Reclaimable, 0.7, "Yarn 1's package cache; Yarn re-downloads packages on the next install"),
+    ("yarn/berry/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-state.yml`"),
+    ("yarn/classic/node_modules", "builtin.yarn", "build-output", Reclaimable, 0.95, "regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `.yarn-integrity`"),
 ];
 
 #[test]
@@ -342,63 +258,61 @@ fn the_built_in_packs_judge_the_fixture_exactly_as_written() {
     let tmp = fixture();
     let mut actual = rows(&tmp);
 
-    for (path, label, disposition, confidence, reason) in EXPECTED {
+    for (path, pack, label, disposition, confidence, reason) in EXPECTED {
         let want = Row {
+            pack: (*pack).into(),
             label: (*label).into(),
             disposition: *disposition,
             confidence: *confidence,
             reason: (*reason).into(),
         };
-        let got = actual.remove(&PathBuf::from(path.replace('/', std::path::MAIN_SEPARATOR_STR)));
-        assert_eq!(got.as_ref(), Some(&want), "{path}");
+        assert_eq!(actual.remove(*path).as_ref(), Some(&want), "{path}");
     }
 
-    assert!(actual.is_empty(), "the pack judged paths the fixture does not expect: {actual:?}");
+    assert!(actual.is_empty(), "the packs judged paths the fixture does not expect: {actual:#?}");
 }
 
-/// The pack a provenance names is what `clean --rule 'pack [Title]'` takes, so
-/// a rule that wanders into another pack breaks a command the user already
-/// typed. The regression: a rule landing in the wrong `builtin.<domain>` pack,
-/// or a pack renamed, while the verdict table above still passes.
+/// The regression: a directory judged on its name alone. Every `UNOWNED`
+/// entry is somebody's data as far as any tool's evidence goes, so nothing at
+/// or above it inside the fixture may carry a verdict.
 #[test]
-fn each_built_in_rule_is_credited_to_the_pack_of_the_toolchain_that_owns_it() {
+fn a_name_without_its_tool_s_signature_is_never_judged() {
     let tmp = fixture();
-    let catalog = catalog_of(tmp.path());
-    for (id, verdict) in judge(&catalog, &TrustedPack::builtins()) {
-        let path = catalog.path(id);
-        let name = path.file_name().expect("a judged path has a name").to_string_lossy();
-        let owner = match name.as_ref() {
-            "installer.iso" => "builtin.downloads",
-            "build" | "dist" | ".cache" | "cache" | "caches" => "builtin.generic",
-            "bin" | "obj" => "builtin.dotnet",
-            ".gradle" => "builtin.gradle",
-            "node_modules" | ".next" => "builtin.node",
-            ".venv" | "venv" | "__pycache__" | ".tox" | ".mypy_cache" | ".pytest_cache" => {
-                "builtin.python"
+    let judged = rows(&tmp);
+    for file in UNOWNED {
+        let mut prefix = String::new();
+        for part in file.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
             }
-            "target" => "builtin.rust",
-            other => panic!("no owner expected for `{other}`"),
-        };
-        assert_eq!(verdict.provenance.pack, owner, "{}", path.display());
+            prefix.push_str(part);
+            assert!(!judged.contains_key(&prefix), "`{prefix}` was judged with no tool evidence");
+        }
     }
 }
 
 /// "Later pack wins" on an equal confidence, so a built-in rule that overlaps
 /// another built-in pack's rule makes verdicts depend on the order of the
 /// `PACKS` list. The regression: a new rule that claims a target another
-/// pack's rule already claims — say a `build/` beside a `Cargo.toml` — with
-/// the winner decided by list position rather than by anyone's intent. The
-/// crowded directory puts every corroborating manifest beside every generic
-/// name, which is where such an overlap would surface.
+/// pack's rule already claims — say a `node_modules` holding both npm's and
+/// pnpm's marker — with the winner decided by list position rather than by
+/// anyone's intent. The crowded tree puts every signature inside and beside
+/// every name a rule targets, which is where such an overlap would surface.
 #[test]
 fn the_built_in_packs_judge_the_same_in_either_order() {
     let tmp = fixture();
     let crowded = tmp.path().join("crowded");
-    for marker in ["Cargo.toml", "package.json", "pyproject.toml", "CMakeLists.txt", "App.csproj"] {
-        write(crowded.join(marker), b"{}");
-    }
-    for dir in ["target", "build", "dist", "bin", "obj", "cache", ".cache", "caches"] {
-        write(crowded.join(dir).join("out.bin"), b"built");
+    let signatures: BTreeSet<&str> =
+        OWNED.iter().filter_map(|file| file.rsplit('/').next()).collect();
+    let names: BTreeSet<&str> =
+        OWNED.iter().flat_map(|file| file.split('/').rev().skip(1)).collect();
+    for (index, name) in names.iter().enumerate() {
+        let parent = crowded.join(format!("p{index}"));
+        // A file may not share a name with the directory beside it.
+        for signature in signatures.iter().filter(|signature| *signature != name) {
+            write(parent.join(signature), b"x");
+            write(parent.join(name).join(signature), b"x");
+        }
     }
     let catalog = catalog_of(tmp.path());
 

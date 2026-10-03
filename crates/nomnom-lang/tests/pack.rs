@@ -135,7 +135,7 @@ fn a_directory_without_a_manifest_is_an_io_error() {
 fn the_documented_example_rule_still_parses() {
     let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/lang.md");
     let text = fs::read_to_string(&spec).expect("docs/lang.md is next to the crate");
-    let start = text.find("[build/ beside a manifest]").expect("the example is in the spec");
+    let start = text.find("[Yarn node_modules/]").expect("the example is in the spec");
     let end = text[start..].find("\n```").expect("the example is fenced") + start;
     let source = Source::new("docs/lang.md", &text[start..end]);
     assert_eq!(parse(&source, &Kinds::builtin()).expect("the spec example parses").len(), 2);

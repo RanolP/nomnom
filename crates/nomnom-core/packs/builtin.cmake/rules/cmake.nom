@@ -1,0 +1,14 @@
+# A CMake build directory: CMake writes `CMakeCache.txt` and `CMakeFiles/`
+# into every binary directory it configures. An in-source build puts them in
+# the source tree itself, next to `CMakeLists.txt`, so a directory holding
+# `CMakeLists.txt` is never taken.
+[CMake build directory]
+description = regenerable: CMake build directory, rebuilt by configuring and building again — it holds CMake's `CMakeCache.txt`
+kind = build-output/v1
+confidence = 0.9
+filter {
+  $b has CMakeCache.txt
+  $b has CMakeFiles
+  $b lacks CMakeLists.txt
+  then $b/
+}

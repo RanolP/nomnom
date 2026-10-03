@@ -31,8 +31,8 @@ use globset::{GlobBuilder, GlobMatcher};
 use nomnom_lang::pack::Pack;
 use nomnom_lang::vocab::{Field, Ty};
 use nomnom_lang::{
-    ChildTest, Constraint, Disposition as AstDisposition, Facts, FieldTest, NamePattern, Rule,
-    Value, check, render_reason,
+    ChildTest, CmpOp, Constraint, Disposition as AstDisposition, Facts, FieldTest, Literal,
+    NamePattern, Rule, Value, check, render_reason,
 };
 use nomnom_pack::Trust;
 
@@ -152,6 +152,9 @@ enum Key {
         name: String,
         depth: usize,
     },
+    /// Seeded from nodes named this (folded), each its own anchor: the rule
+    /// pins the anchor's own name with `$v.name == "x"`.
+    Anchor(String),
     /// Seeded from the parents of nodes named any of these (folded).
     Has(Vec<String>),
     /// Seeded from every node strictly inside a subtree named this (folded).
@@ -232,6 +235,12 @@ fn key_of(rule: &Rule) -> Key {
         return Key::Name { name: fold(name), depth };
     }
     let constraints = &rule.filter.constraints;
+    if let Some(name) = constraints.iter().find_map(|c| match c {
+        Constraint::Field(test) if !test.negated => anchor_name(test),
+        _ => None,
+    }) {
+        return Key::Anchor(fold(name));
+    }
     let has = constraints.iter().find_map(|c| match c {
         Constraint::Children(test) if !test.negated => {
             test.names.iter().map(|n| n.value.literal().map(fold)).collect::<Option<Vec<_>>>()
@@ -248,6 +257,19 @@ fn key_of(rule: &Rule) -> Key {
         return Key::Under(name);
     }
     Key::Universal
+}
+
+/// The literal a `$v.name == "x"` test pins the anchor's own name to. All
+/// three name fields compare by the platform's name equality, so a node that
+/// carries this name in the index is exactly a node the test can pass.
+fn anchor_name(test: &FieldTest) -> Option<&str> {
+    let (op, literal) = test.compare.as_ref()?;
+    match (&test.field.value, &op.value, &literal.value) {
+        (Field::Name | Field::DirName | Field::FileName, CmpOp::Eq, Literal::Str(name)) => {
+            Some(name)
+        }
+        _ => None,
+    }
 }
 
 /// The platform's name equality as a hash key: ASCII case folded on Windows,
@@ -270,7 +292,9 @@ impl NameIndex {
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
         for rule in rules {
             match &rule.key {
-                Key::Name { name, .. } => drop(by_name.entry(name.clone()).or_default()),
+                Key::Name { name, .. } | Key::Anchor(name) => {
+                    by_name.entry(name.clone()).or_default();
+                }
                 Key::Has(names) => {
                     for name in names {
                         by_name.entry(name.clone()).or_default();
@@ -379,6 +403,11 @@ impl Compiled<'_> {
                         continue;
                     };
                     self.descend(ctx, seed, depth + 1, anchor, &captures, hits);
+                }
+            }
+            Key::Anchor(name) => {
+                for &anchor in index.named(name) {
+                    self.try_anchor(ctx, index, anchor, clock, hits);
                 }
             }
             Key::Has(names) => {

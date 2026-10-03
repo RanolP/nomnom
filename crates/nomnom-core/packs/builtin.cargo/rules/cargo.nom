@@ -1,0 +1,54 @@
+# Cargo's build directory and the caches under `CARGO_HOME`.
+#
+# Cargo writes `.rustc_info.json` (its cache of `rustc -vV`) and a
+# `CACHEDIR.TAG` into the root of every target directory, whatever it is
+# named, so the pair is the evidence and the name is not consulted: a
+# `target/` without them is somebody else's `target/`.
+
+[Cargo target directory]
+description = regenerable: Cargo build output, rebuilt by `cargo build` — it holds Cargo's `.rustc_info.json` and `CACHEDIR.TAG`
+kind = build-output/v1
+confidence = 0.95
+filter {
+  $t has .rustc_info.json
+  $t has CACHEDIR.TAG
+  then $t/
+}
+
+# `CARGO_HOME/registry` and `CARGO_HOME/git` each carry a `CACHEDIR.TAG`.
+# Only what Cargo refills on its own is taken: the `.crate` downloads, their
+# unpacked sources, and git working copies, which Cargo checks out again from
+# the bare repositories in `git/db` (those stay).
+
+[Cargo registry downloads]
+description = Cargo's downloaded `.crate` archives; Cargo re-downloads them on the next build that needs them
+kind = cache/v1
+confidence = 0.8
+filter {
+  $r.dir.name == "registry"
+  $r has CACHEDIR.TAG
+  $r has index
+  then $r/cache/
+}
+
+[Cargo registry sources]
+description = Cargo's unpacked crate sources; Cargo re-extracts them from its download cache on the next build
+kind = cache/v1
+confidence = 0.8
+filter {
+  $r.dir.name == "registry"
+  $r has CACHEDIR.TAG
+  $r has index
+  then $r/src/
+}
+
+[Cargo git checkouts]
+description = Cargo's working copies of git dependencies; Cargo checks them out again from `git/db` on the next build
+kind = cache/v1
+confidence = 0.8
+filter {
+  $g.dir.name == "git"
+  $g has CACHEDIR.TAG
+  $g has db
+  then $g/checkouts/
+}

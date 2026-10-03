@@ -11,12 +11,15 @@ So the rules move out of Rust and into data, and the data becomes distributable.
 ## A rule
 
 ```
-[build/ beside a manifest]
-description = regenerable: build output, rebuilt by the project's build command — `{$marker}` sits beside it
+[Yarn node_modules/]
+description = regenerable: Yarn dependency tree, rebuilt by `yarn install` — it holds Yarn's `{$marker}`
 kind = build-output/v1
+confidence = 0.95
 filter {
-  $dir has package.json | pyproject.toml | CMakeLists.txt as $marker
-  then $dir/build/
+  $nm.dir.name == "node_modules"
+  $nm has .yarn-integrity | .yarn-state.yml as $marker
+  $nm lacks .modules.yaml | .pnpm | .pnpm-workspace-state-v1.json
+  then $nm/
 }
 
 [Stale download by access]
@@ -92,7 +95,8 @@ A target is **one** decision for its whole subtree, not one per file inside it. 
 Because the target is a path from the matched node rather than the matched node itself, three shapes that the first version of this language could not express are now ordinary rules:
 
 - **Match `X`, target a descendant of it.** `$p has .next / then $p/.next/cache/` takes `.next/cache` and leaves the rest of `.next` alone.
-- **Match `X`, target a sibling.** `$p has .dart_tool / then $p/build/` takes the `build/` that a `.dart_tool` beside it vouches for.
+- **Match the target by what it holds.** `$nm has .yarn-integrity / then $nm/` makes the anchor the target, so the evidence is a file the tool wrote inside it. This is the shape the built-in packs prefer: a directory name is never evidence, and a manifest beside a directory says nothing about what the directory holds.
+- **Match `X`, target a sibling.** `$p has *.csproj as $project / then $p/bin/` takes the `bin/` that a .NET project file beside it vouches for.
 - **Match `X`, spare named children.** `then $p/.cargo/registry/cache/` takes the registry's download cache and never touches `src`, `index` or `git`, which are its siblings.
 
 ## Vocabulary
@@ -143,7 +147,7 @@ That makes `not $f.has_accessed` the way to ask about absence, and it makes the 
 
 A rule's shape tells the engine where it can match, so no rule is run against every node. This is the same trick a browser uses for CSS selectors: match from the right, starting at the most specific name.
 
-1. **Key.** Each rule gets a key from its shape — the deepest literal name in its `then` path (`node_modules`), or failing that, a literal `has` name (the anchor must hold that child), or failing that, its `under` name. One pass over the catalog collects the nodes carrying any key name, and a rule is tried only at those nodes.
+1. **Key.** Each rule gets a key from its shape — the deepest literal name in its `then` path (`node_modules`), or failing that, the anchor's own name pinned by `$v.name`, `$v.dir.name` or `$v.file.name == "literal"`, or failing that, a literal `has` name (the anchor must hold that child), or failing that, its `under` name. One pass over the catalog collects the nodes carrying any key name, and a rule is tried only at those nodes.
 2. **Climb, then check.** From a keyed node the engine climbs back up the `then` path to the anchor and tests the constraints there, cheapest first: `under` (a binary search over the subtree ranges of every node with that name), then bool and numeric fields, then one pass over the anchor's children that answers every `has` and `lacks` at once, then string fields.
 3. **Universal rules.** A rule with no literal name anywhere has no key and is checked at every node. That is allowed, and it is timed on its own line under `NOMNOM_TIMINGS=1`, so a pack that makes a scan slow says which rules did it.
 
@@ -180,7 +184,7 @@ Rule files load in file-name order, so rule order — the last conflict tie-brea
 
 Resolution order, later overriding earlier:
 
-1. built-in, compiled into the binary: one pack per ecosystem or app that owns the files, named `builtin.<domain>` — `builtin.generic` (`build/`, `dist/` and caches no one toolchain owns) first, then `builtin.downloads`, `builtin.dotnet`, `builtin.gradle`, `builtin.node`, `builtin.python` and `builtin.rust`, so a pack naming one owner wins a tie against the catch-all
+1. built-in, compiled into the binary: one pack per tool that creates the files, named `builtin.<tool>`, in alphabetical order — `builtin.bun`, `builtin.cargo`, `builtin.chrome`, `builtin.cmake`, `builtin.cocoapods`, `builtin.cpython`, `builtin.dart`, `builtin.dotnet`, `builtin.downloads`, `builtin.edge`, `builtin.firefox`, `builtin.go`, `builtin.gradle`, `builtin.maven`, `builtin.mypy`, `builtin.next`, `builtin.npm`, `builtin.nuget`, `builtin.pip`, `builtin.pnpm`, `builtin.pytest`, `builtin.ruff`, `builtin.tox`, `builtin.uv`, `builtin.venv`, `builtin.vscode`, `builtin.windows-update` and `builtin.yarn`. There is no catch-all pack: every rule matches only on a signature its tool leaves, and rules that could meet on one directory exclude each other's signatures (`lacks`), so the order among built-ins decides nothing
 2. user — `%LOCALAPPDATA%\nomnom\packs\`
 3. project — `./.nomnom/packs/`
 4. `--pack <dir>`, explicit

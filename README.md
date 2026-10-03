@@ -11,8 +11,8 @@ cargo run -p nomnom-cli -- drives               # fixed drives: label, filesyste
 cargo run -p nomnom-cli -- scan C:\             # the tree, biggest first
 cargo run -p nomnom-cli -- suggest D:           # what each path is, and why
 cargo run -p nomnom-cli -- clean D:             # list the cleanup candidates grouped by rule; approves nothing
-cargo run -p nomnom-cli -- clean D: --rule "Cargo target/"        # dry-run plan of every match of that rule, minus exclusions
-cargo run -p nomnom-cli -- clean D: --rule "Cargo target/" --apply  # delete them permanently
+cargo run -p nomnom-cli -- clean D: --rule "Cargo target directory" # dry-run plan of every match of that rule, minus exclusions
+cargo run -p nomnom-cli -- clean D: --rule "Cargo target directory" --apply  # delete them permanently
 cargo run -p nomnom-cli -- clean D: --exclude D:\work\active      # keep a path and its subtree out of every plan, across scans
 cargo run -p nomnom-cli -- clean D: --exclusions                  # list the drive's exclusions (no scan)
 cargo run -p nomnom-cli -- clean D: D:\proj\node_modules --apply  # permanently delete only the named paths

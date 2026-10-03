@@ -149,6 +149,7 @@ fn the_builtin_packs_are_never_capped() {
     let root = tmp.path().join("tree");
     write(root.join("package.json"), b"{}");
     write(root.join("node_modules").join("left-pad").join("index.js"), b"1");
+    write(root.join("node_modules").join(".package-lock.json"), b"{}");
 
     let catalog = catalog_of(&root);
     let id = catalog.find(&root.join("node_modules")).expect("node_modules node");

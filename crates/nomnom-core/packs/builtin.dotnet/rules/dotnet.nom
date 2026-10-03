@@ -1,46 +1,22 @@
-# The .NET SDK's `bin/` and `obj/`.
-#
-# Both are also ordinary directory names, so each needs a `*.csproj` or `*.sln`
-# beside it proving `dotnet` owns the directory, and without one the verdict
-# drops to `review`. Each corroborated rule has an uncorroborated complement,
-# so exactly one of the pair judges any `bin/` or `obj/`.
+# The .NET SDK's `obj/` and `bin/`.
 
-[.NET bin/]
-description = regenerable: .NET build output, rebuilt by `dotnet build` — `{$marker}` sits beside it
-kind = build-output/v1
-filter {
-  $dir has *.csproj | *.sln as $marker
-  then $dir/bin/
-}
-
+# `dotnet restore` writes `project.assets.json` into `obj/`.
 [.NET obj/]
-description = regenerable: .NET build output, rebuilt by `dotnet build` — `{$marker}` sits beside it
+description = regenerable: .NET intermediate build output, rebuilt by `dotnet build` — it holds the SDK's `project.assets.json`
 kind = build-output/v1
 filter {
-  $dir has *.csproj | *.sln as $marker
-  then $dir/obj/
+  $o.dir.name == "obj"
+  $o has project.assets.json
+  then $o/
 }
 
-# The name matched and nothing backs it up. Still shown, because the human
-# wants to see it, but `review` and low confidence: this is as likely to be
-# their data as it is to be build output.
-
-[bin/ without a .NET project]
-description = named `bin`, but no *.csproj or *.sln beside it — `bin` is also an ordinary directory name, so this may be your data rather than build output
+# `bin/` carries no SDK signature of its own, so the project file beside it is
+# the evidence: the SDK's default output path is `bin/` next to the project.
+[.NET bin/]
+description = regenerable: .NET build output, rebuilt by `dotnet build` — `{$project}` sits beside it
 kind = build-output/v1
-disposition = review
-confidence = 0.35
+confidence = 0.85
 filter {
-  $dir lacks *.csproj | *.sln
-  then $dir/bin/
-}
-
-[obj/ without a .NET project]
-description = named `obj`, but no *.csproj or *.sln beside it — `obj` is also an ordinary directory name, so this may be your data rather than build output
-kind = build-output/v1
-disposition = review
-confidence = 0.35
-filter {
-  $dir lacks *.csproj | *.sln
-  then $dir/obj/
+  $p has *.csproj | *.fsproj | *.vbproj as $project
+  then $p/bin/
 }
