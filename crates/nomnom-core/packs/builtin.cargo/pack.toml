@@ -1,2 +1,5 @@
 name = "builtin.cargo"
 version = "1.0.0"
+# icon source: SVG Logos `rust`, https://cdn.jsdelivr.net/gh/gilbarbara/logos@37a6b807fd71c622efea27a9309b5d4edc792969/logos/rust.svg
+# icon license: CC0-1.0
+icon = "icon.svg"

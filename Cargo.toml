@@ -26,6 +26,9 @@ thiserror = "2.0.20"
 toml = "1.1.6"
 tempfile = "3.27.0"
 chrono = "0.4.45"
+# Checks that a pack icon parses, at the trust boundary: the version gpui
+# renders with, without the font stack, since an icon needs no text.
+usvg = { version = "0.46.0", default-features = false }
 
 # GUI front-end: Longbridge's facade over gpui-component. gpui itself is
 # reachable as `gpui_kit::*`; Zed's `gpui` crate is a separate, incompatible

@@ -1,2 +1,5 @@
 name = "builtin.uv"
 version = "1.0.0"
+# icon source: Simple Icons `uv`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/uv.svg, recolored: filled #DE5FE9
+# icon license: CC0-1.0
+icon = "icon.svg"

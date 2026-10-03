@@ -1,2 +1,5 @@
 name = "builtin.ruff"
 version = "1.0.0"
+# icon source: Simple Icons `ruff`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/ruff.svg, recolored: filled #261230
+# icon license: CC0-1.0
+icon = "icon.svg"

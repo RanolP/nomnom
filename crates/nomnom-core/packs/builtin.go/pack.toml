@@ -1,2 +1,5 @@
 name = "builtin.go"
 version = "1.0.0"
+# icon source: SVG Logos `go`, https://cdn.jsdelivr.net/gh/gilbarbara/logos@37a6b807fd71c622efea27a9309b5d4edc792969/logos/go.svg
+# icon license: CC0-1.0
+icon = "icon.svg"

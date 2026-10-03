@@ -24,6 +24,8 @@ use nomnom_lang::pack::{Pack, from_sources};
 struct Embedded {
     dir: &'static str,
     manifest: &'static str,
+    /// `icon.svg`, which every built-in pack has and names in its manifest.
+    icon: &'static [u8],
     files: &'static [(&'static str, &'static str)],
 }
 
@@ -32,6 +34,7 @@ macro_rules! embedded {
         Embedded {
             dir: $dir,
             manifest: include_str!(concat!("../../packs/", $dir, "/pack.toml")),
+            icon: include_bytes!(concat!("../../packs/", $dir, "/icon.svg")),
             files: &[$(($file, include_str!(concat!("../../packs/", $dir, "/rules/", $file)))),+],
         }
     };
@@ -98,6 +101,10 @@ fn parse(embedded: &Embedded) -> Pack {
         &Source::new("pack.toml", embedded.manifest),
         rules,
         PathBuf::from("<built-in>"),
+        |file| match file {
+            "icon.svg" => Ok(embedded.icon.to_vec()),
+            other => Err(format!("{other} is not compiled in; a built-in pack's icon is icon.svg")),
+        },
     )
     .unwrap_or_else(|error| {
         panic!("the built-in pack `{}` is compiled in and valid:\n{error}", embedded.dir)
@@ -105,4 +112,42 @@ fn parse(embedded: &Embedded) -> Pack {
     // The directory is where a reader looks for the rules a provenance names.
     assert_eq!(pack.name, embedded.dir, "a built-in pack's `name` is its directory name");
     pack
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Catches a built-in pack shipping without an icon, or with one that
+    // no longer parses, which would otherwise only show as a fallback glyph.
+    #[test]
+    fn every_builtin_pack_has_an_icon_that_parses() {
+        for pack in builtin_packs() {
+            let icon = pack.icon.as_ref().unwrap_or_else(|| panic!("`{}` names no icon", pack.name));
+            if let Err(why) = &icon.svg {
+                panic!("`{}`'s icon does not load: {why}", pack.name);
+            }
+        }
+    }
+
+    // Catches an icon added without recording where it came from and under
+    // which license, which a later licensing review could not reconstruct.
+    #[test]
+    fn every_builtin_icon_records_its_source_and_license() {
+        for embedded in PACKS {
+            let line = |key: &str| {
+                embedded.manifest.lines().find_map(|line| line.strip_prefix(key)).map(str::trim)
+            };
+            let source = line("# icon source:")
+                .unwrap_or_else(|| panic!("`{}` has no `# icon source:` line", embedded.dir));
+            assert!(source.contains("https://"), "`{}`'s icon source has no URL", embedded.dir);
+            let license = line("# icon license:")
+                .unwrap_or_else(|| panic!("`{}` has no `# icon license:` line", embedded.dir));
+            assert!(
+                ["CC0-1.0", "ISC", "MIT", "Apache-2.0"].contains(&license),
+                "`{}`'s icon license `{license}` is not one known to be permissive",
+                embedded.dir
+            );
+        }
+    }
 }

@@ -1,5 +1,8 @@
 name = "builtin.downloads"
 version = "1.0.0"
+# icon source: Lucide `download`, https://cdn.jsdelivr.net/npm/lucide-static@1.51.0/icons/download.svg, recolored: stroke #52525b
+# icon license: ISC
+icon = "icon.svg"
 
 # Every kind this pack uses is built in. A pack that wants a kind of its own
 # declares it here, as `[kinds."name/v1"]` with a `disposition`.

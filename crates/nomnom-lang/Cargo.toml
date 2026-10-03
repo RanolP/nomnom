@@ -10,6 +10,7 @@ description = "The nomnom rule language: lexer, parser, AST, diagnostics and pac
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+usvg.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

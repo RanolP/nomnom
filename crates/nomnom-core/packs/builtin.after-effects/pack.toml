@@ -1,5 +1,8 @@
 name = "builtin.after-effects"
 version = "1.0.0"
+# icon source: SVG Logos `adobe-after-effects`, https://cdn.jsdelivr.net/gh/gilbarbara/logos@37a6b807fd71c622efea27a9309b5d4edc792969/logos/adobe-after-effects.svg
+# icon license: CC0-1.0
+icon = "icon.svg"
 # Adobe After Effects on Windows: the application, the per-version
 # preferences folder, and the conformed-media cache it shares with Premiere
 # Pro and Media Encoder. Only the media cache is ever proposed for removal;

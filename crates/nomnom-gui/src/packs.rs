@@ -6,6 +6,7 @@
 //! they are trusted.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -20,13 +21,17 @@ use nomnom_core::action::plain;
 use nomnom_core::verdict::{KnownPack, PackRow, find_pack, pack_inventory};
 use nomnom_pack::{Lock, Store, Tier, Trust};
 
+use crate::pack_icon;
 use crate::session::{Phase, Session};
+
+/// A row with the icon it draws, decoded once per load rather than per frame.
+type IconedRow = (PackRow, Option<Arc<Image>>);
 
 pub struct PacksScreen {
     session: Entity<Session>,
     /// The root the inventory was loaded for, so a root change reloads it.
     loaded_for: Option<PathBuf>,
-    rows: Option<Result<Vec<PackRow>, String>>,
+    rows: Option<Result<Vec<IconedRow>, String>>,
     url: Entity<InputState>,
     /// A trust grant waiting for the user to read what it names.
     pending_trust: Option<KnownPack>,
@@ -157,6 +162,14 @@ impl PacksScreen {
                 .background_executor()
                 .spawn(async move { pack_inventory(&pack_root, &explicit) })
                 .await
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| {
+                            let image = pack_icon::image(row.icon.as_ref());
+                            (row, image)
+                        })
+                        .collect()
+                })
                 .map_err(|error| {
                     let message = format!("cannot list packs for {}: {error}", root.display());
                     eprintln!("nomnom-gui: {message}");
@@ -417,7 +430,7 @@ impl Render for PacksScreen {
                 Alert::error("pack-list-error", message.clone()).into_any_element()
             }
             Some(Ok(rows)) => {
-                let body = rows.iter().enumerate().map(|(ix, row)| {
+                let body = rows.iter().enumerate().map(|(ix, (row, image))| {
                     let name = row.name.clone();
                     let locked = row.url.is_some();
                     let actions = h_flex()
@@ -475,7 +488,14 @@ impl Render for PacksScreen {
                             )
                         });
                     TableRow::new()
-                        .child(TableCell::new().child(row.name.clone()))
+                        .child(
+                            TableCell::new().child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(pack_icon::tile(image.clone(), cx))
+                                    .child(row.name.clone()),
+                            ),
+                        )
                         .child(TableCell::new().child(tier_name(row.tier)))
                         .child(TableCell::new().child(trust_tag(row.trust)))
                         .child(
@@ -490,7 +510,15 @@ impl Render for PacksScreen {
                         )
                         .child(TableCell::new().child(actions))
                 });
-                Table::new()
+                // The CLI's `pack list` prints the same lines under its table.
+                let broken: Vec<String> = rows
+                    .iter()
+                    .filter_map(|(row, _)| {
+                        let why = row.icon.as_ref()?.svg.as_ref().err()?;
+                        Some(format!("Pack `{}` shows no icon: {why}", row.name))
+                    })
+                    .collect();
+                let table = Table::new()
                     .child(
                         TableHeader::new().child(
                             TableRow::new()
@@ -502,7 +530,13 @@ impl Render for PacksScreen {
                                 .child(TableHead::new().child("")),
                         ),
                     )
-                    .child(TableBody::new().children(body))
+                    .child(TableBody::new().children(body));
+                v_flex()
+                    .gap_2()
+                    .when(!broken.is_empty(), |col| {
+                        col.child(Alert::warning("pack-icon-warning", broken.join("\n")))
+                    })
+                    .child(table)
                     .into_any_element()
             }
         };

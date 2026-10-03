@@ -1,2 +1,5 @@
 name = "builtin.nuget"
 version = "1.0.0"
+# icon source: Simple Icons `nuget`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/nuget.svg, recolored: filled #004880
+# icon license: CC0-1.0
+icon = "icon.svg"

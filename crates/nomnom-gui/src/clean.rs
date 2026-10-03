@@ -26,6 +26,7 @@ use gpui_kit::*;
 use nomnom_core::action::{Action, ActionKind, ApplyRecord, RecordStatus, apply_with, plain};
 use nomnom_core::verdict::{Assessment, Disposition, Provenance, Verdict};
 
+use crate::pack_icon;
 use crate::session::{Assessed, Phase, Session};
 use crate::state::{Preview, Selection, size};
 
@@ -595,6 +596,10 @@ fn render_row(
                         ),
                 )
                 .children(disposition_tag(*disposition))
+                .child(pack_icon::tile(
+                    this.session.read(cx).pack_icons.get(&provenance.pack).cloned(),
+                    cx,
+                ))
                 .child(
                     v_flex()
                         .flex_1()

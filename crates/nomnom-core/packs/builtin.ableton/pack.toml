@@ -1,5 +1,8 @@
 name = "builtin.ableton"
 version = "1.0.0"
+# icon source: Lucide `audio-waveform`, https://cdn.jsdelivr.net/npm/lucide-static@1.51.0/icons/audio-waveform.svg, recolored: stroke #52525b
+# icon license: ISC
+icon = "icon.svg"
 # Ableton Live (every edition, Suite included) on Windows: the application and
 # its Core Library, the per-version preferences, the browser database, the
 # User Library, every Live Project, and the decoding cache. Only the decoding

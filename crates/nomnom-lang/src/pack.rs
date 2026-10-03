@@ -2,13 +2,15 @@
 //!
 //! ```text
 //! mypack/
-//!   pack.toml     name, version, the kinds it declares
+//!   pack.toml     name, version, its icon, the kinds it declares
+//!   icon.svg      optional, named by `icon`
 //!   rules/*.toml  `[[rule]]` tables
 //! ```
 //!
 //! ```toml
 //! name = "rust"
 //! version = "0.2.0"
+//! icon = "icon.svg"
 //!
 //! [kinds."toolchain-cache/v1"]
 //! disposition = "reclaimable"
@@ -21,7 +23,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -43,7 +46,25 @@ pub struct Pack {
     /// rather than of the filesystem's readdir order.
     pub rules: Vec<LoadedRule>,
     pub dir: PathBuf,
+    /// `None` when `pack.toml` names no icon.
+    pub icon: Option<PackIcon>,
 }
+
+/// The icon `pack.toml` names, as named and as read.
+///
+/// A broken icon never fails the pack: the rules are what a pack is for, so a
+/// missing or malformed picture costs the pack its picture and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackIcon {
+    /// The file name `icon` gives, relative to the pack directory.
+    pub file: String,
+    /// The SVG, checked to parse, or why it cannot be shown — a warning for
+    /// whoever lists the pack, never a load error.
+    pub svg: Result<Arc<[u8]>, String>,
+}
+
+/// Above this an icon is not an icon; it is refused before it is parsed.
+pub const ICON_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct LoadedRule {
@@ -71,6 +92,8 @@ pub enum PackError {
 struct Manifest {
     name: String,
     version: String,
+    #[serde(default)]
+    icon: Option<String>,
     #[serde(default)]
     kinds: BTreeMap<String, KindDecl>,
 }
@@ -116,7 +139,59 @@ pub fn load(dir: &Path) -> Result<Pack, PackError> {
         let text = read(&file)?;
         sources.push((Source::new(display(&file), text), file));
     }
-    from_sources(&manifest, sources, dir.to_path_buf())
+    from_sources(&manifest, sources, dir.to_path_buf(), |file| read_icon_file(dir, file))
+}
+
+/// The icon `dir/pack.toml` names, read without loading the pack — for a
+/// listing that must show a pack whose rules do not load. `None` when the
+/// manifest is unreadable or names no icon; loading the pack reports why.
+pub fn load_icon(dir: &Path) -> Option<PackIcon> {
+    let text = fs::read_to_string(dir.join("pack.toml")).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    match table.get("icon")? {
+        toml::Value::String(file) => Some(icon(file.clone(), |file| read_icon_file(dir, file))),
+        other => {
+            Some(PackIcon { file: other.to_string(), svg: Err("`icon` is not a string".into()) })
+        }
+    }
+}
+
+fn read_icon_file(dir: &Path, file: &str) -> Result<Vec<u8>, String> {
+    fs::read(dir.join(file)).map_err(|error| format!("cannot read {file}: {error}"))
+}
+
+/// Check the name `icon` gives, read it through `read`, and check that it
+/// parses as SVG. A pack is untrusted input, so the name may only name a file
+/// directly inside the pack directory.
+fn icon(file: String, read: impl FnOnce(&str) -> Result<Vec<u8>, String>) -> PackIcon {
+    let svg = check_icon_name(&file).and_then(|()| read(&file)).and_then(|bytes| {
+        if bytes.len() > ICON_MAX_BYTES {
+            return Err(format!(
+                "{file} is {} bytes, over the {ICON_MAX_BYTES}-byte limit",
+                bytes.len()
+            ));
+        }
+        usvg::Tree::from_data(&bytes, &usvg::Options::default())
+            .map_err(|error| format!("{file} is not a usable SVG: {error}"))?;
+        Ok(Arc::from(bytes))
+    });
+    PackIcon { file, svg }
+}
+
+fn check_icon_name(file: &str) -> Result<(), String> {
+    let mut components = Path::new(file).components();
+    // `components` reads `a/b` as two parts on every platform but `a\b` as
+    // one outside Windows, so separators are refused by hand as well.
+    let single = matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && !file.contains(['/', '\\']);
+    if !single {
+        return Err(format!("`icon = \"{file}\"` must name a file directly in the pack directory"));
+    }
+    if !file.to_ascii_lowercase().ends_with(".svg") {
+        return Err(format!("`icon = \"{file}\"` must name an .svg file"));
+    }
+    Ok(())
 }
 
 /// [`load`], for a manifest and rule files already in memory — the built-in
@@ -124,16 +199,21 @@ pub fn load(dir: &Path) -> Result<Pack, PackError> {
 /// exactly the checks a downloaded pack does.
 ///
 /// `rules` is in load order, each source paired with the path it came from.
+/// `read_icon` is handed the file name `icon` gives, already checked to name
+/// a file directly in the pack directory, and returns its bytes.
 pub fn from_sources(
     manifest: &Source,
     rules: impl IntoIterator<Item = (Source, PathBuf)>,
     dir: PathBuf,
+    read_icon: impl FnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Pack, PackError> {
     let text = &manifest.text;
     let parsed: Manifest = toml::from_str(text).map_err(|error| {
         let span = error.span().map_or(Span::new(0, text.len()), |r| Span::new(r.start, r.end));
         Diagnostic::new(manifest, span, format!("invalid pack manifest: {}", error.message()))
-            .with_label("expected `name`, `version` and optional `[kinds.\"name/vN\"]` tables")
+            .with_label(
+                "expected `name`, `version`, optional `icon` and optional `[kinds.\"name/vN\"]` tables",
+            )
     })?;
 
     let mut declared = Vec::new();
@@ -163,7 +243,8 @@ pub fn from_sources(
         }
     }
 
-    Ok(Pack { name: parsed.name, version: parsed.version, kinds: declared, rules: loaded, dir })
+    let icon = parsed.icon.map(|file| icon(file, read_icon));
+    Ok(Pack { name: parsed.name, version: parsed.version, kinds: declared, rules: loaded, dir, icon })
 }
 
 /// One `[kinds."name/vN"]` table to a [`Kind`].

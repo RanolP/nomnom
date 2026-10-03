@@ -151,18 +151,37 @@ fn list(root: &Path, explicit: &[PathBuf], json: bool, out: &mut dyn Write) -> R
     }
 
     let width = |f: fn(&Row) -> &str| rows.iter().map(|r| f(r).len()).max().unwrap_or(0);
-    let (name_w, tier_w, trust_w) =
-        (width(|r| &r.name).max(4), width(|r| r.tier).max(4), width(|r| r.trust).max(5));
-    writeln!(out, "{:name_w$}  {:tier_w$}  {:trust_w$}  PINNED", "NAME", "TIER", "TRUST")?;
+    let (name_w, tier_w, trust_w, icon_w) = (
+        width(|r| &r.name).max(4),
+        width(|r| r.tier).max(4),
+        width(|r| r.trust).max(5),
+        width(Row::icon_cell).max(4),
+    );
+    writeln!(
+        out,
+        "{:name_w$}  {:tier_w$}  {:trust_w$}  {:icon_w$}  PINNED",
+        "NAME", "TIER", "TRUST", "ICON"
+    )?;
     for row in &rows {
         writeln!(
             out,
-            "{:name_w$}  {:tier_w$}  {:trust_w$}  {}",
+            "{:name_w$}  {:tier_w$}  {:trust_w$}  {:icon_w$}  {}",
             row.name,
             row.tier,
             row.trust,
+            row.icon_cell(),
             row.sha.as_deref().unwrap_or("-")
         )?;
+    }
+    let broken: Vec<(&str, &str)> = rows
+        .iter()
+        .filter_map(|row| Some((row.name.as_str(), row.icon.as_ref()?.error.as_deref()?)))
+        .collect();
+    if !broken.is_empty() {
+        writeln!(out)?;
+        for (name, why) in broken {
+            writeln!(out, "warning: pack `{name}` shows no icon: {why}")?;
+        }
     }
     if rows.iter().any(|row| row.trust == UNTRUSTED) {
         writeln!(out)?;
@@ -289,11 +308,41 @@ struct Row {
     sha: Option<String>,
     url: Option<String>,
     dir: String,
+    /// `null` when the manifest names no icon.
+    icon: Option<IconRow>,
+}
+
+#[derive(Serialize)]
+struct IconRow {
+    /// What `icon` says, as written.
+    file: String,
+    /// `file` joined to `dir`, or `null` when the icon is broken — a name
+    /// that leaves the pack directory must not be printed as if it were in it.
+    path: Option<String>,
+    /// Why it cannot be shown, or `null` when it parses. A broken icon is a
+    /// warning: the pack still loads.
+    error: Option<String>,
+}
+
+impl Row {
+    fn icon_cell(&self) -> &str {
+        match &self.icon {
+            None => "-",
+            Some(IconRow { error: Some(_), .. }) => "broken",
+            Some(IconRow { error: None, .. }) => "yes",
+        }
+    }
 }
 
 impl From<PackRow> for Row {
     fn from(pack: PackRow) -> Row {
+        let dir = pack.dir.unwrap_or_else(|| PathBuf::from("<built-in>"));
         Row {
+            icon: pack.icon.map(|icon| IconRow {
+                path: icon.svg.is_ok().then(|| dir.join(&icon.file).display().to_string()),
+                error: icon.svg.err(),
+                file: icon.file,
+            }),
             name: pack.name,
             tier: match pack.tier {
                 None => "built-in",
@@ -308,7 +357,7 @@ impl From<PackRow> for Row {
             },
             sha: pack.sha,
             url: pack.url,
-            dir: pack.dir.map_or_else(|| "<built-in>".to_string(), |dir| dir.display().to_string()),
+            dir: dir.display().to_string(),
         }
     }
 }
@@ -453,6 +502,47 @@ mod tests {
         // Every row carries the pin slot even when it is empty, so a consumer
         // never has to tell "no key" from "not pinned".
         assert!(packs.iter().all(|row| row.get("sha").is_some()), "{packs:?}");
+    }
+
+    /// The regression: a user pack whose `icon` escapes its directory or does
+    /// not parse failing the listing, or being reported as having an icon,
+    /// where it must list with a warning and the GUI's fallback glyph.
+    #[test]
+    fn pack_list_reports_each_icon_and_warns_on_a_broken_one_without_failing() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let good = local_pack(root, "good", "review");
+        std::fs::write(
+            good.join("icon.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>"#,
+        )
+        .unwrap();
+        let bad = local_pack(root, "bad", "review");
+        let manifest = std::fs::read_to_string(bad.join("pack.toml")).unwrap();
+        let manifest = manifest.replacen("\n", "\nicon = \"../good/icon.svg\"\n", 1);
+        std::fs::write(bad.join("pack.toml"), manifest).unwrap();
+        let manifest = std::fs::read_to_string(good.join("pack.toml")).unwrap();
+        std::fs::write(good.join("pack.toml"), manifest.replacen("\n", "\nicon = \"icon.svg\"\n", 1))
+            .unwrap();
+        let packs = vec![good.clone(), bad];
+
+        let text = pack_ok(root, PackCommand::List { packs: packs.clone(), json: false });
+        assert!(text.contains("ICON"), "{text}");
+        assert!(text.contains("warning: pack `bad` shows no icon"), "{text}");
+        assert!(!text.contains("warning: pack `good`"), "{text}");
+
+        let json = list_json(root, packs);
+        let row = |name: &str| {
+            json["packs"].as_array().unwrap().iter().find(|row| row["name"] == name).unwrap().clone()
+        };
+        let good_icon = &row("good")["icon"];
+        assert_eq!(good_icon["path"].as_str(), Some(good.join("icon.svg").display().to_string().as_str()));
+        assert!(good_icon["error"].is_null(), "{good_icon}");
+        let bad_icon = &row("bad")["icon"];
+        assert!(bad_icon["error"].as_str().unwrap().contains("directly in the pack"));
+        assert!(bad_icon["path"].is_null(), "an escaping name has no path: {bad_icon}");
+        assert_eq!(bad_icon["file"].as_str(), Some("../good/icon.svg"));
+        assert!(row("builtin.cargo")["icon"]["error"].is_null(), "built-in icons parse");
     }
 
     /// `docs/lang.md`: a pack is "pinned to a commit, never to a branch". The

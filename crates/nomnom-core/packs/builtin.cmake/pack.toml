@@ -1,2 +1,5 @@
 name = "builtin.cmake"
 version = "1.0.0"
+# icon source: Simple Icons `cmake`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/cmake.svg, recolored: filled #064F8C
+# icon license: CC0-1.0
+icon = "icon.svg"

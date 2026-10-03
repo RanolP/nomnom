@@ -1,2 +1,5 @@
 name = "builtin.mypy"
 version = "1.0.0"
+# icon source: Lucide `type`, https://cdn.jsdelivr.net/npm/lucide-static@1.51.0/icons/type.svg, recolored: stroke #52525b
+# icon license: ISC
+icon = "icon.svg"

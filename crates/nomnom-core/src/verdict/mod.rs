@@ -25,6 +25,7 @@ pub use claim::{Claim, ClaimRow, DropReason, DroppedClaim, Ownership, PackClaims
 pub use packs::{
     KnownPack, PackLookupError, PackRow, find_pack, pack_inventory, resolve_packs, resolve_sources,
 };
+pub use nomnom_lang::pack::PackIcon;
 pub use select::TrustedPack;
 
 /// What the path IS — an open, interned name rather than a closed enum.

@@ -1,2 +1,5 @@
 name = "builtin.pytest"
 version = "1.0.0"
+# icon source: Simple Icons `pytest`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/pytest.svg, recolored: filled #0A9EDC
+# icon license: CC0-1.0
+icon = "icon.svg"

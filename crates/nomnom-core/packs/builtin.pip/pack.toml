@@ -1,2 +1,5 @@
 name = "builtin.pip"
 version = "1.0.0"
+# icon source: Simple Icons `pypi`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/pypi.svg, recolored: filled #3775A9
+# icon license: CC0-1.0
+icon = "icon.svg"

@@ -3,17 +3,19 @@
 //! starts by itself once it lands; the plan list and Reclaim read that one
 //! assessment.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui_kit::{Context, EventEmitter};
+use gpui_kit::{Context, EventEmitter, Image};
 use nomnom_core::catalog::{Catalog, NodeId};
 use nomnom_core::scan::{self, ScanFailure, Stage, Volume, VolumeRoot};
 use nomnom_core::timings;
 use nomnom_core::verdict::{Assessment, assess_with, resolve_packs};
 
+use crate::pack_icon;
 use crate::palette::Palette;
 
 /// The long-running phase in flight. Only one runs at a time: every phase
@@ -161,6 +163,8 @@ pub struct Session {
     /// Set while a scan runs.
     pub progress: Option<ScanProgress>,
     pub assessment: Option<Arc<Assessment>>,
+    /// The icon of every pack `assessment` was judged with, by pack name.
+    pub pack_icons: Arc<HashMap<String, Arc<Image>>>,
     /// Set while the judging of the current catalog runs in the background.
     pub assessing: bool,
     /// Bumped by every scan and every judging run, so a result that lands
@@ -185,6 +189,7 @@ impl Session {
             scan: None,
             progress: None,
             assessment: None,
+            pack_icons: Arc::default(),
             assessing: false,
             assess_generation: 0,
             busy: None,
@@ -356,7 +361,9 @@ impl Session {
                         progress.enter(Stage::Index, 0);
                     }
                     let packs = resolve_packs(&pack_root, &explicit)?;
-                    Ok::<_, nomnom_pack::Error>(Arc::new(assess_with(&catalog, packs, progress)))
+                    let icons = Arc::new(pack_icon::images(&packs));
+                    let assessment = Arc::new(assess_with(&catalog, packs, progress));
+                    Ok::<_, nomnom_pack::Error>((assessment, icons))
                 })
                 .await;
             let elapsed = started.elapsed();
@@ -372,8 +379,9 @@ impl Session {
                 }
                 this.assessing = false;
                 match judged {
-                    Ok(assessment) => {
+                    Ok((assessment, icons)) => {
                         this.assessment = Some(assessment);
+                        this.pack_icons = icons;
                         cx.emit(Assessed);
                     }
                     Err(error) => {

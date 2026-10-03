@@ -31,7 +31,46 @@ fn diagnostic_of(error: PackError) -> String {
     }
 }
 
-const RUST_MANIFEST: &str = "name = \"rust\"\nversion = \"0.2.0\"\n\n\
+const SQUARE_SVG: &str =
+    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>"#;
+
+fn icon_pack(icon: &str) -> TempDir {
+    let manifest = format!("name = \"iconed\"\nversion = \"0.1.0\"\nicon = {icon:?}\n");
+    let dir = pack_dir(&manifest, &[("main.toml", rule_text("only", "cache/v1"))]);
+    fs::write(dir.path().join("icon.svg"), SQUARE_SVG).expect("write icon");
+    fs::write(dir.path().join("broken.svg"), "<svg").expect("write broken icon");
+    dir
+}
+
+// Catches an untrusted pack's `icon` reading outside its own directory, or a
+// bad icon failing the whole pack instead of costing it only its picture.
+#[test]
+fn a_pack_icon_loads_from_its_own_directory_and_a_bad_one_is_only_a_warning() {
+    let dir = icon_pack("icon.svg");
+    let pack = load(dir.path()).expect("loads");
+    let icon = pack.icon.expect("an icon");
+    assert_eq!(icon.svg.as_deref(), Ok(SQUARE_SVG.as_bytes()));
+    let listed = nomnom_lang::pack::load_icon(dir.path()).expect("an icon");
+    assert_eq!(listed.svg.as_deref(), Ok(SQUARE_SVG.as_bytes()), "a listing reads the same icon");
+
+    for (named, why) in [
+        ("../icon.svg", "directly in the pack directory"),
+        ("sub/icon.svg", "directly in the pack directory"),
+        ("sub\\icon.svg", "directly in the pack directory"),
+        ("/etc/icon.svg", "directly in the pack directory"),
+        ("pack.toml", "must name an .svg file"),
+        ("missing.svg", "cannot read missing.svg"),
+        ("broken.svg", "not a usable SVG"),
+    ] {
+        let dir = icon_pack(named);
+        let pack =
+            load(dir.path()).unwrap_or_else(|error| panic!("`{named}` failed the pack: {error}"));
+        let error = pack.icon.expect("an icon").svg.expect_err(named);
+        assert!(error.contains(why), "`{named}`: {error}");
+    }
+}
+
+const RUST_MANIFEST: &str ="name = \"rust\"\nversion = \"0.2.0\"\n\n\
     [kinds.\"toolchain-cache/v1\"]\ndisposition = \"review\"\n";
 
 /// The whole-directory happy path: manifest fields and declared kinds land,

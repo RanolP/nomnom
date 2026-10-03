@@ -1,2 +1,5 @@
 name = "builtin.maven"
 version = "1.0.0"
+# icon source: Simple Icons `apachemaven`, https://cdn.jsdelivr.net/npm/simple-icons@16.33.0/icons/apachemaven.svg, recolored: filled #C71A36
+# icon license: Apache-2.0
+icon = "icon.svg"

@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use nomnom_lang::pack::{PackIcon, load_icon};
 use nomnom_pack::{Lock, PackSource, Resolver, Store, Tier, Trust};
 
 use super::{TrustedPack, builtin_packs};
@@ -58,6 +59,8 @@ pub struct PackRow {
     pub url: Option<String>,
     /// `None` for a built-in pack, which is compiled in.
     pub dir: Option<PathBuf>,
+    /// `None` when the manifest names no icon or cannot be read.
+    pub icon: Option<PackIcon>,
 }
 
 /// The built-in packs, then every pack the project's lock and tiers resolve.
@@ -75,6 +78,7 @@ pub fn pack_inventory(
             sha: None,
             url: None,
             dir: None,
+            icon: pack.icon.clone(),
         })
         .collect();
     for source in resolve_sources(project_root, explicit, &lock)? {
@@ -85,6 +89,7 @@ pub fn pack_inventory(
             trust: source.trust,
             sha: locked.and_then(|pack| pack.sha.clone()),
             url: locked.and_then(|pack| pack.url.clone()),
+            icon: load_icon(&source.dir),
             dir: Some(source.dir),
         });
     }

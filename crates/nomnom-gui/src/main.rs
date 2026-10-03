@@ -7,6 +7,7 @@
 mod app;
 mod clean;
 mod drives;
+mod pack_icon;
 mod packs;
 mod palette;
 mod scan;

@@ -651,7 +651,8 @@ The winning verdict records which pack and rule produced it. With packs coming f
 
 ```
 mypack/
-  pack.toml        name, version, kinds; from Unit 3 also platforms, classes, handlers, [reads]
+  pack.toml        name, version, icon, kinds; from Unit 3 also platforms, classes, handlers, [reads]
+  icon.svg         optional, named by `icon`
   rules/*.toml     [[rule]] tables, read in file-name order
   fixtures/*.tree  Unit 3: golden tests, with a .expect beside each
 ```
@@ -659,10 +660,17 @@ mypack/
 ```toml
 name = "rust"
 version = "0.2.0"
+# icon source: SVG Logos `rust`, https://cdn.jsdelivr.net/gh/gilbarbara/logos@<commit>/logos/rust.svg
+# icon license: CC0-1.0
+icon = "icon.svg"
 
 [kinds."toolchain-cache/v1"]
 disposition = "reclaimable"
 ```
+
+`icon` is optional and names an SVG file directly inside the pack directory: one file name, with no `/`, `\` or `..`, ending in `.svg`, at most 256 KiB. The GUI draws it beside the pack on the Packs screen and beside each of its rules in the suggestion panel, and `nomnom pack list` shows whether it is set (`--json` gives its path). A pack is untrusted input, so a name that leaves the directory, a missing file or one that does not parse as SVG never fails the pack: it loads without its icon, the GUI draws a neutral glyph, and both `pack list` and the Packs screen print a warning saying why.
+
+Every built-in pack has an `icon.svg`, embedded in the binary beside its rules, and its `pack.toml` records where it came from in two comments above the key: `# icon source:` with the pinned URL and any recolouring, and `# icon license:` with the SPDX id. A test fails the build when a built-in icon is missing, does not parse, or lacks either line.
 
 Rule files load in file-name order, so rule order — the tie-break within a pack — is the same on every machine. A `rules/` directory still holding a `.nom` file from the old line-based format refuses the whole pack, naming the file, because skipping it would load the pack with none of its rules and no word about why.
 
