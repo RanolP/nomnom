@@ -212,7 +212,7 @@ So a refusal is never a rule. It is applied to every candidate, after evaluation
 - a candidate outside the scan root, or on another volume, is refused
 - a run that could not verify something reports "I could not verify N items" rather than quietly including or excluding them
 
-The other half of that history is worth stating too: every serious incident there was an unrecoverable one, because deletion was a permanent `unlink`. nomnom deletes reversibly, through the platform's own recycle bin, with a journal that restores byte-for-byte. That is the one place the comparison deliberately does not apply.
+The other half of that history is worth stating too: every serious incident there was an unrecoverable one, because deletion was a permanent `unlink`. nomnom deletes permanently as well, with no recycle bin and no undo, so its safety has to come before the deletion rather than after it. Nothing is deleted that the user did not approve: every candidate starts unapproved, a rule or a path is approved one at a time, and an approval lasts one run. Exclusions persist per drive and can only shrink a plan. And the executor's own fences hold whatever the plan says: it refuses a drive root, a path outside the clean root, a path containing `..`, and the clean root itself.
 
 ## What the language does not do
 

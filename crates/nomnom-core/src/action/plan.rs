@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use super::ActionError;
 
-/// One reversible operation on one path.
+/// One operation on one path.
 ///
-/// There is no hard delete. [`Action::Trash`] goes to the OS recycle bin; the
-/// other two are renames.
+/// [`Action::Delete`] is permanent: no recycle bin, because a recycled path
+/// frees no space until the bin is emptied. The other two are renames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
-    Trash { path: PathBuf },
+    Delete { path: PathBuf },
     Archive { path: PathBuf, to: PathBuf },
     Move { path: PathBuf, to: PathBuf },
 }
@@ -27,7 +27,7 @@ impl Action {
     /// The path the action consumes.
     pub fn path(&self) -> &Path {
         match self {
-            Action::Trash { path } | Action::Archive { path, .. } | Action::Move { path, .. } => {
+            Action::Delete { path } | Action::Archive { path, .. } | Action::Move { path, .. } => {
                 path
             }
         }
@@ -36,7 +36,7 @@ impl Action {
     /// Where it goes, for the two actions that name a destination.
     pub fn destination(&self) -> Option<&Path> {
         match self {
-            Action::Trash { .. } => None,
+            Action::Delete { .. } => None,
             Action::Archive { to, .. } | Action::Move { to, .. } => Some(to),
         }
     }
@@ -149,7 +149,7 @@ impl Plan {
     fn guard(&self, action: &Action) -> Result<Action, ActionError> {
         let source = guard_source(action.path(), &self.root)?;
         Ok(match action {
-            Action::Trash { .. } => Action::Trash { path: source },
+            Action::Delete { .. } => Action::Delete { path: source },
             Action::Archive { to, .. } => {
                 let to = guard_destination(to, &source)?;
                 Action::Archive { path: source, to }

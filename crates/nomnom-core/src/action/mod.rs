@@ -3,8 +3,9 @@
 //! Everything else in this crate observes and judges; this domain acts. It is
 //! built on two commitments:
 //!
-//! - **Nothing is hard-deleted.** [`Action::Trash`] goes to the OS recycle bin,
-//!   and the other two actions are renames.
+//! - **Nothing moves without an explicit pick.** [`Action::Delete`] is
+//!   permanent (no recycle bin), so a plan holds only what the user approved,
+//!   minus exclusions. The other two actions are renames.
 //! - **The guards are not optional.** A [`Plan`] refuses any path that is a
 //!   filesystem or drive root, contains `..`, or falls outside the declared
 //!   clean root — at planning time and again at apply time, because a plan can
@@ -22,7 +23,7 @@ mod plan;
 
 use std::path::PathBuf;
 
-pub use apply::{ActionKind, ApplyRecord, ApplyReport, RecordStatus, apply};
+pub use apply::{ActionKind, ApplyRecord, ApplyReport, RecordStatus, apply, apply_with};
 pub use candidates::{
     Approval, RuleGroup, RuleLookupError, approved, by_rule, candidates, find_rule, plan_from,
 };

@@ -15,7 +15,7 @@ use super::plan::{Action, Plan};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
-    Trash,
+    Delete,
     Archive,
     Move,
 }
@@ -23,7 +23,7 @@ pub enum ActionKind {
 impl From<&Action> for ActionKind {
     fn from(action: &Action) -> Self {
         match action {
-            Action::Trash { .. } => ActionKind::Trash,
+            Action::Delete { .. } => ActionKind::Delete,
             Action::Archive { .. } => ActionKind::Archive,
             Action::Move { .. } => ActionKind::Move,
         }
@@ -83,28 +83,42 @@ impl ApplyReport {
     }
 }
 
-/// Execute `plan`: trashed paths go to the OS recycle bin, archives and moves
+/// Execute `plan`: deleted paths are removed permanently, archives and moves
 /// are renames.
 ///
 /// Returns `Err` only when the plan itself is unacceptable, before anything
 /// moves. Every per-action failure lands in the returned [`ApplyReport`].
 pub fn apply(plan: &Plan) -> Result<ApplyReport, ActionError> {
+    apply_with(plan, |_| {})
+}
+
+/// [`apply`], calling `on_record` with each entry's record the moment that
+/// entry is done, in plan order, so a front-end can log and meter the run as
+/// it goes. The plan's `len` and `total_bytes` are the meter's totals.
+pub fn apply_with(
+    plan: &Plan,
+    mut on_record: impl FnMut(&ApplyRecord),
+) -> Result<ApplyReport, ActionError> {
     plan.validate()?;
     let records = plan
         .actions()
         .iter()
-        .map(|entry| ApplyRecord {
-            kind: ActionKind::from(&entry.action),
-            source: entry.action.path().to_path_buf(),
-            destination: entry.action.destination().map(Path::to_path_buf),
-            bytes: entry.bytes,
-            reason: entry.reason.clone(),
-            pack: entry.pack.clone(),
-            rule: entry.rule.clone(),
-            status: match perform(&entry.action) {
-                Ok(()) => RecordStatus::Succeeded,
-                Err(message) => RecordStatus::Failed { message },
-            },
+        .map(|entry| {
+            let record = ApplyRecord {
+                kind: ActionKind::from(&entry.action),
+                source: entry.action.path().to_path_buf(),
+                destination: entry.action.destination().map(Path::to_path_buf),
+                bytes: entry.bytes,
+                reason: entry.reason.clone(),
+                pack: entry.pack.clone(),
+                rule: entry.rule.clone(),
+                status: match perform(&entry.action) {
+                    Ok(()) => RecordStatus::Succeeded,
+                    Err(message) => RecordStatus::Failed { message },
+                },
+            };
+            on_record(&record);
+            record
         })
         .collect();
     Ok(ApplyReport { root: plan.root().to_path_buf(), records })
@@ -112,10 +126,59 @@ pub fn apply(plan: &Plan) -> Result<ApplyReport, ActionError> {
 
 fn perform(action: &Action) -> Result<(), String> {
     match action {
-        Action::Trash { path } => {
-            trash::delete(path).map_err(|e| format!("cannot trash {}: {e}", path.display()))
+        Action::Delete { path } => {
+            delete(path).map_err(|e| format!("cannot delete {}: {e}", path.display()))
         }
         Action::Archive { path, to } | Action::Move { path, to } => rename(path, to),
+    }
+}
+
+/// Permanent removal of `path` and, for a directory, everything under it. A
+/// symlink or junction is removed itself, never followed out of the plan's
+/// fence. Windows refuses to remove a read-only file, so a refusal there
+/// clears the attribute under `path` and tries once more.
+fn delete(path: &Path) -> std::io::Result<()> {
+    match remove(path) {
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly(path);
+            remove(path)
+        }
+        result => result,
+    }
+}
+
+fn remove(path: &Path) -> std::io::Result<()> {
+    let kind = fs::symlink_metadata(path)?.file_type();
+    if kind.is_symlink() {
+        // A directory symlink or junction on Windows takes `remove_dir`.
+        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+    } else if kind.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(windows)]
+fn clear_readonly(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else { return };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly(&entry.path());
+        }
+    }
+    let mut permissions = meta.permissions();
+    if permissions.readonly() {
+        // On Windows this clears FILE_ATTRIBUTE_READONLY; no Unix mode bits.
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
     }
 }
 

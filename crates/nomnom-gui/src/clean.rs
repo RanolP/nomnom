@@ -8,10 +8,13 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::{self, TryRecvError};
+use std::time::Duration;
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tag::Tag;
@@ -20,7 +23,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use nomnom_core::action::{Action, RecordStatus, apply, plain};
+use nomnom_core::action::{Action, ActionKind, ApplyRecord, RecordStatus, apply_with, plain};
 use nomnom_core::verdict::{Assessment, Disposition, Provenance, Verdict};
 
 use crate::session::{Assessed, Phase, Session};
@@ -33,13 +36,6 @@ pub const PANEL_WIDTH: f32 = 420.;
 /// reason and exclusion state.
 const ROW_HEIGHT: f32 = 62.;
 
-/// What one apply did, kept until the next one.
-struct Outcome {
-    bytes_reclaimed: u64,
-    succeeded: usize,
-    failures: Vec<(PathBuf, String)>,
-}
-
 /// Asks the window to select `0` in the tree, opening its ancestors.
 pub struct Reveal(pub PathBuf);
 
@@ -49,7 +45,8 @@ pub struct SuggestPanel {
     /// How many paths the approved rules plan; kept beside `preview`.
     checked: usize,
     preview: Option<Result<Rc<Preview>, String>>,
-    outcome: Option<Result<Outcome, String>>,
+    /// The running or last apply's log, until dismissed.
+    log: Option<ApplyLog>,
     /// Rules whose matches are listed under them.
     expanded: HashSet<Provenance>,
     /// The last exclusion list read or write that failed.
@@ -67,7 +64,7 @@ impl SuggestPanel {
             selection: Selection::default(),
             checked: 0,
             preview: None,
-            outcome: None,
+            log: None,
             expanded: HashSet::new(),
             exclusion_error: None,
         };
@@ -147,21 +144,23 @@ impl SuggestPanel {
         }
         let preview = preview.clone();
         let (len, bytes) = (preview.plan.len(), preview.plan.total_bytes());
-        let body =
-            format!("{len} paths, {} in total, will be moved to the recycle bin.", size(bytes));
+        let body = format!(
+            "{len} paths, {} in total, will be permanently deleted. This cannot be undone.",
+            size(bytes)
+        );
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        // An alert dialog, because only it renders the default `DialogFooter`
+        // (right-aligned Cancel, then OK); a plain `Dialog` drops `button_props`.
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
                 .title("Apply this cleanup?")
-                .child(div().text_sm().child(body.clone()))
+                .description(body.clone())
                 .child(render_plan(&preview, cx))
-                .button_props(
-                    gpui_kit::component::dialog::DialogButtonProps::default()
-                        .ok_text("Apply")
-                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                        .show_cancel(true),
-                )
+                .width(px(448.))
+                .confirm()
+                .ok_text("Delete permanently")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     view.update(cx, |this, cx| this.apply(cx));
                     true
@@ -175,41 +174,57 @@ impl SuggestPanel {
         if !session.update(cx, |session, cx| session.begin(Phase::Applying, cx)) {
             return;
         }
-        self.outcome = None;
+        self.log = Some(ApplyLog::new(&preview));
         let plan = preview.plan.clone();
+        let (sender, records) = mpsc::channel::<ApplyRecord>();
+        let task = cx.background_executor().spawn(async move {
+            apply_with(&plan, |record| {
+                let _ = sender.send(record.clone());
+            })
+            .map_err(|error| format!("apply under {} failed: {error}", plain(plan.root())))
+        });
         cx.spawn(async move |this, cx| {
-            let applied = cx
-                .background_executor()
-                .spawn(async move {
-                    apply(&plan).map_err(|error| {
-                        format!("apply under {} failed: {error}", plain(plan.root()))
-                    })
-                })
-                .await;
-            let outcome = applied.map(|report| Outcome {
-                bytes_reclaimed: report.bytes_reclaimed(),
-                succeeded: report.records().iter().filter(|r| r.succeeded()).count(),
-                failures: report
-                    .failures()
-                    .map(|record| {
-                        let message = match &record.status {
-                            RecordStatus::Failed { message } => message.clone(),
-                            _ => String::new(),
-                        };
-                        (record.source.clone(), message)
-                    })
-                    .collect(),
-            });
-            match &outcome {
-                Ok(done) => {
-                    for (path, message) in &done.failures {
-                        eprintln!("nomnom-gui: apply could not move {}: {message}", plain(path));
+            // Drained on a short timer, one repaint per batch, so a run of many
+            // small deletions does not repaint once per path. The sender drops
+            // when the apply returns, which ends the loop after the last batch.
+            loop {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                let mut batch = Vec::new();
+                let finished = loop {
+                    match records.try_recv() {
+                        Ok(record) => batch.push(record),
+                        Err(TryRecvError::Empty) => break false,
+                        Err(TryRecvError::Disconnected) => break true,
+                    }
+                };
+                if !batch.is_empty() {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(log) = &mut this.log {
+                            log.record(batch);
+                        }
+                        cx.notify();
+                    });
+                }
+                if finished {
+                    break;
+                }
+            }
+            let applied = task.await;
+            match &applied {
+                Ok(report) => {
+                    for record in report.failures() {
+                        if let RecordStatus::Failed { message } = &record.status {
+                            eprintln!("nomnom-gui: apply failed on {}: {message}", plain(&record.source));
+                        }
                     }
                 }
                 Err(message) => eprintln!("nomnom-gui: {message}"),
             }
             let _ = this.update(cx, |this, cx| {
-                this.outcome = Some(outcome);
+                if let Some(log) = &mut this.log {
+                    log.finished = Some(applied.map(|_| ()));
+                    log.scroll.scroll_to_bottom();
+                }
                 // What was approved is applied; the next plan starts empty.
                 this.selection.clear();
                 this.refresh_preview(cx);
@@ -224,44 +239,196 @@ impl SuggestPanel {
         .detach();
     }
 
-    fn render_outcome(&self, cx: &App) -> Option<AnyElement> {
-        let outcome = self.outcome.as_ref()?;
-        Some(match outcome {
-            Err(message) => Alert::error("apply-error", message.clone()).into_any_element(),
-            Ok(done) => v_flex()
-                .gap_1()
+    /// The live apply log: a bar over paths and bytes done, every path's
+    /// outcome as it lands, and once finished a summary and Dismiss.
+    fn render_log(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let log = self.log.as_ref()?;
+        let fraction = if log.total_bytes > 0 {
+            log.bytes_done as f32 / log.total_bytes as f32
+        } else if log.total > 0 {
+            log.done as f32 / log.total as f32
+        } else {
+            1.
+        };
+        let count = |wanted: fn(&LogStatus) -> bool| log.lines.iter().filter(|l| wanted(&l.status)).count();
+        let (done, failed, skipped) = (
+            count(|s| matches!(s, LogStatus::Done)),
+            count(|s| matches!(s, LogStatus::Failed(_))),
+            count(|s| matches!(s, LogStatus::Skipped(_))),
+        );
+        let headline = match &log.finished {
+            None => format!(
+                "Deleting… {}/{} paths · {} of {}",
+                log.done,
+                log.total,
+                size(log.bytes_done),
+                size(log.total_bytes)
+            ),
+            Some(Ok(())) => format!(
+                "Finished: {done} done, {failed} failed, {skipped} skipped · {} freed",
+                size(log.freed)
+            ),
+            Some(Err(message)) => message.clone(),
+        };
+        let theme = cx.theme();
+        let (muted, danger, warning, border) =
+            (theme.muted_foreground, theme.danger, theme.warning, theme.border);
+        let failed_run = matches!(log.finished, Some(Err(_))) || failed > 0;
+        Some(
+            v_flex()
+                .gap_2()
                 .p_3()
                 .border_1()
-                .border_color(cx.theme().border)
+                .border_color(border)
                 .rounded_md()
                 .text_sm()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                    "Applied: {} actions done, {} reclaimed.",
-                    done.succeeded,
-                    size(done.bytes_reclaimed)
-                )))
-                .when(!done.failures.is_empty(), |panel| {
-                    panel
+                .child(
+                    h_flex()
+                        .gap_2()
                         .child(
                             div()
-                                .text_color(cx.theme().danger)
-                                .child(format!("{} actions failed:", done.failures.len())),
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .when(failed_run, |d| d.text_color(danger))
+                                .child(headline),
                         )
-                        .children(done.failures.iter().map(|(path, message)| {
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().danger)
-                                .child(format!("{}: {message}", plain(path)))
-                        }))
-                })
+                        .when(log.finished.is_some(), |row| {
+                            row.child(
+                                Button::new("dismiss-apply-log")
+                                    .small()
+                                    .ghost()
+                                    .label("Dismiss")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.log = None;
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
+                .child(Progress::new("apply-progress").value(fraction * 100.))
+                .child(
+                    div()
+                        .id("apply-log")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .track_scroll(&log.scroll)
+                        .text_xs()
+                        .children(log.lines.iter().map(|line| {
+                            let (label, color, note) = match &line.status {
+                                LogStatus::Done => (line.done_label, None, None),
+                                LogStatus::Failed(message) => ("failed", Some(danger), Some(message)),
+                                LogStatus::Skipped(message) => ("skipped", Some(warning), Some(message)),
+                            };
+                            v_flex()
+                                .py_0p5()
+                                .when_some(color, |row, color| row.text_color(color))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().w(px(56.)).child(label))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(plain(&line.path)),
+                                        )
+                                        .child(div().text_color(muted).child(size(line.bytes))),
+                                )
+                                .when_some(note, |row, note| {
+                                    row.child(div().pl(px(64.)).child(note.clone()))
+                                })
+                        })),
+                )
                 .into_any_element(),
-        })
+        )
+    }
+}
+
+/// What became of one path, as the apply log shows it.
+enum LogStatus {
+    Done,
+    Failed(String),
+    /// Refused by the plan's guards before the apply started.
+    Skipped(String),
+}
+
+struct LogLine {
+    /// The past tense of the action, shown for `Done`.
+    done_label: &'static str,
+    path: PathBuf,
+    bytes: u64,
+    status: LogStatus,
+}
+
+/// One apply's live log, kept on screen past the post-apply rescan until the
+/// user dismisses it.
+struct ApplyLog {
+    total: usize,
+    total_bytes: u64,
+    done: usize,
+    bytes_done: u64,
+    /// Bytes of the actions that succeeded.
+    freed: u64,
+    lines: Vec<LogLine>,
+    /// `None` while the plan runs; `Err` when it was refused before anything
+    /// moved.
+    finished: Option<Result<(), String>>,
+    scroll: ScrollHandle,
+}
+
+impl ApplyLog {
+    fn new(preview: &Preview) -> Self {
+        let lines = preview
+            .refused
+            .iter()
+            .map(|(path, error)| LogLine {
+                done_label: "",
+                path: path.clone(),
+                bytes: 0,
+                status: LogStatus::Skipped(error.to_string()),
+            })
+            .collect();
+        Self {
+            total: preview.plan.len(),
+            total_bytes: preview.plan.total_bytes(),
+            done: 0,
+            bytes_done: 0,
+            freed: 0,
+            lines,
+            finished: None,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    fn record(&mut self, records: Vec<ApplyRecord>) {
+        for record in records {
+            self.done += 1;
+            self.bytes_done += record.bytes;
+            if record.succeeded() {
+                self.freed += record.bytes;
+            }
+            self.lines.push(LogLine {
+                done_label: match record.kind {
+                    ActionKind::Delete => "deleted",
+                    ActionKind::Archive => "archived",
+                    ActionKind::Move => "moved",
+                },
+                path: record.source,
+                bytes: record.bytes,
+                status: match record.status {
+                    RecordStatus::Succeeded => LogStatus::Done,
+                    RecordStatus::Failed { message } => LogStatus::Failed(message),
+                },
+            });
+        }
+        self.scroll.scroll_to_bottom();
     }
 }
 
 fn verb(action: &Action) -> &'static str {
     match action {
-        Action::Trash { .. } => "trash",
+        Action::Delete { .. } => "delete",
         Action::Archive { .. } => "archive",
         Action::Move { .. } => "move",
     }
@@ -293,11 +460,12 @@ fn render_plan(preview: &Preview, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn disposition_tag(disposition: Disposition) -> Tag {
+/// Every panel item is a deletion suggestion, so only the exception that
+/// asks for extra care is tagged.
+fn disposition_tag(disposition: Disposition) -> Option<Tag> {
     match disposition {
-        Disposition::Reclaimable => Tag::success().small().child("reclaimable"),
-        Disposition::Review => Tag::warning().small().child("review"),
-        Disposition::Keep => Tag::secondary().small().child("keep"),
+        Disposition::Review => Some(Tag::warning().small().child("review")),
+        Disposition::Reclaimable | Disposition::Keep => None,
     }
 }
 
@@ -426,7 +594,7 @@ fn render_row(
                             cx.listener(move |this, _, _, cx| this.toggle_expanded(&expand, cx)),
                         ),
                 )
-                .child(disposition_tag(*disposition))
+                .children(disposition_tag(*disposition))
                 .child(
                     v_flex()
                         .flex_1()
@@ -556,7 +724,7 @@ impl Render for SuggestPanel {
             .border_l_1()
             .border_color(cx.theme().border)
             .child(div().font_weight(FontWeight::SEMIBOLD).child("Suggestions to review"))
-            .children(self.render_outcome(cx));
+            .children(self.render_log(cx));
         let Some(assessment) = assessment.filter(|_| waiting.is_none()) else {
             return panel.children(waiting).into_any_element();
         };

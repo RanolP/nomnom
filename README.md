@@ -1,6 +1,6 @@
 # nomnom
 
-Find what is eating your disk, say what each path is and why, and reclaim it through the recycle bin. The rule language is described in [docs/lang.md](docs/lang.md).
+Find what is eating your disk, say what each path is and why, and reclaim it by deleting what you approve. Deletion is permanent: there is no recycle bin and no undo. The rule language is described in [docs/lang.md](docs/lang.md).
 
 ## CLI
 
@@ -12,10 +12,10 @@ cargo run -p nomnom-cli -- scan C:\             # the tree, biggest first
 cargo run -p nomnom-cli -- suggest D:           # what each path is, and why
 cargo run -p nomnom-cli -- clean D:             # list the cleanup candidates grouped by rule; approves nothing
 cargo run -p nomnom-cli -- clean D: --rule "Cargo target/"        # dry-run plan of every match of that rule, minus exclusions
-cargo run -p nomnom-cli -- clean D: --rule "Cargo target/" --apply  # move them to the recycle bin
+cargo run -p nomnom-cli -- clean D: --rule "Cargo target/" --apply  # delete them permanently
 cargo run -p nomnom-cli -- clean D: --exclude D:\work\active      # keep a path and its subtree out of every plan, across scans
 cargo run -p nomnom-cli -- clean D: --exclusions                  # list the drive's exclusions (no scan)
-cargo run -p nomnom-cli -- clean D: D:\proj\node_modules --apply  # move only the named paths to the recycle bin
+cargo run -p nomnom-cli -- clean D: D:\proj\node_modules --apply  # permanently delete only the named paths
 cargo run -p nomnom-cli -- pack list --drive D: # the rule packs a drive's runs load
 ```
 
@@ -37,7 +37,7 @@ nomnom scans whole drives only, like the CLI. The app opens on **Drives**, one c
 
 Every scan of an NTFS drive asks for Administrator access through a UAC prompt, because reading the Master File Table is much faster than walking the drive and also reports on-disk sizes. Decline the prompt, or let the elevated scan fail, and nomnom walks the drive instead and says so in a banner. When the app already runs as Administrator, no prompt appears.
 
-When a scan finishes, nomnom judges every path in the background while the tree and treemap stay usable. The Tree's bottom bar holds **Files to delete** on the left, with the count of paths you checked, which opens the dry-run list where every candidate starts unchecked and you check the paths to delete (include review verdicts to widen the list), and **Reclaim** on the right, which shows **Analyzing…** until the judging is done, then the size of what you checked, and moves only that to the recycle bin after a confirmation. A new assessment, a rescan, a pack change or an apply clears the checks.
+When a scan finishes, nomnom judges every path in the background while the tree and treemap stay usable. The Tree's bottom bar holds **Files to delete** on the left, with the count of paths you checked, which opens the dry-run list where every candidate starts unchecked and you check the paths to delete (include review verdicts to widen the list), and **Reclaim** on the right, which shows **Analyzing…** until the judging is done, then the size of what you checked, and, after a confirmation, permanently deletes only that, showing a progress bar and a log line per path (deleted, failed with its error, or skipped) that stays until you dismiss it. A new assessment, a rescan, a pack change or an apply clears the checks.
 
 A release build (`cargo build -p nomnom-gui --release`) compiles GPUI's shaders with the Windows SDK's `fxc.exe`. When Windows SDK 10.0.26100.0 is not installed, point `GPUI_FXC_PATH` at the `fxc.exe` of an SDK you do have, for example:
 

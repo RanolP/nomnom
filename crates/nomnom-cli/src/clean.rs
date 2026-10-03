@@ -6,25 +6,25 @@
 //! each approved rule plus any path named on its own, minus the drive's
 //! persisted exclusions (`--exclude` / `--unexclude` / `--exclusions`).
 //! Dry-run is the default. `--apply` is the only thing that moves a byte, and
-//! it sends trashed paths to the recycle bin, where they can be restored from.
+//! it deletes the planned paths permanently: no recycle bin, no undo.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use humansize::{BINARY, format_size};
 use nomnom_core::action::{
-    Action, ApplyReport, Approval, Exclusions, Plan, RecordStatus, RuleGroup, by_rule, candidates,
-    find_rule, plain, plan_from,
+    Action, ApplyRecord, ApplyReport, Approval, Exclusions, Plan, RecordStatus, RuleGroup,
+    apply_with, by_rule, candidates, find_rule, plain, plan_from,
 };
 use nomnom_core::scan::VolumeRoot;
 use nomnom_core::verdict::{Assessment, Disposition, Entry, Verdict};
 use serde::Serialize;
 
 use crate::input;
-use crate::suggest::disposition_name;
+use crate::suggest::disposition_marker;
 
 pub struct Request<'a> {
     pub drive: &'a VolumeRoot,
@@ -221,7 +221,19 @@ fn execute(
     }
 
     if mode.apply {
-        let report = nomnom_core::action::apply(&plan).context("apply failed")?;
+        // Each path's line prints the moment it is done, the GUI's live log.
+        let mut meter = ApplyMeter::start(&plan);
+        let mut written = Ok(());
+        let report = apply_with(&plan, |record| {
+            meter.clear();
+            if !mode.json && written.is_ok() {
+                written = write_record(out, record);
+            }
+            meter.advance(record);
+        })
+        .context("apply failed")?;
+        drop(meter);
+        written?;
         return report_apply(&report, mode.json, out);
     }
 
@@ -396,10 +408,11 @@ fn write_groups(
         writeln!(out, "  {}  {tally}  {}", group.provenance, format_size(group.bytes, BINARY))?;
         for entry in &group.entries {
             let tag = match excluded_by(entry) {
-                Some(_) => "excluded",
-                None => disposition_name(entry.verdict.disposition),
+                Some(_) => Some("excluded"),
+                None => disposition_marker(entry.verdict.disposition),
             };
-            writeln!(out, "    [{tag}] {}  {}", entry.path, format_size(entry.bytes, BINARY))?;
+            let tag = tag.map_or_else(String::new, |tag| format!("[{tag}] "));
+            writeln!(out, "    {tag}{}  {}", entry.path, format_size(entry.bytes, BINARY))?;
             writeln!(out, "        {}", entry.verdict.reason)?;
             if let Some(by) = excluded_by(entry) {
                 writeln!(out, "        kept out of every plan by the exclusion {by}")?;
@@ -454,7 +467,11 @@ fn report_plan(
         return Ok(ExitCode::SUCCESS);
     }
 
-    writeln!(out, "Dry run — nothing has been touched. Add --apply to carry this out.")?;
+    writeln!(
+        out,
+        "Dry run — nothing has been touched. Add --apply to delete these permanently; \
+         this cannot be undone."
+    )?;
     writeln!(out, "Root: {}", plain(plan.root()))?;
     for rule in &approval.rules {
         writeln!(out, "Approved: {rule}")?;
@@ -488,20 +505,6 @@ fn report_apply(report: &ApplyReport, json: bool, out: &mut dyn Write) -> Result
         let output = ApplyOutput { applied: true, report };
         writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
     } else {
-        for record in report.records() {
-            let status = match &record.status {
-                RecordStatus::Succeeded => "done".to_string(),
-                RecordStatus::Failed { message } => format!("FAILED: {message}"),
-            };
-            writeln!(
-                out,
-                "{} {}  {}  [{status}]",
-                kind_verb(record.kind),
-                plain(&record.source),
-                format_size(record.bytes, BINARY)
-            )?;
-            writeln!(out, "      {}", record.reason)?;
-        }
         writeln!(out)?;
         writeln!(out, "Reclaimed {}.", format_size(report.bytes_reclaimed(), BINARY))?;
         if failures > 0 {
@@ -512,9 +515,91 @@ fn report_apply(report: &ApplyReport, json: bool, out: &mut dyn Write) -> Result
     Ok(if failures > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
+fn write_record(out: &mut dyn Write, record: &ApplyRecord) -> std::io::Result<()> {
+    let status = match &record.status {
+        RecordStatus::Succeeded => "done".to_string(),
+        RecordStatus::Failed { message } => format!("FAILED: {message}"),
+    };
+    writeln!(
+        out,
+        "{} {}  {}  [{status}]",
+        kind_verb(record.kind),
+        plain(&record.source),
+        format_size(record.bytes, BINARY)
+    )?;
+    writeln!(out, "      {}", record.reason)
+}
+
+/// `--apply` on a terminal (or under [`input::FORCE_METER_ENV`]): one
+/// rewritten stderr line under the log, paths and bytes done of the plan's
+/// totals — the GUI's apply bar. Cleared before each log line and on drop.
+struct ApplyMeter {
+    enabled: bool,
+    total: usize,
+    total_bytes: u64,
+    done: usize,
+    bytes: u64,
+}
+
+impl ApplyMeter {
+    const WIDTH: usize = 72;
+    const BAR: usize = 24;
+
+    fn start(plan: &Plan) -> Self {
+        let forced = std::env::var_os(input::FORCE_METER_ENV).is_some_and(|v| v == "1");
+        let meter = Self {
+            enabled: forced || std::io::stderr().is_terminal(),
+            total: plan.len(),
+            total_bytes: plan.total_bytes(),
+            done: 0,
+            bytes: 0,
+        };
+        meter.draw();
+        meter
+    }
+
+    fn advance(&mut self, record: &ApplyRecord) {
+        self.done += 1;
+        self.bytes += record.bytes;
+        self.draw();
+    }
+
+    fn draw(&self) {
+        if self.enabled {
+            eprint!("\r{:<width$}", self.line(), width = Self::WIDTH);
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    fn clear(&self) {
+        if self.enabled {
+            eprint!("\r{:width$}\r", "", width = Self::WIDTH);
+        }
+    }
+
+    fn line(&self) -> String {
+        let filled = (self.done * Self::BAR).checked_div(self.total).unwrap_or(Self::BAR);
+        format!(
+            "[{}{}] {}/{} paths  {} / {}",
+            "#".repeat(filled),
+            ".".repeat(Self::BAR - filled),
+            self.done,
+            self.total,
+            format_size(self.bytes, BINARY),
+            format_size(self.total_bytes, BINARY)
+        )
+    }
+}
+
+impl Drop for ApplyMeter {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 fn verb(action: &Action) -> &'static str {
     match action {
-        Action::Trash { .. } => "trash  ",
+        Action::Delete { .. } => "delete ",
         Action::Archive { .. } => "archive",
         Action::Move { .. } => "move   ",
     }
@@ -523,7 +608,7 @@ fn verb(action: &Action) -> &'static str {
 fn kind_verb(kind: nomnom_core::action::ActionKind) -> &'static str {
     use nomnom_core::action::ActionKind;
     match kind {
-        ActionKind::Trash => "trash  ",
+        ActionKind::Delete => "delete ",
         ActionKind::Archive => "archive",
         ActionKind::Move => "move   ",
     }

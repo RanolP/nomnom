@@ -28,7 +28,7 @@ pub enum Feature {
     Tree,
     /// What each path is, and whether it can go.
     Suggest,
-    /// A dry-run cleanup plan, applied on request to the recycle bin.
+    /// A dry-run cleanup plan, permanently deleted on request.
     Clean,
     /// The rule packs a drive's runs load, and their trust.
     Packs,

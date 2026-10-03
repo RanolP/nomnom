@@ -1,6 +1,6 @@
 //! The view model that needs no window: which rows the tree shows, and which
 //! entries a cleanup plan takes. Kept free of gpui types so the selection logic
-//! that decides what gets trashed can be tested on its own.
+//! that decides what gets deleted can be tested on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -290,7 +290,7 @@ mod tests {
     }
 
     // Catches an approved rule not reaching the plan, pulling in another
-    // rule's matches, or an excluded match still being trashed on Apply.
+    // rule's matches, or an excluded match still being deleted on Apply.
     #[test]
     fn an_approved_rule_plans_its_matches_minus_exclusions() {
         let tmp = tempfile::tempdir().unwrap();

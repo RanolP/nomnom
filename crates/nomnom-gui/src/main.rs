@@ -21,6 +21,19 @@ use gpui_kit::*;
 use crate::app::NomnomApp;
 use crate::session::Session;
 
+/// The stock backdrop (5% black light, 20% dark) barely separates a modal
+/// from the tree behind it. Both theme configs carry the override, so it
+/// survives a system light/dark switch reloading the mode's config.
+fn darken_dialog_backdrop(cx: &mut App) {
+    use gpui_kit::component::Theme;
+    let theme = Theme::global_mut(cx);
+    for config in [&mut theme.light_theme, &mut theme.dark_theme] {
+        std::rc::Rc::make_mut(config).colors.overlay = Some("#0000008c".into());
+    }
+    let mode = theme.mode;
+    Theme::change(mode, None, cx);
+}
+
 fn main() -> ExitCode {
     // The elevated MFT helper is this same binary relaunched behind UAC.
     if let Some(code) = nomnom_core::scan::maybe_run_helper() {
@@ -29,6 +42,7 @@ fn main() -> ExitCode {
 
     gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
         gpui_kit::init(cx);
+        darken_dialog_backdrop(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,

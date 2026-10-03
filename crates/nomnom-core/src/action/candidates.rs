@@ -1,4 +1,4 @@
-//! Joining an assessment to a plan: which verdicts become trash actions.
+//! Joining an assessment to a plan: which verdicts become delete actions.
 //!
 //! The user approves rules, not files: approving `built-in [Cargo target/]`
 //! picks every candidate that rule produced, minus the persisted
@@ -123,7 +123,7 @@ pub fn approved<'a>(
         .collect()
 }
 
-/// A trash plan anchored at the assessment's root, holding exactly the
+/// A delete plan anchored at the assessment's root, holding exactly the
 /// [`approved`] entries, biggest first.
 ///
 /// Opt-in: an empty approval is an empty plan, and an exclusion only ever
@@ -155,7 +155,7 @@ pub fn plan_from(
             verdict.provenance.rule.clone(),
         );
         let path = PathBuf::from(&entry.path);
-        if let Err(error) = plan.push(Action::Trash { path: path.clone() }, entry.bytes, justification)
+        if let Err(error) = plan.push(Action::Delete { path: path.clone() }, entry.bytes, justification)
         {
             refused.push((path, error));
         }

@@ -90,7 +90,8 @@ enum Command {
     },
     /// List the drive's cleanup candidates grouped by rule, or plan the rules
     /// approved. Nothing is planned unless approved; dry-run unless `--apply`
-    /// is given, which sends the planned paths to the recycle bin.
+    /// is given, which deletes the planned paths permanently. This cannot be
+    /// undone.
     Clean {
         #[command(flatten)]
         scan: ScanArgs,
@@ -115,7 +116,8 @@ enum Command {
         /// nothing is scanned.
         #[arg(long)]
         exclusions: bool,
-        /// Actually carry the plan out. Requires a --rule or a PATH.
+        /// Actually carry the plan out: the planned paths are permanently
+        /// deleted, which cannot be undone. Requires a --rule or a PATH.
         #[arg(long)]
         apply: bool,
         /// Also act on `review` verdicts, which the evidence does not carry on

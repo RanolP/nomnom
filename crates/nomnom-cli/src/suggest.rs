@@ -72,13 +72,9 @@ fn print_group(out: &mut dyn Write, heading: &str, group: &Group) -> Result<()> 
         if group.entries.len() == 1 { "path" } else { "paths" }
     )?;
     for entry in &group.entries {
-        writeln!(
-            out,
-            "  [{}] {}  {}",
-            disposition_name(entry.verdict.disposition),
-            entry.path,
-            format_size(entry.bytes, BINARY)
-        )?;
+        let marker = disposition_marker(entry.verdict.disposition)
+            .map_or_else(String::new, |name| format!("[{name}] "));
+        writeln!(out, "  {marker}{}  {}", entry.path, format_size(entry.bytes, BINARY))?;
         writeln!(out, "      {}", entry.verdict.reason)?;
         // The rule is printed beside its sentence, not hidden behind a
         // debug flag: with packs coming from the network, "who says so" is
@@ -111,11 +107,14 @@ pub fn label_name(label: &Label) -> String {
     label.as_str().replace('-', " ")
 }
 
-pub fn disposition_name(disposition: Disposition) -> &'static str {
+/// The per-path marker. A suggestion to delete is the default every listed
+/// path carries, so `reclaimable` prints nothing (the GUI panel shows no tag
+/// for it either); only the exceptions are marked.
+pub fn disposition_marker(disposition: Disposition) -> Option<&'static str> {
     match disposition {
-        Disposition::Keep => "keep",
-        Disposition::Reclaimable => "reclaimable",
-        Disposition::Review => "review",
+        Disposition::Keep => Some("keep"),
+        Disposition::Reclaimable => None,
+        Disposition::Review => Some("review"),
     }
 }
 
@@ -220,7 +219,8 @@ mod tests {
         );
 
         let text = suggest(project.path(), &explicit, false);
-        assert!(text.contains("[reclaimable]"), "{text}");
+        assert!(!text.contains("[review]"), "{text}");
+        assert!(!text.contains("Reclaimable: 0 B"), "the trusted verdict must count:\n{text}");
         assert!(!text.contains("capped at review"), "{text}");
 
         let revoked = pack_ok(
